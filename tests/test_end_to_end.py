@@ -26,7 +26,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.inception_mamba import InceptionMambaEncoder
-from models.vit_teacher import ViTTeacher
+from models.vit_teacher import FrozenViTTeacher
 from objectives.salt_loss import ProjectionHead, embedding_std, salt_loss
 
 BATCH = 4
@@ -49,7 +49,7 @@ def test_end_to_end() -> bool:
     results = []
 
     print("  [1/8] Instantiating models...")
-    teacher = ViTTeacher(ckpt_path=None).to(DEVICE)
+    teacher = FrozenViTTeacher.for_testing().to(DEVICE)
     student = InceptionMambaEncoder(
         patch_size=16, embed_dim=256, depth=4, out_dim=768,
     ).to(DEVICE)

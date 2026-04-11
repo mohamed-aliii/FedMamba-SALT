@@ -41,7 +41,7 @@ from tqdm import tqdm
 
 from augmentations.medical_aug import DualViewDataset
 from models.inception_mamba import InceptionMambaEncoder
-from models.vit_teacher import ViTTeacher
+from models.vit_teacher import FrozenViTTeacher
 from objectives.salt_loss import ProjectionHead, embedding_std, salt_loss
 
 # ======================================================================
@@ -192,12 +192,14 @@ def build_dataloader(args: argparse.Namespace) -> DataLoader:
 def build_models(args: argparse.Namespace):
     """Instantiate teacher, student, and projection head."""
 
-    # Teacher: frozen ViT-B/16 (load checkpoint if available)
-    ckpt_path = args.teacher_ckpt if os.path.isfile(args.teacher_ckpt) else None
-    if ckpt_path is None:
-        print("[WARN] Teacher checkpoint not found -- using random weights.")
-        print(f"       Expected at: {args.teacher_ckpt}")
-    teacher = ViTTeacher(ckpt_path=ckpt_path).to(args.device)
+    # Teacher: frozen ViT-B/16 (checkpoint is required)
+    if not os.path.isfile(args.teacher_ckpt):
+        raise FileNotFoundError(
+            f"Teacher checkpoint not found: {args.teacher_ckpt}\n"
+            f"Download the MAE ViT-B/16 checkpoint and place it at this path.\n"
+            f"Training with random teacher weights produces meaningless results."
+        )
+    teacher = FrozenViTTeacher(ckpt_path=args.teacher_ckpt).to(args.device)
 
     # Student: Inception-Mamba encoder
     student = InceptionMambaEncoder(

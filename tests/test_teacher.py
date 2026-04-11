@@ -15,7 +15,7 @@ import sys
 
 import torch
 
-from models.vit_teacher import ViTTeacher
+from models.vit_teacher import FrozenViTTeacher
 
 # =====================================================================
 #  Test helpers
@@ -24,9 +24,9 @@ BATCH_SIZE = 4
 IMG_SHAPE = (3, 224, 224)
 
 
-def _make_teacher() -> ViTTeacher:
-    """Create a teacher with random (untrained) weights — no checkpoint."""
-    return ViTTeacher(ckpt_path=None)
+def _make_teacher() -> FrozenViTTeacher:
+    """Create a teacher with random (untrained) weights -- no checkpoint."""
+    return FrozenViTTeacher.for_testing()
 
 
 # =====================================================================
@@ -128,7 +128,7 @@ def test_not_collapsed() -> bool:
 # =====================================================================
 if __name__ == "__main__":
     print("=" * 60)
-    print("  ViT Teacher — Smoke Tests (no checkpoint needed)")
+    print("  FrozenViTTeacher -- Smoke Tests (no checkpoint needed)")
     print("=" * 60)
 
     results = [
