@@ -3,61 +3,55 @@ utils/ckpt_compat.py -- Cross-version compatible checkpoint loading.
 
 SSL-FL checkpoints embed ``argparse.Namespace`` objects that contain
 pandas DataFrames (``args.record_val_acc``, ``args.record_test_acc``).
-When loaded on a different pandas version, ``torch.load`` crashes during
-unpickling because the internal pandas ``Block`` constructor signature
-has changed.
+When loaded on a newer pandas version, ``torch.load`` crashes because
+the internal ``new_block()`` constructor changed its ``placement``
+argument from ``slice`` to ``BlockPlacement``.
 
-This module provides :func:`safe_torch_load` which intercepts the
-pandas ``BlockPlacement`` error and retries with a custom ``Unpickler``
-that replaces unresolvable objects with ``None``.  The ``'model'`` key
-(the actual weights) is never affected — only the ``'args'`` metadata
-can contain stale pandas objects.
+This module patches pandas before loading so the unpickler succeeds.
+The ``'model'`` key (actual weights) is never affected.
 """
-
-import io
-import pickle
-from typing import Any
 
 import torch
 
 
-class _PermissiveUnpickler(pickle.Unpickler):
+def _patch_pandas() -> None:
     """
-    Unpickler that replaces any class it cannot import or instantiate
-    with a no-op placeholder.  Used exclusively for checkpoint loading
-    where the ``'args'`` key may contain stale pandas objects.
+    Monkey-patch ``pandas.core.internals.blocks.new_block`` so that
+    old pickled DataFrames (which pass a plain ``slice`` for placement)
+    can be unpickled on newer pandas versions that expect a
+    ``BlockPlacement`` object.
+
+    Safe to call multiple times -- only patches once.
     """
+    try:
+        import pandas as pd
+        from pandas.core.internals import blocks as _blocks
+    except ImportError:
+        return  # no pandas => no problem
 
-    def find_class(self, module: str, name: str) -> Any:
-        try:
-            return super().find_class(module, name)
-        except (AttributeError, ImportError, ModuleNotFoundError):
-            # Return a dummy that absorbs any constructor call
-            return _DummyObject
+    # Check if already patched
+    if getattr(_blocks, '_fedmamba_patched', False):
+        return
 
+    _original_new_block = _blocks.new_block
 
-class _DummyObject:
-    """Absorbs arbitrary constructor arguments."""
+    def _patched_new_block(values, ndim, placement, refs=None, **kwargs):
+        if isinstance(placement, slice):
+            from pandas._libs.internals import BlockPlacement
+            placement = BlockPlacement(placement)
+        return _original_new_block(values, ndim=ndim, placement=placement, refs=refs, **kwargs)
 
-    def __init__(self, *args, **kwargs):
-        pass
-
-    def __reduce__(self):
-        return (_DummyObject, ())
+    _blocks.new_block = _patched_new_block
+    _blocks._fedmamba_patched = True
 
 
 def safe_torch_load(path: str, map_location: str = "cpu") -> dict:
     """
     Load a PyTorch checkpoint with graceful handling of stale pickled
-    objects (e.g. old pandas DataFrames inside ``args``).
+    pandas DataFrames (found in SSL-FL checkpoints).
 
-    1. First attempt: normal ``torch.load(..., weights_only=False)``.
-    2. If that fails with a pandas/pickle error, fall back to a
-       permissive unpickler that replaces unresolvable objects with
-       ``None`` placeholders.
-
-    The ``'model'`` state_dict is always loaded correctly because it
-    contains only ``torch.Tensor`` objects.
+    Patches pandas internals before loading, then uses standard
+    ``torch.load(..., weights_only=False)``.
 
     Args:
         path: Path to the ``.pth`` checkpoint file.
@@ -66,38 +60,5 @@ def safe_torch_load(path: str, map_location: str = "cpu") -> dict:
     Returns:
         The checkpoint dictionary.
     """
-    # --- Attempt 1: standard load ---
-    try:
-        return torch.load(path, map_location=map_location, weights_only=False)
-    except (TypeError, pickle.UnpicklingError, AttributeError) as e:
-        print(f"[safe_torch_load] Standard load failed: {e.__class__.__name__}")
-        print(f"[safe_torch_load] Retrying with permissive unpickler...")
-
-    # --- Attempt 2: permissive unpickler ---
-    with open(path, "rb") as f:
-        unpickler = _PermissiveUnpickler(f)
-        # Apply map_location by hooking into torch's internal mechanism
-        # torch.load uses a custom _load function; we replicate the
-        # essential logic here for the CPU case.
-        try:
-            ckpt = unpickler.load()
-        except Exception:
-            # If even the permissive unpickler fails, use torch's own
-            # mechanism with safe_globals for argparse.Namespace
-            import argparse
-            torch.serialization.add_safe_globals([argparse.Namespace])
-            return torch.load(path, map_location=map_location, weights_only=True)
-
-    # Move tensors to the requested device
-    if isinstance(ckpt, dict):
-        device = torch.device(map_location)
-        for key, val in ckpt.items():
-            if isinstance(val, dict):
-                for k2, v2 in val.items():
-                    if isinstance(v2, torch.Tensor):
-                        val[k2] = v2.to(device)
-            elif isinstance(val, torch.Tensor):
-                ckpt[key] = val.to(device)
-
-    print(f"[safe_torch_load] Loaded successfully with permissive unpickler.")
-    return ckpt
+    _patch_pandas()
+    return torch.load(path, map_location=map_location, weights_only=False)
