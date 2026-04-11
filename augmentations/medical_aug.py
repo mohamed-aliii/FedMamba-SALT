@@ -24,10 +24,14 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 
 # ======================================================================
-# ImageNet normalization constants
+# Normalization constants
 # ======================================================================
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
+
+# Retina-specific stats (from SSL-FL datasets.py)
+RETINA_MEAN = [0.5007, 0.5010, 0.5019]
+RETINA_STD = [0.0342, 0.0535, 0.0484]
 
 
 # ======================================================================
@@ -58,26 +62,31 @@ class AddGaussianNoise:
 # ======================================================================
 # Teacher augmentation pipeline (minimal)
 # ======================================================================
-def get_teacher_transform() -> transforms.Compose:
+def get_teacher_transform(dataset: str = "imagenet") -> transforms.Compose:
     """
     Minimal augmentation for the teacher view.
 
     Only geometric invariances (tight crop + horizontal flip) are applied.
     **No** colour jitter, blur, or noise — every augmentation added here
     makes the student's task easier and weakens the learning signal.
+
+    Args:
+        dataset: ``'imagenet'`` or ``'retina'`` to select normalization stats.
     """
+    mean = RETINA_MEAN if dataset == "retina" else IMAGENET_MEAN
+    std = RETINA_STD if dataset == "retina" else IMAGENET_STD
     return transforms.Compose([
         transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.ToTensor(),
-        transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        transforms.Normalize(mean=mean, std=std),
     ])
 
 
 # ======================================================================
 # Student augmentation pipeline (aggressive)
 # ======================================================================
-def get_student_transform() -> transforms.Compose:
+def get_student_transform(dataset: str = "imagenet") -> transforms.Compose:
     """
     Heavy augmentation for the student view.
 
@@ -87,7 +96,12 @@ def get_student_transform() -> transforms.Compose:
         • RandomGrayscale               → single-channel modalities
         • GaussianBlur                  → motion blur / defocus
         • AddGaussianNoise              → sensor noise
+
+    Args:
+        dataset: ``'imagenet'`` or ``'retina'`` to select normalization stats.
     """
+    mean = RETINA_MEAN if dataset == "retina" else IMAGENET_MEAN
+    std = RETINA_STD if dataset == "retina" else IMAGENET_STD
     return transforms.Compose([
         transforms.RandomResizedCrop(224, scale=(0.5, 1.0)),
         transforms.RandomHorizontalFlip(p=0.5),
@@ -100,7 +114,7 @@ def get_student_transform() -> transforms.Compose:
         transforms.RandomGrayscale(p=0.2),
         transforms.GaussianBlur(kernel_size=23, sigma=(0.5, 3.0)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        transforms.Normalize(mean=mean, std=std),
         AddGaussianNoise(std=0.05),
     ])
 

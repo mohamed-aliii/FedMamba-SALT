@@ -37,10 +37,12 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
-from torchvision.datasets import ImageFolder
 from tqdm import tqdm
 
-from augmentations.medical_aug import DualViewDataset
+from augmentations.medical_aug import (
+    DualViewDataset, get_teacher_transform, get_student_transform,
+)
+from augmentations.retina_dataset import RetinaDataset
 from models.inception_mamba import InceptionMambaEncoder
 from models.vit_teacher import FrozenViTTeacher
 from objectives.salt_loss import ProjectionHead, embedding_std, salt_loss
@@ -225,14 +227,21 @@ def parse_args() -> argparse.Namespace:
 # Data
 # ======================================================================
 def build_dataloader(args: argparse.Namespace) -> DataLoader:
-    """Build the DualViewDataset + DataLoader from an ImageFolder."""
-    train_root = os.path.join(args.data_path, "train")
-    if not os.path.isdir(train_root):
-        print(f"[ERROR] Expected a train/ subdirectory at: {train_root}")
-        sys.exit(1)
+    """Build the DualViewDataset + DataLoader from a RetinaDataset (SSL-FL format)."""
+    # Load the Retina dataset in SSL-FL format
+    base_ds = RetinaDataset(
+        data_path=args.data_path,
+        phase="train",
+        split_type="central",
+        split_csv="train.csv",
+    )
 
-    base_ds = ImageFolder(root=train_root)
-    dual_ds = DualViewDataset(base_ds)
+    # Wrap with dual-view transforms using Retina normalization
+    dual_ds = DualViewDataset(
+        base_ds,
+        teacher_transform=get_teacher_transform(dataset="retina"),
+        student_transform=get_student_transform(dataset="retina"),
+    )
 
     loader = DataLoader(
         dual_ds,
@@ -244,7 +253,7 @@ def build_dataloader(args: argparse.Namespace) -> DataLoader:
         persistent_workers=args.num_workers > 0,
     )
 
-    print(f"Dataset: {len(base_ds)} images from {train_root}")
+    print(f"Dataset: {len(base_ds)} images from {args.data_path}")
     print(f"DataLoader: {len(loader)} batches of {args.batch_size}")
     return loader
 
