@@ -1,0 +1,51 @@
+# =============================================================================
+# FedMamba-SALT — Pinned Dependencies
+# =============================================================================
+#
+# INSTALL ORDER MATTERS for the CUDA packages below.
+#
+# Step 1 — Install PyTorch + torchvision with CUDA *before* this file:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#
+# Step 2 — Then install everything else:
+#   pip install -r requirements.txt
+#
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Teacher backbone (MAE ViT-B/16)
+# ---------------------------------------------------------------------------
+# timm 0.3.2 is REQUIRED.  The MAE ViT-B/16 checkpoint was serialised with
+# this version's VisionTransformer class definition.  Newer timm releases
+# renamed / removed fields inside VisionTransformer (e.g., `patch_embed`,
+# `cls_token`, `pos_embed`, head structure), so loading the checkpoint with
+# timm >= 0.4 raises shape-mismatch or missing-key errors.
+timm==0.3.2
+
+# ---------------------------------------------------------------------------
+# Student backbone (Inception-Mamba / selective-state-space layers)
+# ---------------------------------------------------------------------------
+# mamba-ssm 1.2.0 — The Mamba CUDA kernel interface (selective_scan_fn,
+# mamba_inner_fn) has breaking signature changes across minor versions.
+# Pinning avoids silent numerical errors or hard crashes at runtime.
+mamba-ssm==1.2.0
+
+# causal-conv1d 1.2.0 — Hard build-time + runtime dependency of mamba-ssm.
+# Version must match exactly; a mismatch causes ImportError or CUDA
+# symbol-resolution failures when mamba-ssm loads its kernels.
+causal-conv1d==1.2.0
+
+# ---------------------------------------------------------------------------
+# Tensor utilities
+# ---------------------------------------------------------------------------
+# einops — used for readable reshape / rearrange operations inside the
+# Inception-Mamba blocks (e.g., patch un-embedding, channel mixing).
+einops
+
+# ---------------------------------------------------------------------------
+# Scientific / training stack
+# ---------------------------------------------------------------------------
+numpy
+Pillow
+matplotlib
+tqdm

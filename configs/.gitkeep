@@ -1,0 +1,2 @@
+# configs/ — YAML/JSON experiment configurations.
+# Example: default.yaml with hyperparameters for centralized SALT training.
