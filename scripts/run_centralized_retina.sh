@@ -70,6 +70,7 @@ echo ""
 # ---- Step 2: Pre-training ----
 echo "[Step 2] Launching centralized SALT pre-training..."
 python train_centralized.py \
+    --config configs/retina_centralized.yaml \
     --data_path "${DATA_PATH}" \
     --teacher_ckpt "${TEACHER_CKPT}" \
     --output_dir "${OUTPUT_DIR}" \
@@ -124,7 +125,7 @@ echo "  Full fine-tune:    ${FINETUNE_OUTPUT}/"
 echo "============================================================"
 echo ""
 echo "  SUCCESS CRITERIA:"
-echo "    1. Final SALT loss < 0.5"
+echo "    1. Final SALT loss < 0.3"
 echo "    2. embedding_std never dropped below 0.05"
 echo "    3. Linear probe accuracy within 5% of Fed-MAE baseline (77.43%)"
 echo ""

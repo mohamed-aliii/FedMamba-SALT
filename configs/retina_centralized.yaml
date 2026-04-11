@@ -2,28 +2,21 @@
 # FedMamba-SALT -- Retina Centralized Experiment Configuration
 # =============================================================================
 #
-# This config stores the full hyperparameter set for the centralized
-# (non-federated) SALT pre-training experiment on the Retina dataset.
+# Load this file with:
+#   python train_centralized.py --config configs/retina_centralized.yaml
 #
-# Usage with train_centralized.py:
-#   python train_centralized.py \
-#       --data_path /path/to/retina \
-#       --teacher_ckpt data/ckpts/mae_vit_base.pth \
-#       --output_dir outputs/retina_centralized \
-#       --epochs 100 \
-#       --batch_size 128 \
-#       --lr 0.001 \
-#       --weight_decay 0.05 \
-#       --num_workers 4 \
-#       --save_every 10
+# Values here act as defaults.  Any CLI flag overrides the corresponding
+# YAML key.  For example:
+#   python train_centralized.py --config configs/retina_centralized.yaml --epochs 50
+# will use epochs=50, overriding the 100 below.
 #
-# Or equivalently, source this YAML from a config loader.
+# Keys that do not correspond to train_centralized.py arguments (e.g.
+# evaluation-only settings) are silently skipped during loading.
 # =============================================================================
 
 # -- Data --
 data_path: "/path/to/retina"          # Change to actual dataset root
                                        # Must have train/ subdirectory
-num_classes: 5                         # Retina: 5 disease categories
 
 # -- Teacher checkpoint --
 teacher_ckpt: "data/ckpts/mae_vit_base.pth"
@@ -36,24 +29,28 @@ epochs: 100
 batch_size: 128
 lr: 1.0e-3
 weight_decay: 0.05
-warmup_epochs: 10                      # Linear warmup: lr/10 -> lr
-
-# -- Student architecture --
-patch_size: 16
-embed_dim: 256
-depth: 4
-out_dim: 768
 
 # -- Infrastructure --
 num_workers: 4
 save_every: 10
 device: "cuda"
 
-# -- Evaluation --
-eval_mode: "linear_probe"              # or "full_finetune"
-eval_epochs: 50
-eval_batch_size: 256
-eval_lr: 1.0e-3
+# =============================================================================
+# Reference-only settings (NOT loaded by train_centralized.py)
+# =============================================================================
+# These keys are used by eval/linear_probe.py and scripts, not by the
+# training script.  They are kept here for documentation purposes.
+#
+#   num_classes:    5              # Retina: 5 disease categories
+#   warmup_epochs:  10             # Linear warmup: lr/10 -> lr
+#   patch_size:     16             # Student architecture
+#   embed_dim:      256
+#   depth:          4
+#   out_dim:        768
+#   eval_mode:      linear_probe   # or full_finetune
+#   eval_epochs:    50
+#   eval_batch_size: 256
+#   eval_lr:        1.0e-3
 
 # =============================================================================
 # Expected training behavior (healthy run)

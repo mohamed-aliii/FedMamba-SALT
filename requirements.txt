@@ -49,3 +49,4 @@ numpy
 Pillow
 matplotlib
 tqdm
+PyYAML

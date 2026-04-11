@@ -52,6 +52,33 @@ COLLAPSE_THRESHOLD = 0.05  # embedding_std below this -> likely collapse
 
 
 # ======================================================================
+# YAML config loading
+# ======================================================================
+def load_yaml_config(path: str) -> dict:
+    """
+    Load a YAML config file and return a dict of key-value pairs.
+
+    Only keys that are valid argparse argument names are returned.
+    Unknown keys are silently skipped (they may be eval-only settings).
+    """
+    import yaml
+
+    try:
+        with open(path, "r") as f:
+            raw = yaml.safe_load(f)
+    except FileNotFoundError:
+        print(f"[ERROR] Config file not found: {path}")
+        raise
+
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"Expected YAML config to be a mapping (dict), got {type(raw).__name__}"
+        )
+
+    return raw
+
+
+# ======================================================================
 # CLI
 # ======================================================================
 def parse_args() -> argparse.Namespace:
@@ -60,9 +87,16 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
+    # Config file (parsed first via two-pass approach)
+    parser.add_argument(
+        "--config", type=str, default=None,
+        help="Path to a YAML config file. Values from the file are used as "
+             "defaults; any CLI flags override them.",
+    )
+
     # Data
     parser.add_argument(
-        "--data_path", type=str, required=True,
+        "--data_path", type=str, default=None,
         help="Root of an ImageFolder dataset (must contain a train/ subdirectory)",
     )
     parser.add_argument(
@@ -85,7 +119,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_every",   type=int,   default=10)
     parser.add_argument("--device",       type=str,   default="cuda")
 
-    return parser.parse_args()
+    # ------------------------------------------------------------------
+    # Two-pass parsing: extract --config first, load YAML, set defaults
+    # ------------------------------------------------------------------
+    known, _ = parser.parse_known_args()
+
+    if known.config is not None:
+        yaml_dict = load_yaml_config(known.config)
+
+        # Filter to only keys that match valid argparse destinations
+        valid_keys = {a.dest for a in parser._actions}
+        filtered = {k: v for k, v in yaml_dict.items() if k in valid_keys}
+        skipped = {k for k in yaml_dict if k not in valid_keys}
+
+        parser.set_defaults(**filtered)
+
+        if skipped:
+            print(f"[Config] Skipped non-training keys: {sorted(skipped)}")
+
+    # Full parse (CLI flags override YAML defaults)
+    args = parser.parse_args()
+
+    # Validate that data_path was provided (either via CLI or YAML)
+    if args.data_path is None:
+        parser.error("--data_path is required (via CLI or YAML config)")
+
+    # Log loaded config
+    if args.config is not None:
+        print(f"[Config] Loaded from: {args.config}")
+        yaml_dict = load_yaml_config(args.config)
+        valid_keys = {a.dest for a in parser._actions}
+        for k, v in sorted(yaml_dict.items()):
+            if k in valid_keys:
+                actual = getattr(args, k, v)
+                override = " (overridden by CLI)" if actual != v else ""
+                print(f"  {k}: {v}{override}")
+
+    return args
 
 
 # ======================================================================
