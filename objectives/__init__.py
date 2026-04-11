@@ -1,1 +1,2 @@
-# objectives/ — Loss functions for teacher–student embedding alignment.
+# objectives/ -- Loss functions for teacher-student embedding alignment.
+from objectives.salt_loss import salt_loss, ProjectionHead, embedding_std
