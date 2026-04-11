@@ -22,6 +22,13 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
+# --- timm 0.3.2 compatibility shim for PyTorch 2.x ---
+import collections.abc, types
+if "torch._six" not in sys.modules:
+    _mock = types.ModuleType("torch._six")
+    _mock.container_abcs = collections.abc
+    sys.modules["torch._six"] = _mock
+
 from utils.ckpt_compat import safe_torch_load
 
 # Ensure project root is on sys.path

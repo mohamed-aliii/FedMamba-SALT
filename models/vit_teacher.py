@@ -22,6 +22,16 @@ from typing import Union
 
 import torch
 import torch.nn as nn
+
+# --- timm 0.3.2 compatibility shim for PyTorch 2.x ---
+# timm 0.3.2 imports torch._six which was removed in PyTorch 2.0.
+# This must run before any timm import.
+import collections.abc, sys, types
+if "torch._six" not in sys.modules:
+    _mock = types.ModuleType("torch._six")
+    _mock.container_abcs = collections.abc
+    sys.modules["torch._six"] = _mock
+
 from timm.models.vision_transformer import VisionTransformer
 
 from utils.ckpt_compat import safe_torch_load
