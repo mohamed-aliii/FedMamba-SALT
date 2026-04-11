@@ -64,7 +64,7 @@ def main() -> None:
     # Step 2: Load checkpoint and inspect top-level keys
     # ==================================================================
     print(f"\n[Step 2] Loading checkpoint...")
-    ckpt = torch.load(args.ckpt_path, map_location="cpu")
+    ckpt = torch.load(args.ckpt_path, map_location="cpu", weights_only=False)
 
     if isinstance(ckpt, dict):
         top_keys = list(ckpt.keys())

@@ -384,7 +384,7 @@ def try_resume(
         return 0
 
     print(f"[RESUME] Loading checkpoint: {latest_path}")
-    ckpt = torch.load(latest_path, map_location=device)
+    ckpt = torch.load(latest_path, map_location=device, weights_only=False)
 
     student.load_state_dict(ckpt["student_state_dict"])
     projector.load_state_dict(ckpt["projector_state_dict"])

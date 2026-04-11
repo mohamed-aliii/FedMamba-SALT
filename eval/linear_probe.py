@@ -129,7 +129,7 @@ def load_encoder(ckpt_path: str, device: str, freeze: bool) -> InceptionMambaEnc
         patch_size=16, embed_dim=256, depth=4, out_dim=768,
     )
 
-    ckpt = torch.load(ckpt_path, map_location="cpu")
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     state_dict = ckpt.get("student_state_dict", ckpt)
     encoder.load_state_dict(state_dict)
     print(f"[Encoder] Loaded weights from: {ckpt_path}")

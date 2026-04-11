@@ -105,7 +105,7 @@ class FrozenViTTeacher(nn.Module):
     # ------------------------------------------------------------------
     def _load_mae_checkpoint(self, ckpt_path: str) -> None:
         """Load an MAE checkpoint, stripping the ``encoder.`` key prefix."""
-        ckpt = torch.load(ckpt_path, map_location="cpu")
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
         # MAE checkpoints nest the state dict under "model"
         state_dict = ckpt.get("model", ckpt)
