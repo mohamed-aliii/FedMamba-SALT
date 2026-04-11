@@ -35,11 +35,16 @@ def _patch_pandas() -> None:
 
     _original_new_block = _blocks.new_block
 
-    def _patched_new_block(values, ndim, placement, refs=None, **kwargs):
-        if isinstance(placement, slice):
-            from pandas._libs.internals import BlockPlacement
-            placement = BlockPlacement(placement)
-        return _original_new_block(values, ndim=ndim, placement=placement, refs=refs, **kwargs)
+    def _patched_new_block(*args, **kwargs):
+        # placement can be 3rd positional arg or a keyword arg
+        from pandas._libs.internals import BlockPlacement
+        if len(args) >= 3 and isinstance(args[2], slice):
+            args = list(args)
+            args[2] = BlockPlacement(args[2])
+            args = tuple(args)
+        elif 'placement' in kwargs and isinstance(kwargs['placement'], slice):
+            kwargs['placement'] = BlockPlacement(kwargs['placement'])
+        return _original_new_block(*args, **kwargs)
 
     _blocks.new_block = _patched_new_block
     _blocks._fedmamba_patched = True
