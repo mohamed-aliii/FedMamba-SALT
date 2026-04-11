@@ -188,6 +188,6 @@ class FrozenViTTeacher(nn.Module):
         # parent module that recursively set this module to train mode.
         self.eval()
 
-        # forward_features returns (B, N+1, 768); index 0 is the CLS token
-        tokens = self.encoder.forward_features(x)  # (B, N+1, 768)
-        return tokens[:, 0]  # (B, 768)
+        # timm 0.3.2: forward_features returns pre_logits(x[:, 0]) = (B, 768)
+        # i.e. the CLS token is already extracted and normalized.
+        return self.encoder.forward_features(x)  # (B, 768)
