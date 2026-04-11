@@ -30,10 +30,11 @@ timm==0.3.2
 # Pinning avoids silent numerical errors or hard crashes at runtime.
 mamba-ssm==1.2.0
 
-# causal-conv1d 1.2.0 — Hard build-time + runtime dependency of mamba-ssm.
+# causal-conv1d 1.2.0.post2 — Hard build-time + runtime dependency of mamba-ssm.
 # Version must match exactly; a mismatch causes ImportError or CUDA
 # symbol-resolution failures when mamba-ssm loads its kernels.
-causal-conv1d==1.2.0
+# Note: 1.2.0 does not exist on PyPI; 1.2.0.post2 is the actual release.
+causal-conv1d==1.2.0.post2
 
 # ---------------------------------------------------------------------------
 # Tensor utilities
