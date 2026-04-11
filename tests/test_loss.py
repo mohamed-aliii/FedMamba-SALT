@@ -4,8 +4,8 @@ tests/test_loss.py -- Tests for the SALT loss and projection head.
 Five checks:
   1. Loss is a scalar tensor with requires_grad=True
   2. Loss ~ 0.0 for identical normalised vectors
-  3. Loss ~ 2.0 for orthogonal normalised vectors
-  4. Loss ~ 4.0 for opposite normalised vectors
+  3. Loss ~ 1.0 for orthogonal normalised vectors  (cosine sim = 0)
+  4. Loss ~ 2.0 for opposite normalised vectors    (cosine sim = -1)
   5. .backward() produces grads on student_proj but NOT on teacher_emb
 
 Run from the project root:
@@ -51,7 +51,7 @@ def test_loss_scalar_and_grad() -> bool:
 #  Test 2 -- Identical normalised vectors -> loss ~ 0.0
 # =====================================================================
 def test_loss_identical() -> bool:
-    """MSE between two identical unit vectors should be 0."""
+    """Cosine loss between two identical unit vectors should be 0."""
     v = torch.randn(BATCH, DIM)
 
     # Pass the same tensor as both arguments.  salt_loss will normalise
@@ -66,16 +66,15 @@ def test_loss_identical() -> bool:
 
 
 # =====================================================================
-#  Test 3 -- Orthogonal normalised vectors -> loss ~ 2/D
+#  Test 3 -- Orthogonal normalised vectors -> loss ~ 1.0
 # =====================================================================
-# F.mse_loss uses mean reduction: mean((a_i - b_i)^2) over all D dims.
-# For unit vectors: ||a - b||^2 = 2*(1 - cos(theta)).
-# Orthogonal => ||a - b||^2 = 2, but MSE = 2 / D.
-EXPECTED_ORTHO = 2.0 / DIM
+# Loss = 1 - cosine_similarity.  For orthogonal unit vectors,
+# cosine_similarity = 0, so loss = 1.0 exactly.
+EXPECTED_ORTHO = 1.0
 
 
 def test_loss_orthogonal() -> bool:
-    """MSE (mean reduction) for orthogonal unit vectors = 2/D."""
+    """Cosine loss for orthogonal unit vectors = 1.0."""
     # Construct a pair of exactly orthogonal vectors using QR decomposition.
     q, _ = torch.linalg.qr(torch.randn(DIM, 2))
     a = q[:, 0].unsqueeze(0).expand(BATCH, -1)  # (B, DIM), unit norm
@@ -86,19 +85,20 @@ def test_loss_orthogonal() -> bool:
     passed = abs(loss.item() - EXPECTED_ORTHO) < TOL
     tag = "PASS" if passed else "FAIL"
     print(f"  [{tag}] Test 3 -- Orthogonal vectors: loss = {loss.item():.6f}  "
-          f"(expected ~{EXPECTED_ORTHO:.6f} = 2/{DIM})")
+          f"(expected {EXPECTED_ORTHO:.1f})")
     return passed
 
 
 # =====================================================================
-#  Test 4 -- Opposite normalised vectors -> loss ~ 4/D
+#  Test 4 -- Opposite normalised vectors -> loss ~ 2.0
 # =====================================================================
-# Opposite => ||a - b||^2 = 4, but MSE = 4 / D.
-EXPECTED_OPP = 4.0 / DIM
+# Loss = 1 - cosine_similarity.  For opposite unit vectors,
+# cosine_similarity = -1, so loss = 1 - (-1) = 2.0 exactly.
+EXPECTED_OPP = 2.0
 
 
 def test_loss_opposite() -> bool:
-    """MSE (mean reduction) for opposite unit vectors = 4/D."""
+    """Cosine loss for opposite unit vectors = 2.0."""
     v = torch.randn(BATCH, DIM)
     v = v / v.norm(dim=-1, keepdim=True)  # unit norm
 
@@ -107,7 +107,7 @@ def test_loss_opposite() -> bool:
     passed = abs(loss.item() - EXPECTED_OPP) < TOL
     tag = "PASS" if passed else "FAIL"
     print(f"  [{tag}] Test 4 -- Opposite vectors: loss = {loss.item():.6f}  "
-          f"(expected ~{EXPECTED_OPP:.6f} = 4/{DIM})")
+          f"(expected {EXPECTED_OPP:.1f})")
     return passed
 
 

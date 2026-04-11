@@ -113,21 +113,23 @@ A successful centralized experiment must meet **all three** conditions:
 
 | # | Condition | Threshold | Why |
 |---|---|---|---|
-| 1 | **SALT loss at epoch 100** | < 0.5 | Confirms the student is learning to match the teacher's embedding space |
+| 1 | **SALT loss at epoch 100** | < 0.3 | Confirms the student is learning to match the teacher's embedding space |
 | 2 | **embedding_std throughout training** | never < 0.05 | Ensures no representation collapse (all embeddings collapsing to the same vector) |
 | 3 | **Linear probe accuracy on Retina test set** | within 5% of 77.43% | Fed-MAE achieves 77.43% with full fine-tuning on Retina Split-3. Since linear probing is strictly weaker than fine-tuning, reaching ~72%+ with a frozen encoder indicates strong representations |
 
 ## Expected Training Behavior
 
+Loss = 1 - cosine_similarity (range [0, 2])
+
 | Epoch | Expected Loss | Notes |
 |---|---|---|
-| 1 | ~2.0 | Random initialization; MSE of two uncorrelated unit vectors |
-| 10 | ~0.8 - 1.2 | Warmup complete, student starting to align |
-| 30 | ~0.4 - 0.7 | Student learning meaningful features |
-| 100 | ~0.15 - 0.35 | Plateau; diminishing returns |
+| 1 | ~0.9 - 1.0 | Random initialization; cosine similarity near 0 for uncorrelated vectors |
+| 10 | ~0.4 - 0.7 | Warmup complete, student starting to align |
+| 30 | ~0.15 - 0.4 | Student learning meaningful features |
+| 100 | ~0.05 - 0.2 | Plateau; diminishing returns |
 
 **Warning signs:**
-- Loss stuck above 1.5 after epoch 20 --> check learning rate, augmentations, or data loading
+- Loss stuck above 0.8 after epoch 20 --> check learning rate, augmentations, or data loading
 - embedding_std drops below 0.05 --> representation collapse, stop and debug
 - Loss goes to NaN --> gradient explosion, reduce learning rate or check for data issues
 

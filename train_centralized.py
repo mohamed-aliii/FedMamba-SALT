@@ -12,10 +12,11 @@ Usage:
 
 Expected training behavior (healthy run)
 =========================================
-  Epoch   1:  loss ~ 2.0   (random init on the unit sphere)
-  Epoch  10:  loss ~ 0.8-1.2
-  Epoch  30:  loss ~ 0.4-0.7
-  Epoch 100:  loss ~ 0.15-0.35  (plateau)
+  Loss = 1 - cosine_similarity  (range [0, 2])
+  Epoch   1:  loss ~ 0.9-1.0  (random init, cosine sim near 0)
+  Epoch  10:  loss ~ 0.4-0.7  (warmup complete, student starting to align)
+  Epoch  30:  loss ~ 0.15-0.4
+  Epoch 100:  loss ~ 0.05-0.2  (plateau)
 
   embedding_std should stay ABOVE 0.1 throughout training.
   If it drops below 0.05, representations are collapsing --
@@ -360,10 +361,11 @@ def main() -> None:
 
     # ----- Training loop -----
     # Expected loss trajectory (healthy training):
-    #   Epoch   1: ~2.0    (random init, unit-sphere MSE for uncorrelated vectors)
-    #   Epoch  10: ~0.8-1.2
-    #   Epoch  30: ~0.4-0.7
-    #   Epoch 100: ~0.15-0.35 (plateau)
+    #   Loss = 1 - cosine_similarity  (range [0, 2])
+    #   Epoch   1: ~0.9-1.0  (random init, cosine sim near 0)
+    #   Epoch  10: ~0.4-0.7  (warmup complete, student starting to align)
+    #   Epoch  30: ~0.15-0.4
+    #   Epoch 100: ~0.05-0.2 (plateau)
     #
     # Collapse detection:
     #   embedding_std measures the average per-dimension standard deviation

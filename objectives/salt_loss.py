@@ -1,25 +1,24 @@
 """
-objectives/salt_loss.py — Learning objective for FedMamba-SALT.
+objectives/salt_loss.py -- Learning objective for FedMamba-SALT.
 
-The loss is normalised MSE between the student's projected embedding and
-the teacher's embedding.  Three implementation details are critical:
+The loss is 1 - cosine_similarity between the student's projected embedding
+and the teacher's embedding, averaged over the batch.  Two implementation
+details are critical:
 
-    1. **Detach the teacher** — ``teacher_emb.detach()`` is called inside the
+    1. **Detach the teacher** -- ``teacher_emb.detach()`` is called inside the
        loss function as an explicit guarantee that no gradients flow into the
        teacher, even across PyTorch versions with different autograd semantics.
 
-    2. **L2-normalise both vectors** — Without normalisation, the trivial
-       minimum is the zero vector (representation collapse).  On the unit
-       hypersphere the only way to reduce MSE is to align *directions*, not
-       magnitudes.  Normalised MSE = 2·(1 − cos θ), ranging from 0
-       (identical) to 4 (opposite).
-
-    3. **Use F.mse_loss, not cosine embedding loss** — MSE gives cleaner
-       gradient magnitudes and requires no margin hyperparameter.
+    2. **L2-normalise both vectors** -- Kept for numerical stability even
+       though cosine_similarity handles unnormalized inputs.  Normalisation
+       also ensures the loss has a clean, interpretable range:
+           0.0 = perfect alignment
+           1.0 = orthogonal (uncorrelated)
+           2.0 = opposite directions
 
 References:
-    • BYOL (Grill et al., 2020) — projection-head architectural pattern
-    • VICReg (Bardes et al., 2022) — embedding std collapse diagnostic
+    - BYOL (Grill et al., 2020) -- projection-head architectural pattern
+    - VICReg (Bardes et al., 2022) -- embedding std collapse diagnostic
 """
 
 import torch
@@ -85,8 +84,15 @@ def salt_loss(
     teacher_emb: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Normalised MSE loss between the student's projected embedding and the
-    teacher's embedding.
+    Cosine alignment loss between the student's projected embedding and
+    the teacher's embedding.
+
+    Loss = 1 - cosine_similarity(student, teacher), averaged over batch.
+
+    Range:
+        0.0 = perfect alignment (identical directions)
+        1.0 = orthogonal (uncorrelated)
+        2.0 = opposite directions
 
     Args:
         student_proj: ``(B, D)`` output of the projection head.
@@ -95,27 +101,24 @@ def salt_loss(
     Returns:
         Scalar loss tensor.
     """
-    # Detail 1 — Detach the teacher embedding.
+    # Detail 1 -- Detach the teacher embedding.
     # The teacher's @torch.no_grad() prevents gradient computation through
     # teacher *parameters*, but does not fully sever the computation graph
     # in all PyTorch versions.  Explicit .detach() is the definitive
     # guarantee that no gradient signal flows into the teacher.
     teacher_emb = teacher_emb.detach()
 
-    # Detail 2 — L2-normalise both vectors.
-    # Constrains embeddings to the unit hypersphere where the only way to
-    # reduce MSE is to align directions, not magnitudes.
-    # On the unit sphere: MSE = 2 * (1 - cos(θ))
-    #   • identical vectors → 0.0
-    #   • orthogonal vectors → 2.0
-    #   • opposite vectors   → 4.0
+    # Detail 2 -- L2-normalise both vectors for numerical stability.
+    # cosine_similarity handles unnormalized inputs, but pre-normalising
+    # keeps the gradient magnitudes well-behaved.
     student_proj = F.normalize(student_proj, dim=-1, p=2)
     teacher_emb = F.normalize(teacher_emb, dim=-1, p=2)
 
-    # Detail 3 — Use F.mse_loss (not cosine embedding loss).
-    # MSE gives cleaner gradient magnitudes and has no margin
-    # hyperparameter to tune.
-    return F.mse_loss(student_proj, teacher_emb)
+    # Detail 3 -- Cosine alignment loss.
+    # Equivalent to normalized MSE up to a constant scale factor (the
+    # gradient *direction* is identical), but with the human-readable
+    # range [0, 2] instead of [0, 4/D].
+    return (1.0 - F.cosine_similarity(student_proj, teacher_emb, dim=-1)).mean()
 
 
 # ======================================================================
