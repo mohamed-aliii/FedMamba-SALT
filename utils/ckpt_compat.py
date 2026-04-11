@@ -3,60 +3,86 @@ utils/ckpt_compat.py -- Cross-version compatible checkpoint loading.
 
 SSL-FL checkpoints embed ``argparse.Namespace`` objects that contain
 pandas DataFrames (``args.record_val_acc``, ``args.record_test_acc``).
-When loaded on a newer pandas version, ``torch.load`` crashes because
-the internal ``new_block()`` constructor changed its ``placement``
-argument from ``slice`` to ``BlockPlacement``.
+When loaded on a newer pandas, the ``new_block()`` constructor fails
+because old pickled blocks pass ``slice`` for ``placement``, while
+newer pandas expects ``BlockPlacement``.
 
-This module patches pandas before loading so the unpickler succeeds.
-The ``'model'`` key (actual weights) is never affected.
+This module hooks into torch.load's pickle machinery to intercept
+``pandas.core.internals.blocks.new_block`` at unpickle time and patch
+the placement argument before it reaches the C extension.
 """
+
+import pickle
+from typing import Any
 
 import torch
 
 
-def _patch_pandas() -> None:
+def _make_safe_new_block():
     """
-    Monkey-patch ``pandas.core.internals.blocks.new_block`` so that
-    old pickled DataFrames (which pass a plain ``slice`` for placement)
-    can be unpickled on newer pandas versions that expect a
-    ``BlockPlacement`` object.
-
-    Safe to call multiple times -- only patches once.
+    Return a wrapper around ``pandas.core.internals.blocks.new_block``
+    that converts ``slice`` placement args to ``BlockPlacement``.
     """
-    try:
-        import pandas as pd
-        from pandas.core.internals import blocks as _blocks
-    except ImportError:
-        return  # no pandas => no problem
+    from pandas.core.internals.blocks import new_block as _real_new_block
+    from pandas._libs.internals import BlockPlacement
 
-    # Check if already patched
-    if getattr(_blocks, '_fedmamba_patched', False):
-        return
+    def _safe_new_block(*args, **kwargs):
+        # Convert slice -> BlockPlacement in positional args
+        args = list(args)
+        for i, a in enumerate(args):
+            if isinstance(a, slice):
+                args[i] = BlockPlacement(a)
+        # Convert slice -> BlockPlacement in keyword args
+        for k, v in kwargs.items():
+            if isinstance(v, slice):
+                kwargs[k] = BlockPlacement(v)
+        return _real_new_block(*args, **kwargs)
 
-    _original_new_block = _blocks.new_block
+    return _safe_new_block
 
-    def _patched_new_block(*args, **kwargs):
-        # placement can be 3rd positional arg or a keyword arg
-        from pandas._libs.internals import BlockPlacement
-        if len(args) >= 3 and isinstance(args[2], slice):
-            args = list(args)
-            args[2] = BlockPlacement(args[2])
-            args = tuple(args)
-        elif 'placement' in kwargs and isinstance(kwargs['placement'], slice):
-            kwargs['placement'] = BlockPlacement(kwargs['placement'])
-        return _original_new_block(*args, **kwargs)
 
-    _blocks.new_block = _patched_new_block
-    _blocks._fedmamba_patched = True
+class _CompatUnpickler(pickle.Unpickler):
+    """
+    Custom unpickler that intercepts ``pandas.core.internals.blocks.new_block``
+    and returns a safe wrapper that converts slice -> BlockPlacement.
+
+    This is the ONLY reliable way to handle this because:
+    - Pickle's GLOBAL opcode calls ``find_class`` to resolve functions
+    - The resolved function is then called via REDUCE with arguments
+    - Monkeypatching the module attribute doesn't work if the pickle
+      stream has a direct GLOBAL reference to the original function
+    """
+
+    def find_class(self, module: str, name: str) -> Any:
+        if module == "pandas.core.internals.blocks" and name == "new_block":
+            return _make_safe_new_block()
+        return super().find_class(module, name)
+
+
+class _CompatPickleModule:
+    """
+    A module-like object that provides our custom Unpickler to torch.load.
+    torch.load uses ``pickle_module.Unpickler`` internally.
+    """
+    Unpickler = _CompatUnpickler
+
+    # Forward all other pickle attributes to the real module
+    def __getattr__(self, name):
+        return getattr(pickle, name)
+
+
+# Singleton instance
+_compat_pickle = _CompatPickleModule()
 
 
 def safe_torch_load(path: str, map_location: str = "cpu") -> dict:
     """
     Load a PyTorch checkpoint with graceful handling of stale pickled
-    pandas DataFrames (found in SSL-FL checkpoints).
+    pandas DataFrames found in SSL-FL checkpoints.
 
-    Patches pandas internals before loading, then uses standard
-    ``torch.load(..., weights_only=False)``.
+    Uses a custom pickle module with an ``Unpickler`` that intercepts
+    ``new_block`` calls and fixes the ``slice`` -> ``BlockPlacement``
+    type mismatch.
 
     Args:
         path: Path to the ``.pth`` checkpoint file.
@@ -65,5 +91,15 @@ def safe_torch_load(path: str, map_location: str = "cpu") -> dict:
     Returns:
         The checkpoint dictionary.
     """
-    _patch_pandas()
-    return torch.load(path, map_location=map_location, weights_only=False)
+    try:
+        # Try standard load first (works for our own checkpoints)
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        # SSL-FL checkpoint with stale pandas — use custom unpickler
+        print("[safe_torch_load] Retrying with pandas-compat unpickler...")
+        return torch.load(
+            path,
+            map_location=map_location,
+            weights_only=False,
+            pickle_module=_compat_pickle,
+        )
