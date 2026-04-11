@@ -25,6 +25,7 @@ Expected training behavior (healthy run)
 """
 
 import argparse
+import csv
 import math
 import os
 import sys
@@ -49,6 +50,67 @@ from objectives.salt_loss import ProjectionHead, embedding_std, salt_loss
 # ======================================================================
 WARMUP_EPOCHS = 10
 COLLAPSE_THRESHOLD = 0.05  # embedding_std below this -> likely collapse
+METRICS_FILENAME = "training_metrics.csv"
+
+
+# ======================================================================
+# GPU memory tracking
+# ======================================================================
+def get_gpu_memory_mb() -> dict:
+    """
+    Return current and peak GPU memory usage in MB.
+    Returns zeros if CUDA is unavailable.
+    """
+    if not torch.cuda.is_available():
+        return {"gpu_mem_allocated_mb": 0.0, "gpu_mem_reserved_mb": 0.0, "gpu_mem_peak_mb": 0.0}
+    return {
+        "gpu_mem_allocated_mb": torch.cuda.memory_allocated() / (1024 ** 2),
+        "gpu_mem_reserved_mb": torch.cuda.memory_reserved() / (1024 ** 2),
+        "gpu_mem_peak_mb": torch.cuda.max_memory_allocated() / (1024 ** 2),
+    }
+
+
+# ======================================================================
+# CSV Metrics Logger
+# ======================================================================
+class MetricsLogger:
+    """
+    Append-mode CSV logger that writes one row per epoch.
+
+    Columns: epoch, loss, student_std, teacher_std, lr, epoch_time_s,
+             gpu_mem_allocated_mb, gpu_mem_reserved_mb, gpu_mem_peak_mb
+    """
+
+    COLUMNS = [
+        "epoch", "loss", "student_std", "teacher_std", "lr",
+        "epoch_time_s", "gpu_mem_allocated_mb", "gpu_mem_reserved_mb",
+        "gpu_mem_peak_mb",
+    ]
+
+    def __init__(self, output_dir: str):
+        self.path = os.path.join(output_dir, METRICS_FILENAME)
+        # Write header only if file doesn't exist (supports resume)
+        if not os.path.exists(self.path):
+            with open(self.path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(self.COLUMNS)
+
+    def log(self, epoch: int, loss: float, student_std: float,
+            teacher_std: float, lr: float, epoch_time: float,
+            gpu_mem: dict) -> None:
+        with open(self.path, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                epoch + 1,
+                f"{loss:.6f}",
+                f"{student_std:.6f}",
+                f"{teacher_std:.6f}",
+                f"{lr:.2e}",
+                f"{epoch_time:.1f}",
+                f"{gpu_mem['gpu_mem_allocated_mb']:.1f}",
+                f"{gpu_mem['gpu_mem_reserved_mb']:.1f}",
+                f"{gpu_mem['gpu_mem_peak_mb']:.1f}",
+            ])
 
 
 # ======================================================================
@@ -450,9 +512,16 @@ def main() -> None:
     #   meaning it has found a degenerate shortcut instead of learning
     #   meaningful representations.
 
+    # ----- Metrics logger -----
+    metrics_logger = MetricsLogger(args.output_dir)
+
     print(f"\n{'='*55}")
     print(f"  Starting training from epoch {start_epoch}")
     print(f"{'='*55}\n")
+
+    # Reset peak GPU memory counter for accurate per-run tracking
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
 
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
@@ -465,6 +534,7 @@ def main() -> None:
         scheduler.step()
         current_lr = optimizer.param_groups[0]["lr"]
         elapsed = time.time() - t0
+        gpu_mem = get_gpu_memory_mb()
 
         # ----- Logging -----
         print(
@@ -473,7 +543,14 @@ def main() -> None:
             f"s_std={avg_s_std:.4f}  "
             f"t_std={avg_t_std:.4f}  "
             f"lr={current_lr:.2e}  "
-            f"time={elapsed:.1f}s"
+            f"time={elapsed:.1f}s  "
+            f"gpu={gpu_mem['gpu_mem_allocated_mb']:.0f}MB"
+        )
+
+        # ----- Log to CSV -----
+        metrics_logger.log(
+            epoch, avg_loss, avg_s_std, avg_t_std,
+            current_lr, elapsed, gpu_mem,
         )
 
         # ----- Collapse warning -----
@@ -502,9 +579,15 @@ def main() -> None:
             )
             print(f"    -> Saved {name}")
 
+    # ----- Final GPU summary -----
+    if torch.cuda.is_available():
+        peak = torch.cuda.max_memory_allocated() / (1024 ** 2)
+        print(f"\n  Peak GPU memory: {peak:.0f} MB")
+
     print(f"\n{'='*55}")
     print(f"  Training complete.  Final loss: {avg_loss:.4f}")
-    print(f"  Checkpoints saved to: {args.output_dir}")
+    print(f"  Metrics saved to:  {os.path.join(args.output_dir, METRICS_FILENAME)}")
+    print(f"  Checkpoints saved: {args.output_dir}")
     print(f"{'='*55}")
 
 
