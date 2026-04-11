@@ -106,34 +106,53 @@ class FrozenViTTeacher(nn.Module):
     # Checkpoint loading with prefix stripping
     # ------------------------------------------------------------------
     def _load_mae_checkpoint(self, ckpt_path: str) -> None:
-        """Load an MAE checkpoint, stripping the ``encoder.`` key prefix."""
+        """Load an MAE checkpoint, handling both prefixed and unprefixed formats.
+
+        Format A (Facebook MAE):  keys start with ``encoder.`` — strip prefix.
+        Format B (SSL-FL):        keys have no prefix — filter out decoder keys.
+        """
         ckpt = safe_torch_load(ckpt_path, map_location="cpu")
 
         # MAE checkpoints nest the state dict under "model"
         state_dict = ckpt.get("model", ckpt)
 
-        # Strip the 'encoder.' prefix that MAE adds to every encoder key.
-        # Non-encoder keys (decoder weights, mask token, etc.) are dropped.
+        # --- Try Format A: strip 'encoder.' prefix ---
         prefix = "encoder."
-        stripped: dict[str, torch.Tensor] = {}
-        for key, value in state_dict.items():
-            if key.startswith(prefix):
-                stripped[key[len(prefix):]] = value
-            # Keys without the prefix belong to the MAE decoder -- skip them.
+        stripped = {
+            key[len(prefix):]: value
+            for key, value in state_dict.items()
+            if key.startswith(prefix)
+        }
 
-        result = self.encoder.load_state_dict(stripped, strict=False)
+        if len(stripped) > 0:
+            # Format A: Facebook MAE checkpoint
+            encoder_state = stripped
+            fmt = "Format A (encoder.* prefix)"
+        else:
+            # --- Format B: no prefix, filter out decoder/mask keys ---
+            DECODER_PREFIXES = ("decoder_", "decoder.", "mask_token")
+            encoder_state = {
+                key: value
+                for key, value in state_dict.items()
+                if not any(key.startswith(p) for p in DECODER_PREFIXES)
+            }
+            fmt = "Format B (no prefix, decoder keys filtered)"
+
+        result = self.encoder.load_state_dict(encoder_state, strict=False)
 
         n_missing = len(result.missing_keys)
         n_unexpected = len(result.unexpected_keys)
 
         print(f"[FrozenViTTeacher] Loaded checkpoint: {ckpt_path}")
+        print(f"  Detected: {fmt}")
+        print(f"  Encoder keys loaded: {len(encoder_state)}")
         print(f"  Missing keys:    {n_missing}")
         print(f"  Unexpected keys: {n_unexpected}")
 
         if n_missing > 20:
             print(
                 f"  WARNING: {n_missing} missing keys is suspicious -- "
-                "check prefix stripping logic or checkpoint format."
+                "check checkpoint format."
             )
         if n_unexpected > 0:
             print(

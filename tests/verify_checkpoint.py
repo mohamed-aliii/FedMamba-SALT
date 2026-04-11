@@ -128,13 +128,11 @@ def main() -> None:
 
     print(f"\n  Detected prefix: '{detected_prefix}'")
     if detected_prefix == "encoder.":
-        print(f"  [OK] This matches vit_teacher.py's stripping logic.")
+        print(f"  [OK] Format A: vit_teacher.py will strip 'encoder.' prefix.")
     elif detected_prefix == "(none)":
-        print(f"  [WARNING] No prefix detected. vit_teacher.py strips 'encoder.' --")
-        print(f"  if there is no prefix, stripping will yield 0 matching keys.")
+        print(f"  [OK] Format B (SSL-FL): no prefix. vit_teacher.py will filter decoder keys.")
     else:
-        print(f"  [WARNING] Prefix '{detected_prefix}' does not match 'encoder.'")
-        print(f"  vit_teacher.py may need to be updated to strip this prefix.")
+        print(f"  [WARNING] Prefix '{detected_prefix}' — vit_teacher.py may need updating.")
 
     # ==================================================================
     # Step 5: Check patch embedding weight
@@ -183,23 +181,37 @@ def main() -> None:
         results.append(("patch_embed shape [768,3,16,16]", shape_ok))
 
     # ==================================================================
-    # Step 6: Simulate prefix stripping and test loading
+    # Step 6: Simulate vit_teacher.py loading (dual-format)
     # ==================================================================
-    print(f"\n[Step 6] Simulating vit_teacher.py prefix stripping...")
+    print(f"\n[Step 6] Simulating vit_teacher.py checkpoint loading...")
 
+    # --- Try Format A: strip 'encoder.' prefix ---
     prefix = "encoder."
-    stripped = {}
-    for key, value in state_dict.items():
-        if key.startswith(prefix):
-            stripped[key[len(prefix):]] = value
+    stripped = {
+        key[len(prefix):]: value
+        for key, value in state_dict.items()
+        if key.startswith(prefix)
+    }
 
-    print(f"  Keys before stripping: {len(state_dict)}")
-    print(f"  Keys after stripping '{prefix}': {len(stripped)}")
+    if len(stripped) > 0:
+        encoder_state = stripped
+        fmt = "Format A (encoder.* prefix stripped)"
+    else:
+        # --- Format B: no prefix, filter out decoder/mask keys ---
+        DECODER_PREFIXES = ("decoder_", "decoder.", "mask_token")
+        encoder_state = {
+            key: value
+            for key, value in state_dict.items()
+            if not any(key.startswith(p) for p in DECODER_PREFIXES)
+        }
+        fmt = "Format B (no prefix, decoder keys filtered)"
 
-    if len(stripped) == 0:
-        print(f"  [ERROR] No keys survived stripping. The checkpoint may use")
-        print(f"  a different prefix than 'encoder.'")
-        results.append(("prefix stripping < 20 missing keys", False))
+    print(f"  Detected: {fmt}")
+    print(f"  Encoder keys: {len(encoder_state)}")
+
+    if len(encoder_state) == 0:
+        print(f"  [ERROR] No encoder keys found in checkpoint.")
+        results.append(("encoder loading < 20 missing keys", False))
     else:
         # Try loading into a VisionTransformer
         try:
@@ -217,7 +229,7 @@ def main() -> None:
                 qkv_bias=True,
                 norm_layer=functools.partial(nn.LayerNorm, eps=1e-6),
             )
-            load_result = vit.load_state_dict(stripped, strict=False)
+            load_result = vit.load_state_dict(encoder_state, strict=False)
 
             n_missing = len(load_result.missing_keys)
             n_unexpected = len(load_result.unexpected_keys)
@@ -232,24 +244,22 @@ def main() -> None:
                     print(f"    - {k}")
 
             few_missing = n_missing <= 20
-            results.append(("prefix stripping < 20 missing keys", few_missing))
+            results.append(("encoder loading < 20 missing keys", few_missing))
 
         except ImportError:
             print(f"  [SKIP] timm not installed -- cannot test load_state_dict.")
             print(f"  Install timm==0.3.2 to enable this check.")
-            # Count stripped keys vs expected ViT-B/16 params (~152 tensors)
-            reasonable_count = len(stripped) > 50
+            reasonable_count = len(encoder_state) > 50
             tag = "OK" if reasonable_count else "WARNING"
-            print(f"  [{tag}] {len(stripped)} stripped keys "
+            print(f"  [{tag}] {len(encoder_state)} encoder keys "
                   f"(ViT-B/16 has ~152 parameter tensors)")
-            results.append(("prefix stripping < 20 missing keys", reasonable_count))
+            results.append(("encoder loading < 20 missing keys", reasonable_count))
 
         except Exception as e:
             print(f"  [ERROR] Failed to construct VisionTransformer: {e}")
             print(f"  This may be a timm version compatibility issue.")
-            # Fall back to key count heuristic
-            reasonable_count = len(stripped) > 50
-            results.append(("prefix stripping < 20 missing keys", reasonable_count))
+            reasonable_count = len(encoder_state) > 50
+            results.append(("encoder loading < 20 missing keys", reasonable_count))
 
     # ==================================================================
     # Step 7: Final summary
