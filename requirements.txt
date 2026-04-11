@@ -25,16 +25,16 @@ timm==0.3.2
 # ---------------------------------------------------------------------------
 # Student backbone (Inception-Mamba / selective-state-space layers)
 # ---------------------------------------------------------------------------
-# mamba-ssm 1.2.0 — The Mamba CUDA kernel interface (selective_scan_fn,
-# mamba_inner_fn) has breaking signature changes across minor versions.
-# Pinning avoids silent numerical errors or hard crashes at runtime.
-mamba-ssm==1.2.0
+# mamba-ssm — The Mamba CUDA kernel interface (selective_scan_fn,
+# mamba_inner_fn).  On Google Colab, use --no-build-isolation so the
+# build can see the existing PyTorch/CUDA.
+# Tested with: mamba-ssm 1.2.0+ / causal-conv1d 1.4.0+
+mamba-ssm>=1.2.0
 
-# causal-conv1d 1.2.0.post2 — Hard build-time + runtime dependency of mamba-ssm.
-# Version must match exactly; a mismatch causes ImportError or CUDA
-# symbol-resolution failures when mamba-ssm loads its kernels.
-# Note: 1.2.0 does not exist on PyPI; 1.2.0.post2 is the actual release.
-causal-conv1d==1.2.0.post2
+# causal-conv1d — Hard build-time + runtime dependency of mamba-ssm.
+# Must be installed BEFORE mamba-ssm.
+# On Colab: pip install causal-conv1d>=1.4.0 --no-build-isolation
+causal-conv1d>=1.4.0
 
 # ---------------------------------------------------------------------------
 # Tensor utilities
