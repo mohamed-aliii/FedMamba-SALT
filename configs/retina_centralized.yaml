@@ -1,0 +1,73 @@
+# =============================================================================
+# FedMamba-SALT -- Retina Centralized Experiment Configuration
+# =============================================================================
+#
+# This config stores the full hyperparameter set for the centralized
+# (non-federated) SALT pre-training experiment on the Retina dataset.
+#
+# Usage with train_centralized.py:
+#   python train_centralized.py \
+#       --data_path /path/to/retina \
+#       --teacher_ckpt data/ckpts/mae_vit_base.pth \
+#       --output_dir outputs/retina_centralized \
+#       --epochs 100 \
+#       --batch_size 128 \
+#       --lr 0.001 \
+#       --weight_decay 0.05 \
+#       --num_workers 4 \
+#       --save_every 10
+#
+# Or equivalently, source this YAML from a config loader.
+# =============================================================================
+
+# -- Data --
+data_path: "/path/to/retina"          # Change to actual dataset root
+                                       # Must have train/ subdirectory
+num_classes: 5                         # Retina: 5 disease categories
+
+# -- Teacher checkpoint --
+teacher_ckpt: "data/ckpts/mae_vit_base.pth"
+
+# -- Output --
+output_dir: "outputs/retina_centralized"
+
+# -- Training --
+epochs: 100
+batch_size: 128
+lr: 1.0e-3
+weight_decay: 0.05
+warmup_epochs: 10                      # Linear warmup: lr/10 -> lr
+
+# -- Student architecture --
+patch_size: 16
+embed_dim: 256
+depth: 4
+out_dim: 768
+
+# -- Infrastructure --
+num_workers: 4
+save_every: 10
+device: "cuda"
+
+# -- Evaluation --
+eval_mode: "linear_probe"              # or "full_finetune"
+eval_epochs: 50
+eval_batch_size: 256
+eval_lr: 1.0e-3
+
+# =============================================================================
+# Expected training behavior (healthy run)
+# =============================================================================
+# Epoch   1:  loss ~ 2.0     (random initialization on unit sphere)
+# Epoch  10:  loss ~ 0.8-1.2
+# Epoch  30:  loss ~ 0.4-0.7
+# Epoch 100:  loss ~ 0.15-0.35  (plateau)
+#
+# embedding_std should stay ABOVE 0.1 throughout.
+# If it drops below 0.05 -> representation collapse, stop and debug.
+#
+# Success criteria:
+#   1. Final loss < 0.5
+#   2. embedding_std never < 0.05
+#   3. Linear probe accuracy within 5% of Fed-MAE baseline (77.43%)
+# =============================================================================

@@ -45,9 +45,91 @@ pip install -r requirements.txt
 # 4. Place the MAE ViT-B/16 checkpoint in data/ckpts/
 #    (see scripts/ for download helpers)
 
-# 5. Run centralized training
-python train_centralized.py --config configs/default.yaml
+# 5. Run the smoke test to verify everything works
+python -m tests.test_end_to_end
+
+# 6. Run centralized training
+python train_centralized.py \
+    --data_path /path/to/retina \
+    --teacher_ckpt data/ckpts/mae_vit_base.pth \
+    --output_dir outputs/retina_centralized \
+    --epochs 100
+
+# 7. Evaluate the trained encoder
+python -m eval.linear_probe \
+    --encoder_ckpt outputs/retina_centralized/ckpt_latest.pth \
+    --data_path /path/to/retina \
+    --num_classes 5
 ```
+
+Or use the all-in-one launch script:
+
+```bash
+bash scripts/run_centralized_retina.sh
+```
+
+## Running the Experiment
+
+### 1. Smoke Test
+
+Before committing to a full training run, verify all components integrate:
+
+```bash
+python -m tests.test_end_to_end
+```
+
+This instantiates the full pipeline (teacher + student + projector), runs a
+forward pass and one gradient step on synthetic data, and confirms everything
+is wired correctly. Should finish in under 60 seconds.
+
+### 2. Pre-training
+
+```bash
+python train_centralized.py \
+    --data_path /path/to/retina \
+    --epochs 100 --batch_size 128 --lr 1e-3
+```
+
+All hyperparameters are also stored in `configs/retina_centralized.yaml`.
+Training automatically resumes from `ckpt_latest.pth` if interrupted.
+
+### 3. Evaluation
+
+```bash
+# Linear probe (diagnostic)
+python -m eval.linear_probe \
+    --encoder_ckpt outputs/retina_centralized/ckpt_latest.pth \
+    --data_path /path/to/retina --num_classes 5 --mode linear_probe
+
+# Full fine-tuning (apples-to-apples comparison with Fed-MAE)
+python -m eval.linear_probe \
+    --encoder_ckpt outputs/retina_centralized/ckpt_latest.pth \
+    --data_path /path/to/retina --num_classes 5 --mode full_finetune
+```
+
+## Success Criteria
+
+A successful centralized experiment must meet **all three** conditions:
+
+| # | Condition | Threshold | Why |
+|---|---|---|---|
+| 1 | **SALT loss at epoch 100** | < 0.5 | Confirms the student is learning to match the teacher's embedding space |
+| 2 | **embedding_std throughout training** | never < 0.05 | Ensures no representation collapse (all embeddings collapsing to the same vector) |
+| 3 | **Linear probe accuracy on Retina test set** | within 5% of 77.43% | Fed-MAE achieves 77.43% with full fine-tuning on Retina Split-3. Since linear probing is strictly weaker than fine-tuning, reaching ~72%+ with a frozen encoder indicates strong representations |
+
+## Expected Training Behavior
+
+| Epoch | Expected Loss | Notes |
+|---|---|---|
+| 1 | ~2.0 | Random initialization; MSE of two uncorrelated unit vectors |
+| 10 | ~0.8 - 1.2 | Warmup complete, student starting to align |
+| 30 | ~0.4 - 0.7 | Student learning meaningful features |
+| 100 | ~0.15 - 0.35 | Plateau; diminishing returns |
+
+**Warning signs:**
+- Loss stuck above 1.5 after epoch 20 --> check learning rate, augmentations, or data loading
+- embedding_std drops below 0.05 --> representation collapse, stop and debug
+- Loss goes to NaN --> gradient explosion, reduce learning rate or check for data issues
 
 ## Dependency Notes
 
