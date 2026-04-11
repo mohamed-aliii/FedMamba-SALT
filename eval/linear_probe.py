@@ -43,6 +43,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.inception_mamba import InceptionMambaEncoder
+from utils.ckpt_compat import safe_torch_load
 
 
 # ======================================================================
@@ -129,7 +130,7 @@ def load_encoder(ckpt_path: str, device: str, freeze: bool) -> InceptionMambaEnc
         patch_size=16, embed_dim=256, depth=4, out_dim=768,
     )
 
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    ckpt = safe_torch_load(ckpt_path, map_location="cpu")
     state_dict = ckpt.get("student_state_dict", ckpt)
     encoder.load_state_dict(state_dict)
     print(f"[Encoder] Loaded weights from: {ckpt_path}")

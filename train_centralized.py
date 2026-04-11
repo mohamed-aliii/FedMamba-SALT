@@ -44,6 +44,7 @@ from augmentations.medical_aug import DualViewDataset
 from models.inception_mamba import InceptionMambaEncoder
 from models.vit_teacher import FrozenViTTeacher
 from objectives.salt_loss import ProjectionHead, embedding_std, salt_loss
+from utils.ckpt_compat import safe_torch_load
 
 # ======================================================================
 # Constants
@@ -384,7 +385,7 @@ def try_resume(
         return 0
 
     print(f"[RESUME] Loading checkpoint: {latest_path}")
-    ckpt = torch.load(latest_path, map_location=device, weights_only=False)
+    ckpt = safe_torch_load(latest_path, map_location=device)
 
     student.load_state_dict(ckpt["student_state_dict"])
     projector.load_state_dict(ckpt["projector_state_dict"])

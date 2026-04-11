@@ -22,6 +22,8 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
+from utils.ckpt_compat import safe_torch_load
+
 # Ensure project root is on sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -64,7 +66,7 @@ def main() -> None:
     # Step 2: Load checkpoint and inspect top-level keys
     # ==================================================================
     print(f"\n[Step 2] Loading checkpoint...")
-    ckpt = torch.load(args.ckpt_path, map_location="cpu", weights_only=False)
+    ckpt = safe_torch_load(args.ckpt_path, map_location="cpu")
 
     if isinstance(ckpt, dict):
         top_keys = list(ckpt.keys())

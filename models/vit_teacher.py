@@ -24,6 +24,8 @@ import torch
 import torch.nn as nn
 from timm.models.vision_transformer import VisionTransformer
 
+from utils.ckpt_compat import safe_torch_load
+
 
 class FrozenViTTeacher(nn.Module):
     """
@@ -105,7 +107,7 @@ class FrozenViTTeacher(nn.Module):
     # ------------------------------------------------------------------
     def _load_mae_checkpoint(self, ckpt_path: str) -> None:
         """Load an MAE checkpoint, stripping the ``encoder.`` key prefix."""
-        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        ckpt = safe_torch_load(ckpt_path, map_location="cpu")
 
         # MAE checkpoints nest the state dict under "model"
         state_dict = ckpt.get("model", ckpt)
