@@ -93,13 +93,13 @@ def test_end_to_end() -> bool:
 
     # ----- SALT loss -----
     print("  [5/8] Computing SALT loss...")
-    loss = salt_loss(s_proj, t_emb)
+    loss, align_loss, var_loss = salt_loss(s_proj, t_emb)
 
     # ----- Check loss is finite -----
     loss_val = loss.item()
     is_finite = torch.isfinite(loss).item()
     tag = "PASS" if is_finite else "FAIL"
-    print(f"  [{tag}] Loss is finite: {loss_val:.6f}")
+    print(f"  [{tag}] Loss is finite: {loss_val:.6f} (align={align_loss.item():.6f}, var={var_loss.item():.6f})")
     results.append(is_finite)
 
     # ----- Check embedding_std -----

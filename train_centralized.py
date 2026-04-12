@@ -420,13 +420,15 @@ def train_one_epoch(
 ) -> tuple:
     """
     Run one epoch of SALT training.
-    Returns (avg_loss, avg_student_std, avg_teacher_std).
+    Returns (avg_loss, avg_align, avg_var, avg_student_std, avg_teacher_std).
     """
     student.train()
     projector.train()
     # teacher stays in eval() permanently (enforced inside its forward())
 
     total_loss = 0.0
+    total_align = 0.0
+    total_var = 0.0
     total_s_std = 0.0
     total_t_std = 0.0
     n_batches = 0
@@ -444,8 +446,8 @@ def train_one_epoch(
         s_emb = student(student_view)                    # (B, 768)
         s_proj = projector(s_emb)                        # (B, 768)
 
-        # ----- SALT loss -----
-        loss = salt_loss(s_proj, t_emb)
+        # ----- SALT loss + VICReg variance penalty -----
+        loss, align_loss, var_loss = salt_loss(s_proj, t_emb)
 
         # ----- Collapse diagnostics -----
         s_std = embedding_std(s_proj.detach())
@@ -461,19 +463,27 @@ def train_one_epoch(
         optimizer.step()
 
         # ----- Accumulate metrics -----
-        batch_loss = loss.item()
-        total_loss += batch_loss
+        total_loss += loss.item()
+        total_align += align_loss.item()
+        total_var += var_loss.item()
         total_s_std += s_std
         total_t_std += t_std
         n_batches += 1
 
-        pbar.set_postfix(loss=f"{batch_loss:.4f}", s_std=f"{s_std:.3f}")
+        pbar.set_postfix(
+            loss=f"{loss.item():.4f}",
+            align=f"{align_loss.item():.4f}",
+            var=f"{var_loss.item():.3f}",
+            s_std=f"{s_std:.3f}",
+        )
 
     avg_loss = total_loss / max(1, n_batches)
+    avg_align = total_align / max(1, n_batches)
+    avg_var = total_var / max(1, n_batches)
     avg_s_std = total_s_std / max(1, n_batches)
     avg_t_std = total_t_std / max(1, n_batches)
 
-    return avg_loss, avg_s_std, avg_t_std
+    return avg_loss, avg_align, avg_var, avg_s_std, avg_t_std
 
 
 # ======================================================================
@@ -536,7 +546,7 @@ def main() -> None:
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
 
-        avg_loss, avg_s_std, avg_t_std = train_one_epoch(
+        avg_loss, avg_align, avg_var, avg_s_std, avg_t_std = train_one_epoch(
             teacher, student, projector, dataloader, optimizer, args.device,
         )
 
@@ -550,6 +560,8 @@ def main() -> None:
         print(
             f"  Epoch [{epoch + 1:3d}/{args.epochs}]  "
             f"loss={avg_loss:.4f}  "
+            f"align={avg_align:.4f}  "
+            f"var={avg_var:.4f}  "
             f"s_std={avg_s_std:.4f}  "
             f"t_std={avg_t_std:.4f}  "
             f"lr={current_lr:.2e}  "

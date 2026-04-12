@@ -36,7 +36,7 @@ def test_loss_scalar_and_grad() -> bool:
     student_proj = torch.randn(BATCH, DIM, requires_grad=True)
     teacher_emb = torch.randn(BATCH, DIM)
 
-    loss = salt_loss(student_proj, teacher_emb)
+    loss, align, var = salt_loss(student_proj, teacher_emb)
 
     is_scalar = loss.dim() == 0
     has_grad = loss.requires_grad is True
@@ -56,11 +56,11 @@ def test_loss_identical() -> bool:
 
     # Pass the same tensor as both arguments.  salt_loss will normalise
     # and detach internally.
-    loss = salt_loss(v.clone().requires_grad_(True), v.clone())
+    loss, align, var = salt_loss(v.clone().requires_grad_(True), v.clone())
 
-    passed = loss.item() < TOL
+    passed = align.item() < TOL
     tag = "PASS" if passed else "FAIL"
-    print(f"  [{tag}] Test 2 -- Identical vectors: loss = {loss.item():.6e}  "
+    print(f"  [{tag}] Test 2 -- Identical vectors: align_loss = {align.item():.6e}  "
           f"(expected ~0.0)")
     return passed
 
@@ -80,11 +80,11 @@ def test_loss_orthogonal() -> bool:
     a = q[:, 0].unsqueeze(0).expand(BATCH, -1)  # (B, DIM), unit norm
     b = q[:, 1].unsqueeze(0).expand(BATCH, -1)  # (B, DIM), unit norm
 
-    loss = salt_loss(a.clone().requires_grad_(True), b.clone())
+    loss, align, var = salt_loss(a.clone().requires_grad_(True), b.clone())
 
-    passed = abs(loss.item() - EXPECTED_ORTHO) < TOL
+    passed = abs(align.item() - EXPECTED_ORTHO) < TOL
     tag = "PASS" if passed else "FAIL"
-    print(f"  [{tag}] Test 3 -- Orthogonal vectors: loss = {loss.item():.6f}  "
+    print(f"  [{tag}] Test 3 -- Orthogonal vectors: align_loss = {align.item():.6f}  "
           f"(expected {EXPECTED_ORTHO:.1f})")
     return passed
 
@@ -102,11 +102,11 @@ def test_loss_opposite() -> bool:
     v = torch.randn(BATCH, DIM)
     v = v / v.norm(dim=-1, keepdim=True)  # unit norm
 
-    loss = salt_loss(v.clone().requires_grad_(True), -v.clone())
+    loss, align, var = salt_loss(v.clone().requires_grad_(True), -v.clone())
 
-    passed = abs(loss.item() - EXPECTED_OPP) < TOL
+    passed = abs(align.item() - EXPECTED_OPP) < TOL
     tag = "PASS" if passed else "FAIL"
-    print(f"  [{tag}] Test 4 -- Opposite vectors: loss = {loss.item():.6f}  "
+    print(f"  [{tag}] Test 4 -- Opposite vectors: align_loss = {align.item():.6f}  "
           f"(expected {EXPECTED_OPP:.1f})")
     return passed
 
@@ -123,7 +123,7 @@ def test_gradient_isolation() -> bool:
     student_proj = torch.randn(BATCH, DIM, requires_grad=True)
     teacher_emb = torch.randn(BATCH, DIM, requires_grad=True)
 
-    loss = salt_loss(student_proj, teacher_emb)
+    loss, align, var = salt_loss(student_proj, teacher_emb)
     loss.backward()
 
     student_has_grad = student_proj.grad is not None
