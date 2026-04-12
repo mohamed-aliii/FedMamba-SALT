@@ -35,13 +35,15 @@ import torch.nn as nn
 from torch.optim import Adam, AdamW
 from torch.utils.data import DataLoader, TensorDataset
 from torchvision import transforms
-from torchvision.datasets import ImageFolder
+from torchvision import transforms
 from tqdm import tqdm
 
 # Ensure project root is on sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from augmentations.retina_dataset import RetinaDataset
+from augmentations.medical_aug import RETINA_MEAN, RETINA_STD
 from models.inception_mamba import InceptionMambaEncoder
 from utils.ckpt_compat import safe_torch_load
 
@@ -87,30 +89,34 @@ def parse_args() -> argparse.Namespace:
 # ======================================================================
 # Transforms
 # ======================================================================
-def get_eval_transform() -> transforms.Compose:
+def get_eval_transform(dataset: str = "retina") -> transforms.Compose:
     """
     Clean evaluation transform -- NO augmentations.
     Using heavy student augmentations here would artificially depress
     accuracy and make pre-training look worse than it is.
     """
+    mean = RETINA_MEAN if dataset == "retina" else IMAGENET_MEAN
+    std = RETINA_STD if dataset == "retina" else IMAGENET_STD
     return transforms.Compose([
         transforms.Resize(256),
         transforms.CenterCrop(224),
         transforms.ToTensor(),
-        transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        transforms.Normalize(mean=mean, std=std),
     ])
 
 
-def get_train_transform() -> transforms.Compose:
+def get_train_transform(dataset: str = "retina") -> transforms.Compose:
     """
     Mild training transform for full fine-tuning mode.
     Slightly stronger than eval but much weaker than the SALT student pipeline.
     """
+    mean = RETINA_MEAN if dataset == "retina" else IMAGENET_MEAN
+    std = RETINA_STD if dataset == "retina" else IMAGENET_STD
     return transforms.Compose([
         transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.ToTensor(),
-        transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        transforms.Normalize(mean=mean, std=std),
     ])
 
 
@@ -431,18 +437,23 @@ def main() -> None:
     # -------------------------------------------------------------------
     # Data
     # -------------------------------------------------------------------
-    train_root = os.path.join(args.data_path, "train")
-    test_root = os.path.join(args.data_path, "test")
-    for d in [train_root, test_root]:
-        if not os.path.isdir(d):
-            print(f"[ERROR] Directory not found: {d}")
-            sys.exit(1)
+    eval_transform = get_eval_transform(dataset="retina")
+    train_transform = get_train_transform(dataset="retina") if args.mode == "full_finetune" else eval_transform
 
-    eval_transform = get_eval_transform()
-    train_transform = get_train_transform() if args.mode == "full_finetune" else eval_transform
-
-    train_ds = ImageFolder(root=train_root, transform=train_transform)
-    test_ds = ImageFolder(root=test_root, transform=eval_transform)
+    train_ds = RetinaDataset(
+        data_path=args.data_path,
+        phase="train",
+        split_type="central",
+        split_csv="train.csv",
+        transform=train_transform,
+    )
+    test_ds = RetinaDataset(
+        data_path=args.data_path,
+        phase="test",
+        split_type="central",
+        split_csv="test.csv",
+        transform=eval_transform,
+    )
     class_names = train_ds.classes
 
     print(f"  Train: {len(train_ds)} images, {len(class_names)} classes")
