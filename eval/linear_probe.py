@@ -182,7 +182,10 @@ def extract_features(
 
     for images, labels in tqdm(dataloader, desc="  Extracting features", leave=False):
         images = images.to(device, non_blocking=True)
+        # Extract and explicitly L2-normalize. SALT optimized cosine similarity,
+        # so features MUST be on the unit sphere for linear probing to work effectively.
         features = encoder(images)  # (B, 768)
+        features = F.normalize(features, dim=-1, p=2)
         all_features.append(features.cpu())
         all_labels.append(labels)
 
