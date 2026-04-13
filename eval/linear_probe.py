@@ -32,6 +32,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import Adam, AdamW
 from torch.utils.data import DataLoader, TensorDataset
 from torchvision import transforms
