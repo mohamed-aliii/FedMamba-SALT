@@ -34,6 +34,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam, AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, TensorDataset
 from torchvision import transforms
 from torchvision import transforms
@@ -255,17 +256,43 @@ def train_finetune(
     encoder: nn.Module,
     classifier: nn.Linear,
     train_loader: DataLoader,
+    test_loader: DataLoader,
     epochs: int,
     lr: float,
     device: str,
+    num_classes: int,
+    class_names: list,
+    output_dir: str,
 ) -> None:
-    """End-to-end fine-tuning of encoder + classifier."""
-    params = list(encoder.parameters()) + list(classifier.parameters())
-    optimizer = AdamW(params, lr=lr, weight_decay=0.01)
+    """End-to-end fine-tuning of encoder + classifier.
+
+    Key improvements over naive fine-tuning:
+      1. Differential LR: encoder gets lr/20, classifier gets lr.
+         This prevents catastrophic forgetting of pre-trained features.
+      2. CosineAnnealingLR: smooth LR decay to settle into a minimum.
+      3. Per-epoch validation: tracks best test accuracy and saves
+         the best checkpoint automatically.
+    """
+    # -- Differential learning rates --
+    encoder_lr = lr * 0.05   # 1/20th of classifier LR
+    param_groups = [
+        {"params": encoder.parameters(), "lr": encoder_lr},
+        {"params": classifier.parameters(), "lr": lr},
+    ]
+    optimizer = AdamW(param_groups, weight_decay=0.01)
+    scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
     criterion = nn.CrossEntropyLoss()
 
+    all_params = list(encoder.parameters()) + list(classifier.parameters())
+
+    best_acc = 0.0
+    best_epoch = 0
+
     print(f"\n  Fine-tuning encoder + classifier on {len(train_loader.dataset)} images...")
+    print(f"  Encoder LR: {encoder_lr:.1e}  |  Classifier LR: {lr:.1e}  |  Epochs: {epochs}")
+
     for epoch in range(epochs):
+        # ---- Train ----
         encoder.train()
         classifier.train()
         total_loss = 0.0
@@ -282,18 +309,70 @@ def train_finetune(
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
             optimizer.step()
 
             total_loss += loss.item() * images.size(0)
             correct += (logits.argmax(dim=1) == labels).sum().item()
             total += images.size(0)
 
+        scheduler.step()
         avg_loss = total_loss / total
-        acc = 100.0 * correct / total
-        if (epoch + 1) % 5 == 0 or epoch == 0:
+        train_acc = 100.0 * correct / total
+
+        # ---- Validate every epoch ----
+        val_acc = _quick_eval(encoder, classifier, test_loader, device)
+
+        # ---- Best checkpoint ----
+        if val_acc > best_acc:
+            best_acc = val_acc
+            best_epoch = epoch + 1
+            ckpt_path = os.path.join(output_dir, "ckpt_best_finetune.pth")
+            torch.save({
+                "epoch": epoch,
+                "encoder_state_dict": encoder.state_dict(),
+                "classifier_state_dict": classifier.state_dict(),
+                "best_acc": best_acc,
+            }, ckpt_path)
+
+        enc_lr = optimizer.param_groups[0]["lr"]
+        cls_lr = optimizer.param_groups[1]["lr"]
+        marker = " *BEST*" if val_acc >= best_acc else ""
+        if (epoch + 1) % 5 == 0 or epoch == 0 or val_acc >= best_acc:
             print(f"    Epoch [{epoch + 1:3d}/{epochs}]  "
-                  f"loss={avg_loss:.4f}  train_acc={acc:.2f}%")
+                  f"loss={avg_loss:.4f}  train={train_acc:.2f}%  "
+                  f"val={val_acc:.2f}%  enc_lr={enc_lr:.1e}  cls_lr={cls_lr:.1e}{marker}")
+
+    print(f"\n  Best validation accuracy: {best_acc:.2f}% at epoch {best_epoch}")
+
+    # ---- Reload best checkpoint ----
+    best_path = os.path.join(output_dir, "ckpt_best_finetune.pth")
+    if os.path.exists(best_path):
+        best_ckpt = torch.load(best_path, map_location=device, weights_only=False)
+        encoder.load_state_dict(best_ckpt["encoder_state_dict"])
+        classifier.load_state_dict(best_ckpt["classifier_state_dict"])
+        print(f"  Loaded best checkpoint from epoch {best_epoch}")
+
+
+@torch.no_grad()
+def _quick_eval(
+    encoder: nn.Module,
+    classifier: nn.Linear,
+    loader: DataLoader,
+    device: str,
+) -> float:
+    """Fast accuracy computation on a DataLoader (no confusion matrix)."""
+    encoder.eval()
+    classifier.eval()
+    correct = 0
+    total = 0
+    for images, labels in loader:
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        logits = classifier(encoder(images))
+        correct += (logits.argmax(dim=1) == labels).sum().item()
+        total += labels.size(0)
+    return 100.0 * correct / total
 
 
 # ======================================================================
@@ -516,10 +595,12 @@ def main() -> None:
         )
 
     else:  # full_finetune
-        # Train end-to-end
+        # Train end-to-end with differential LR + best-checkpoint tracking
         train_finetune(
-            encoder, classifier, train_loader,
+            encoder, classifier, train_loader, test_loader,
             epochs=args.epochs, lr=args.lr, device=args.device,
+            num_classes=args.num_classes, class_names=class_names,
+            output_dir=args.output_dir,
         )
 
         # Evaluate
