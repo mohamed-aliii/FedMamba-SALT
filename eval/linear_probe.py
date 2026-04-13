@@ -21,8 +21,10 @@ Usage:
 """
 
 import argparse
+import csv
 import os
 import sys
+import time
 from pathlib import Path
 
 import matplotlib
@@ -36,7 +38,6 @@ import torch.nn.functional as F
 from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, TensorDataset
-from torchvision import transforms
 from torchvision import transforms
 from tqdm import tqdm
 
@@ -80,6 +81,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--num_workers", type=int, default=10,
+                   help="Number of DataLoader worker processes")
     p.add_argument(
         "--mode", type=str, default="linear_probe",
         choices=["linear_probe", "full_finetune"],
@@ -250,6 +253,20 @@ def train_linear_classifier(
 
 
 # ======================================================================
+# GPU memory helper
+# ======================================================================
+def _gpu_stats(device: str) -> dict:
+    """Return current GPU memory stats in MB."""
+    if not torch.cuda.is_available() or "cpu" in device:
+        return {"allocated_mb": 0, "reserved_mb": 0, "peak_mb": 0}
+    return {
+        "allocated_mb": torch.cuda.memory_allocated() / 1e6,
+        "reserved_mb": torch.cuda.memory_reserved() / 1e6,
+        "peak_mb": torch.cuda.max_memory_allocated() / 1e6,
+    }
+
+
+# ======================================================================
 # Full fine-tuning training
 # ======================================================================
 def train_finetune(
@@ -263,7 +280,7 @@ def train_finetune(
     num_classes: int,
     class_names: list,
     output_dir: str,
-) -> None:
+) -> dict:
     """End-to-end fine-tuning of encoder + classifier.
 
     Key improvements over naive fine-tuning:
@@ -272,6 +289,9 @@ def train_finetune(
       2. CosineAnnealingLR: smooth LR decay to settle into a minimum.
       3. Per-epoch validation: tracks best test accuracy and saves
          the best checkpoint automatically.
+
+    Returns:
+        dict with lists of per-epoch metrics for visualization.
     """
     # -- Differential learning rates --
     encoder_lr = lr * 0.05   # 1/20th of classifier LR
@@ -288,10 +308,28 @@ def train_finetune(
     best_acc = 0.0
     best_epoch = 0
 
+    # Metrics history for visualization
+    history = {
+        "epoch": [], "loss": [], "train_acc": [], "val_acc": [],
+        "enc_lr": [], "cls_lr": [], "time_s": [], "gpu_mb": [],
+    }
+
+    # CSV logger
+    csv_path = os.path.join(output_dir, "finetune_metrics.csv")
+    csv_columns = ["epoch", "loss", "train_acc", "val_acc", "enc_lr", "cls_lr", "time_s", "gpu_mb", "peak_gpu_mb"]
+    with open(csv_path, "w", newline="") as f:
+        csv.writer(f).writerow(csv_columns)
+
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
     print(f"\n  Fine-tuning encoder + classifier on {len(train_loader.dataset)} images...")
     print(f"  Encoder LR: {encoder_lr:.1e}  |  Classifier LR: {lr:.1e}  |  Epochs: {epochs}")
+    total_start = time.time()
 
     for epoch in range(epochs):
+        epoch_start = time.time()
+
         # ---- Train ----
         encoder.train()
         classifier.train()
@@ -323,6 +361,29 @@ def train_finetune(
         # ---- Validate every epoch ----
         val_acc = _quick_eval(encoder, classifier, test_loader, device)
 
+        epoch_time = time.time() - epoch_start
+        gpu = _gpu_stats(device)
+        enc_lr = optimizer.param_groups[0]["lr"]
+        cls_lr = optimizer.param_groups[1]["lr"]
+
+        # ---- Record history ----
+        history["epoch"].append(epoch + 1)
+        history["loss"].append(avg_loss)
+        history["train_acc"].append(train_acc)
+        history["val_acc"].append(val_acc)
+        history["enc_lr"].append(enc_lr)
+        history["cls_lr"].append(cls_lr)
+        history["time_s"].append(epoch_time)
+        history["gpu_mb"].append(gpu["allocated_mb"])
+
+        # ---- CSV log ----
+        with open(csv_path, "a", newline="") as f:
+            csv.writer(f).writerow([
+                epoch + 1, f"{avg_loss:.6f}", f"{train_acc:.2f}", f"{val_acc:.2f}",
+                f"{enc_lr:.2e}", f"{cls_lr:.2e}", f"{epoch_time:.1f}",
+                f"{gpu['allocated_mb']:.0f}", f"{gpu['peak_mb']:.0f}",
+            ])
+
         # ---- Best checkpoint ----
         if val_acc > best_acc:
             best_acc = val_acc
@@ -335,15 +396,18 @@ def train_finetune(
                 "best_acc": best_acc,
             }, ckpt_path)
 
-        enc_lr = optimizer.param_groups[0]["lr"]
-        cls_lr = optimizer.param_groups[1]["lr"]
         marker = " *BEST*" if val_acc >= best_acc else ""
-        if (epoch + 1) % 5 == 0 or epoch == 0 or val_acc >= best_acc:
-            print(f"    Epoch [{epoch + 1:3d}/{epochs}]  "
-                  f"loss={avg_loss:.4f}  train={train_acc:.2f}%  "
-                  f"val={val_acc:.2f}%  enc_lr={enc_lr:.1e}  cls_lr={cls_lr:.1e}{marker}")
+        print(f"  Epoch [{epoch + 1:3d}/{epochs}]  "
+              f"loss={avg_loss:.4f}  train={train_acc:.2f}%  "
+              f"val={val_acc:.2f}%  enc_lr={enc_lr:.1e}  cls_lr={cls_lr:.1e}  "
+              f"time={epoch_time:.1f}s  gpu={gpu['allocated_mb']:.0f}MB{marker}")
 
+    total_time = time.time() - total_start
+    peak_gpu = _gpu_stats(device)["peak_mb"]
     print(f"\n  Best validation accuracy: {best_acc:.2f}% at epoch {best_epoch}")
+    print(f"  Total fine-tuning time: {total_time / 60:.1f} min")
+    print(f"  Peak GPU memory: {peak_gpu:.0f} MB")
+    print(f"  Metrics saved to: {csv_path}")
 
     # ---- Reload best checkpoint ----
     best_path = os.path.join(output_dir, "ckpt_best_finetune.pth")
@@ -352,6 +416,8 @@ def train_finetune(
         encoder.load_state_dict(best_ckpt["encoder_state_dict"])
         classifier.load_state_dict(best_ckpt["classifier_state_dict"])
         print(f"  Loaded best checkpoint from epoch {best_epoch}")
+
+    return history
 
 
 @torch.no_grad()
@@ -373,6 +439,132 @@ def _quick_eval(
         correct += (logits.argmax(dim=1) == labels).sum().item()
         total += labels.size(0)
     return 100.0 * correct / total
+
+
+# ======================================================================
+# Training curves visualization
+# ======================================================================
+def save_training_curves(history: dict, output_dir: str, mode: str) -> None:
+    """Save loss, accuracy, and LR curves as PNG."""
+    epochs = history["epoch"]
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle(f"Fine-Tuning Training Curves", fontsize=16, fontweight="bold")
+
+    # -- Loss --
+    ax = axes[0, 0]
+    ax.plot(epochs, history["loss"], color="#e74c3c", linewidth=2)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.set_title("Training Loss")
+    ax.grid(True, alpha=0.3)
+
+    # -- Accuracy --
+    ax = axes[0, 1]
+    ax.plot(epochs, history["train_acc"], label="Train", color="#3498db", linewidth=2)
+    ax.plot(epochs, history["val_acc"], label="Validation", color="#2ecc71", linewidth=2)
+    if history["val_acc"]:
+        best_idx = int(np.argmax(history["val_acc"]))
+        ax.axvline(x=epochs[best_idx], color="#2ecc71", linestyle="--", alpha=0.5)
+        ax.annotate(f"Best: {history['val_acc'][best_idx]:.1f}%",
+                    xy=(epochs[best_idx], history["val_acc"][best_idx]),
+                    fontsize=9, fontweight="bold", color="#27ae60")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Accuracy (%)")
+    ax.set_title("Train vs Validation Accuracy")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # -- Learning Rate --
+    ax = axes[1, 0]
+    ax.plot(epochs, history["enc_lr"], label="Encoder LR", color="#9b59b6", linewidth=2)
+    ax.plot(epochs, history["cls_lr"], label="Classifier LR", color="#f39c12", linewidth=2)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Learning Rate")
+    ax.set_title("Learning Rate Schedule")
+    ax.legend()
+    ax.set_yscale("log")
+    ax.grid(True, alpha=0.3)
+
+    # -- Time per epoch --
+    ax = axes[1, 1]
+    ax.bar(epochs, history["time_s"], color="#1abc9c", alpha=0.8)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Time (seconds)")
+    ax.set_title("Time per Epoch")
+    ax.grid(True, alpha=0.3, axis="y")
+
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    path = os.path.join(output_dir, f"training_curves_{mode}.png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  Training curves saved to: {path}")
+
+
+# ======================================================================
+# Classification report
+# ======================================================================
+def print_classification_report(
+    cm: np.ndarray,
+    class_names: list,
+    output_dir: str,
+    mode: str,
+) -> None:
+    """Print and save a full classification report (precision, recall, F1)."""
+    num_classes = len(class_names)
+    print("\n  Classification Report:")
+    print(f"  {'Class':>20s}  {'Precision':>10s}  {'Recall':>10s}  {'F1-Score':>10s}  {'Support':>10s}")
+    print("  " + "-" * 66)
+
+    precisions, recalls, f1s, supports = [], [], [], []
+
+    for c in range(num_classes):
+        tp = cm[c, c]
+        fp = cm[:, c].sum() - tp
+        fn = cm[c, :].sum() - tp
+        support = cm[c, :].sum()
+
+        precision = tp / max(tp + fp, 1)
+        recall = tp / max(tp + fn, 1)
+        f1 = 2 * precision * recall / max(precision + recall, 1e-8)
+
+        precisions.append(precision)
+        recalls.append(recall)
+        f1s.append(f1)
+        supports.append(support)
+
+        name = class_names[c]
+        print(f"  {name:>20s}  {precision:>10.4f}  {recall:>10.4f}  {f1:>10.4f}  {support:>10d}")
+
+    # Macro averages
+    total_support = sum(supports)
+    macro_p = np.mean(precisions)
+    macro_r = np.mean(recalls)
+    macro_f1 = np.mean(f1s)
+
+    # Weighted averages
+    weights = np.array(supports) / total_support
+    weighted_p = np.dot(weights, precisions)
+    weighted_r = np.dot(weights, recalls)
+    weighted_f1 = np.dot(weights, f1s)
+
+    print("  " + "-" * 66)
+    print(f"  {'macro avg':>20s}  {macro_p:>10.4f}  {macro_r:>10.4f}  {macro_f1:>10.4f}  {total_support:>10d}")
+    print(f"  {'weighted avg':>20s}  {weighted_p:>10.4f}  {weighted_r:>10.4f}  {weighted_f1:>10.4f}  {total_support:>10d}")
+
+    # Save to file
+    report_path = os.path.join(output_dir, f"classification_report_{mode}.txt")
+    with open(report_path, "w") as f:
+        f.write(f"Classification Report ({mode})\n")
+        f.write(f"{'Class':>20s}  {'Precision':>10s}  {'Recall':>10s}  {'F1-Score':>10s}  {'Support':>10s}\n")
+        f.write("-" * 70 + "\n")
+        for c in range(num_classes):
+            name = class_names[c]
+            f.write(f"{name:>20s}  {precisions[c]:>10.4f}  {recalls[c]:>10.4f}  {f1s[c]:>10.4f}  {supports[c]:>10d}\n")
+        f.write("-" * 70 + "\n")
+        f.write(f"{'macro avg':>20s}  {macro_p:>10.4f}  {macro_r:>10.4f}  {macro_f1:>10.4f}  {total_support:>10d}\n")
+        f.write(f"{'weighted avg':>20s}  {weighted_p:>10.4f}  {weighted_r:>10.4f}  {weighted_f1:>10.4f}  {total_support:>10d}\n")
+    print(f"  Classification report saved to: {report_path}")
 
 
 # ======================================================================
@@ -545,11 +737,11 @@ def main() -> None:
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=4, pin_memory=True, drop_last=False,
+        num_workers=args.num_workers, pin_memory=True, drop_last=False,
     )
     test_loader = DataLoader(
         test_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=4, pin_memory=True,
+        num_workers=args.num_workers, pin_memory=True,
     )
 
     # -------------------------------------------------------------------
@@ -596,12 +788,15 @@ def main() -> None:
 
     else:  # full_finetune
         # Train end-to-end with differential LR + best-checkpoint tracking
-        train_finetune(
+        history = train_finetune(
             encoder, classifier, train_loader, test_loader,
             epochs=args.epochs, lr=args.lr, device=args.device,
             num_classes=args.num_classes, class_names=class_names,
             output_dir=args.output_dir,
         )
+
+        # Save training curves
+        save_training_curves(history, args.output_dir, args.mode)
 
         # Evaluate
         top1, per_class, cm = evaluate_finetune(
@@ -623,6 +818,9 @@ def main() -> None:
     # Save confusion matrix
     cm_path = os.path.join(args.output_dir, f"confusion_matrix_{args.mode}.png")
     save_confusion_matrix(cm, class_names, cm_path, title=f"{mode_label} Confusion Matrix")
+
+    # Classification report
+    print_classification_report(cm, class_names, args.output_dir, args.mode)
 
     # Final summary line
     print(f"\n  {mode_label} Result: {top1:.2f}% on {args.num_classes} classes "
