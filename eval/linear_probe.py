@@ -208,12 +208,17 @@ def train_linear_classifier(
     batch_size: int,
     lr: float,
     device: str,
-) -> nn.Linear:
+) -> nn.Module:
     """Train a single nn.Linear layer on cached features."""
     feat_dim = train_features.shape[1]
-    classifier = nn.Linear(feat_dim, num_classes).to(device)
-    nn.init.kaiming_uniform_(classifier.weight)
-    nn.init.zeros_(classifier.bias)
+    classifier = nn.Sequential(
+        nn.BatchNorm1d(feat_dim),
+        nn.Linear(feat_dim, num_classes)
+    ).to(device)
+    
+    # Init linear layer
+    nn.init.kaiming_uniform_(classifier[1].weight)
+    nn.init.zeros_(classifier[1].bias)
 
     optimizer = Adam(classifier.parameters(), lr=lr, weight_decay=0.0)
     criterion = nn.CrossEntropyLoss()
@@ -271,7 +276,7 @@ def _gpu_stats(device: str) -> dict:
 # ======================================================================
 def train_finetune(
     encoder: nn.Module,
-    classifier: nn.Linear,
+    classifier: nn.Module,
     train_loader: DataLoader,
     test_loader: DataLoader,
     epochs: int,
@@ -293,8 +298,10 @@ def train_finetune(
     Returns:
         dict with lists of per-epoch metrics for visualization.
     """
-    # -- Differential learning rates --
-    encoder_lr = lr * 0.05   # 1/20th of classifier LR
+    # -- Full Learning Rates --
+    # Differential LR was trapping us in the saddle point. MAE geometries must 
+    # be aggressively reorganized for medical semantic classification.
+    encoder_lr = lr
     param_groups = [
         {"params": encoder.parameters(), "lr": encoder_lr},
         {"params": classifier.parameters(), "lr": lr},
@@ -423,7 +430,7 @@ def train_finetune(
 @torch.no_grad()
 def _quick_eval(
     encoder: nn.Module,
-    classifier: nn.Linear,
+    classifier: nn.Module,
     loader: DataLoader,
     device: str,
 ) -> float:
@@ -574,7 +581,7 @@ def print_classification_report(
 def evaluate(
     features: torch.Tensor,
     labels: torch.Tensor,
-    classifier: nn.Linear,
+    classifier: nn.Module,
     num_classes: int,
     device: str,
     class_names: list = None,
@@ -613,7 +620,7 @@ def evaluate(
 @torch.no_grad()
 def evaluate_finetune(
     encoder: nn.Module,
-    classifier: nn.Linear,
+    classifier: nn.Module,
     dataloader: DataLoader,
     num_classes: int,
     device: str,
@@ -751,11 +758,15 @@ def main() -> None:
     encoder = load_encoder(args.encoder_ckpt, args.device, freeze=freeze)
 
     # -------------------------------------------------------------------
-    # Classifier
+    # Classifier (Wrapped with BatchNorm to fix numerical saddle point)
     # -------------------------------------------------------------------
-    classifier = nn.Linear(768, args.num_classes).to(args.device)
-    nn.init.kaiming_uniform_(classifier.weight)
-    nn.init.zeros_(classifier.bias)
+    classifier = nn.Sequential(
+        nn.BatchNorm1d(768),
+        nn.Linear(768, args.num_classes)
+    ).to(args.device)
+    
+    nn.init.kaiming_uniform_(classifier[1].weight)
+    nn.init.zeros_(classifier[1].bias)
 
     # -------------------------------------------------------------------
     # Train + Evaluate
