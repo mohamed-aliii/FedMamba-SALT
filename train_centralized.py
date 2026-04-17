@@ -55,6 +55,11 @@ WARMUP_EPOCHS = 10
 COLLAPSE_RATIO = 0.2  # warn if student_std < teacher_std * this ratio
 METRICS_FILENAME = "training_metrics.csv"
 
+# Early stopping
+LOSS_PATIENCE = 25       # stop if loss doesn't improve for this many epochs
+COLLAPSE_STRIKES_MAX = 5 # abort if collapsed for this many consecutive epochs
+LOSS_MIN_DELTA = 1e-5    # minimum improvement to count as progress
+
 
 # ======================================================================
 # GPU memory tracking
@@ -531,11 +536,18 @@ def main() -> None:
 
     print(f"\n{'='*55}")
     print(f"  Starting training from epoch {start_epoch}")
+    print(f"  Early stopping: loss patience={LOSS_PATIENCE}, "
+          f"collapse strikes={COLLAPSE_STRIKES_MAX}")
     print(f"{'='*55}\n")
 
     # Reset peak GPU memory counter for accurate per-run tracking
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
+
+    # ----- Early stopping state -----
+    best_loss = float("inf")
+    epochs_no_improve = 0
+    collapse_strikes = 0
 
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
@@ -543,6 +555,11 @@ def main() -> None:
         avg_loss, avg_align, avg_var, avg_s_std, avg_t_std = train_one_epoch(
             teacher, student, projector, dataloader, optimizer, args.device,
         )
+
+        # --- NaN safety ---
+        if math.isnan(avg_loss):
+            print("\n  [ABORT] Loss is NaN -- training diverged. Stopping.")
+            break
 
         # Step the LR scheduler (once per epoch)
         scheduler.step()
@@ -572,20 +589,40 @@ def main() -> None:
         # ----- Collapse warning (dynamic, relative to teacher) -----
         collapse_floor = avg_t_std * COLLAPSE_RATIO
         if avg_s_std < collapse_floor:
+            collapse_strikes += 1
             print(
                 f"  [WARNING] Student embedding_std={avg_s_std:.4f} < "
                 f"{collapse_floor:.4f} (teacher_std * {COLLAPSE_RATIO}) "
-                f"-- possible representation collapse!"
+                f"-- possible representation collapse! "
+                f"(strike {collapse_strikes}/{COLLAPSE_STRIKES_MAX})"
             )
-            print(
-                f"  [WARNING] Consider stopping training and debugging "
-                f"augmentations, learning rate, or loss function."
-            )
-        elif avg_s_std > avg_t_std * 10:
+            if collapse_strikes >= COLLAPSE_STRIKES_MAX:
+                print(
+                    f"\n  [ABORT] Representation collapsed for {COLLAPSE_STRIKES_MAX} "
+                    f"consecutive epochs. Stopping training."
+                )
+                break
+        else:
+            collapse_strikes = 0  # reset on recovery
+
+        if avg_s_std > avg_t_std * 10:
             print(
                 f"  [WARNING] Student embedding_std={avg_s_std:.4f} >> "
                 f"teacher_std={avg_t_std:.4f} -- student may be diverging."
             )
+
+        # ----- Loss plateau early stopping -----
+        if avg_loss < best_loss - LOSS_MIN_DELTA:
+            best_loss = avg_loss
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= LOSS_PATIENCE:
+                print(
+                    f"\n  [EARLY STOP] Loss has not improved for {LOSS_PATIENCE} "
+                    f"epochs (best={best_loss:.6f}). Stopping training."
+                )
+                break
 
         # ----- Save ckpt_latest.pth every epoch (resume point) -----
         save_checkpoint(

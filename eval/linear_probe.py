@@ -58,7 +58,10 @@ IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
 # Fed-MAE baseline for context
-FEDMAE_BASELINE = 77.43  # % accuracy, full fine-tuning, Retina Split-3
+FEDMAE_BASELINE = 81.93  # % accuracy, centralized baseline, Retina
+
+# Early stopping for fine-tuning
+FINETUNE_PATIENCE = 15  # stop if val_acc doesn't improve for this many epochs
 
 
 # ======================================================================
@@ -291,11 +294,13 @@ def train_finetune(
     """End-to-end fine-tuning of encoder + classifier.
 
     Key improvements over naive fine-tuning:
-      1. Differential LR: encoder gets lr/20, classifier gets lr.
+      1. Differential LR: encoder gets lr/10, classifier gets lr.
          This prevents catastrophic forgetting of pre-trained features.
       2. CosineAnnealingLR: smooth LR decay to settle into a minimum.
       3. Per-epoch validation: tracks best test accuracy and saves
          the best checkpoint automatically.
+      4. Early stopping: halts if val_acc stagnates for FINETUNE_PATIENCE epochs.
+      5. AUC/ROC tracking: collects per-epoch AUC for visualization.
 
     Returns:
         dict with lists of per-epoch metrics for visualization.
@@ -304,8 +309,9 @@ def train_finetune(
     # The encoder has learned the teacher's manifold geometry during
     # pre-training. Using the full LR would destroy these features
     # in the first few batches (catastrophic forgetting).
-    # The classifier head needs aggressive LR to learn the decision boundary.
-    encoder_lr = lr / 20.0
+    # lr/10 balances protection with enough plasticity for the encoder
+    # to adapt its features to classification.
+    encoder_lr = lr / 10.0
     param_groups = [
         {"params": encoder.parameters(), "lr": encoder_lr},
         {"params": classifier.parameters(), "lr": lr},
@@ -318,16 +324,21 @@ def train_finetune(
 
     best_acc = 0.0
     best_epoch = 0
+    patience_counter = 0
 
     # Metrics history for visualization
     history = {
         "epoch": [], "loss": [], "train_acc": [], "val_acc": [],
+        "val_loss": [], "val_auc": [],
         "enc_lr": [], "cls_lr": [], "time_s": [], "gpu_mb": [],
     }
 
     # CSV logger
     csv_path = os.path.join(output_dir, "finetune_metrics.csv")
-    csv_columns = ["epoch", "loss", "train_acc", "val_acc", "enc_lr", "cls_lr", "time_s", "gpu_mb", "peak_gpu_mb"]
+    csv_columns = [
+        "epoch", "loss", "train_acc", "val_loss", "val_acc", "val_auc",
+        "enc_lr", "cls_lr", "time_s", "gpu_mb", "peak_gpu_mb",
+    ]
     with open(csv_path, "w", newline="") as f:
         csv.writer(f).writerow(csv_columns)
 
@@ -336,6 +347,7 @@ def train_finetune(
 
     print(f"\n  Fine-tuning encoder + classifier on {len(train_loader.dataset)} images...")
     print(f"  Encoder LR: {encoder_lr:.1e}  |  Classifier LR: {lr:.1e}  |  Epochs: {epochs}")
+    print(f"  Early stopping patience: {FINETUNE_PATIENCE} epochs")
     total_start = time.time()
 
     for epoch in range(epochs):
@@ -369,8 +381,10 @@ def train_finetune(
         avg_loss = total_loss / total
         train_acc = 100.0 * correct / total
 
-        # ---- Validate every epoch ----
-        val_acc = _quick_eval(encoder, classifier, test_loader, device)
+        # ---- Validate every epoch (with AUC) ----
+        val_acc, val_loss, val_auc = _eval_with_auc(
+            encoder, classifier, test_loader, device, num_classes,
+        )
 
         epoch_time = time.time() - epoch_start
         gpu = _gpu_stats(device)
@@ -382,6 +396,8 @@ def train_finetune(
         history["loss"].append(avg_loss)
         history["train_acc"].append(train_acc)
         history["val_acc"].append(val_acc)
+        history["val_loss"].append(val_loss)
+        history["val_auc"].append(val_auc)
         history["enc_lr"].append(enc_lr)
         history["cls_lr"].append(cls_lr)
         history["time_s"].append(epoch_time)
@@ -390,7 +406,8 @@ def train_finetune(
         # ---- CSV log ----
         with open(csv_path, "a", newline="") as f:
             csv.writer(f).writerow([
-                epoch + 1, f"{avg_loss:.6f}", f"{train_acc:.2f}", f"{val_acc:.2f}",
+                epoch + 1, f"{avg_loss:.6f}", f"{train_acc:.2f}",
+                f"{val_loss:.6f}", f"{val_acc:.2f}", f"{val_auc:.4f}",
                 f"{enc_lr:.2e}", f"{cls_lr:.2e}", f"{epoch_time:.1f}",
                 f"{gpu['allocated_mb']:.0f}", f"{gpu['peak_mb']:.0f}",
             ])
@@ -399,6 +416,7 @@ def train_finetune(
         if val_acc > best_acc:
             best_acc = val_acc
             best_epoch = epoch + 1
+            patience_counter = 0
             ckpt_path = os.path.join(output_dir, "ckpt_best_finetune.pth")
             torch.save({
                 "epoch": epoch,
@@ -406,12 +424,23 @@ def train_finetune(
                 "classifier_state_dict": classifier.state_dict(),
                 "best_acc": best_acc,
             }, ckpt_path)
+        else:
+            patience_counter += 1
 
         marker = " *BEST*" if val_acc >= best_acc else ""
         print(f"  Epoch [{epoch + 1:3d}/{epochs}]  "
               f"loss={avg_loss:.4f}  train={train_acc:.2f}%  "
-              f"val={val_acc:.2f}%  enc_lr={enc_lr:.1e}  cls_lr={cls_lr:.1e}  "
+              f"val={val_acc:.2f}%  auc={val_auc:.4f}  "
+              f"enc_lr={enc_lr:.1e}  cls_lr={cls_lr:.1e}  "
               f"time={epoch_time:.1f}s  gpu={gpu['allocated_mb']:.0f}MB{marker}")
+
+        # ---- Early stopping ----
+        if patience_counter >= FINETUNE_PATIENCE:
+            print(
+                f"\n  [EARLY STOP] Validation accuracy has not improved for "
+                f"{FINETUNE_PATIENCE} epochs. Best: {best_acc:.2f}% at epoch {best_epoch}."
+            )
+            break
 
     total_time = time.time() - total_start
     peak_gpu = _gpu_stats(device)["peak_mb"]
@@ -452,22 +481,83 @@ def _quick_eval(
     return 100.0 * correct / total
 
 
+@torch.no_grad()
+def _eval_with_auc(
+    encoder: nn.Module,
+    classifier: nn.Module,
+    loader: DataLoader,
+    device: str,
+    num_classes: int,
+) -> tuple:
+    """
+    Compute val accuracy, val loss, and AUC in one pass.
+
+    Returns:
+        (val_acc_percent, val_loss, auc_score)
+    """
+    from sklearn.metrics import roc_auc_score
+
+    encoder.eval()
+    classifier.eval()
+    criterion = nn.CrossEntropyLoss(reduction="sum")
+
+    correct = 0
+    total = 0
+    total_loss = 0.0
+    all_probs = []
+    all_labels = []
+
+    for images, labels in loader:
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        logits = classifier(encoder(images))
+        total_loss += criterion(logits, labels).item()
+        probs = torch.softmax(logits, dim=1)
+        correct += (logits.argmax(dim=1) == labels).sum().item()
+        total += labels.size(0)
+        all_probs.append(probs.cpu())
+        all_labels.append(labels.cpu())
+
+    val_acc = 100.0 * correct / total
+    val_loss = total_loss / total
+
+    all_probs = torch.cat(all_probs, dim=0).numpy()
+    all_labels = torch.cat(all_labels, dim=0).numpy()
+
+    # AUC computation
+    try:
+        if num_classes == 2:
+            auc = roc_auc_score(all_labels, all_probs[:, 1])
+        else:
+            auc = roc_auc_score(
+                all_labels, all_probs, multi_class="ovr", average="macro",
+            )
+    except ValueError:
+        auc = 0.0  # e.g., only one class present in batch
+
+    return val_acc, val_loss, auc
+
+
 # ======================================================================
 # Training curves visualization
 # ======================================================================
 def save_training_curves(history: dict, output_dir: str, mode: str) -> None:
-    """Save loss, accuracy, and LR curves as PNG."""
+    """Save loss, accuracy, AUC, and LR curves as PNG."""
     epochs = history["epoch"]
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig, axes = plt.subplots(2, 3, figsize=(20, 10))
     fig.suptitle(f"Fine-Tuning Training Curves", fontsize=16, fontweight="bold")
 
-    # -- Loss --
+    # -- Training Loss --
     ax = axes[0, 0]
-    ax.plot(epochs, history["loss"], color="#e74c3c", linewidth=2)
+    ax.plot(epochs, history["loss"], color="#e74c3c", linewidth=2, label="Train")
+    if "val_loss" in history and history["val_loss"]:
+        ax.plot(epochs, history["val_loss"], color="#c0392b", linewidth=2,
+                linestyle="--", label="Validation")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Loss")
-    ax.set_title("Training Loss")
+    ax.set_title("Train & Validation Loss")
+    ax.legend()
     ax.grid(True, alpha=0.3)
 
     # -- Accuracy --
@@ -484,6 +574,20 @@ def save_training_curves(history: dict, output_dir: str, mode: str) -> None:
     ax.set_ylabel("Accuracy (%)")
     ax.set_title("Train vs Validation Accuracy")
     ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # -- AUC --
+    ax = axes[0, 2]
+    if "val_auc" in history and history["val_auc"]:
+        ax.plot(epochs, history["val_auc"], color="#8e44ad", linewidth=2)
+        best_auc_idx = int(np.argmax(history["val_auc"]))
+        ax.axvline(x=epochs[best_auc_idx], color="#8e44ad", linestyle="--", alpha=0.5)
+        ax.annotate(f"Best: {history['val_auc'][best_auc_idx]:.4f}",
+                    xy=(epochs[best_auc_idx], history["val_auc"][best_auc_idx]),
+                    fontsize=9, fontweight="bold", color="#6c3483")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("AUC")
+    ax.set_title("Validation AUC")
     ax.grid(True, alpha=0.3)
 
     # -- Learning Rate --
@@ -504,6 +608,19 @@ def save_training_curves(history: dict, output_dir: str, mode: str) -> None:
     ax.set_ylabel("Time (seconds)")
     ax.set_title("Time per Epoch")
     ax.grid(True, alpha=0.3, axis="y")
+
+    # -- Train vs Val Loss Gap (overfitting diagnostic) --
+    ax = axes[1, 2]
+    if "val_loss" in history and history["val_loss"]:
+        gap = [v - t for t, v in zip(history["loss"], history["val_loss"])]
+        ax.plot(epochs, gap, color="#e67e22", linewidth=2)
+        ax.axhline(y=0, color="gray", linestyle="--", alpha=0.5)
+        ax.fill_between(epochs, 0, gap, alpha=0.1,
+                        color="red" if max(gap) > 0 else "green")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Val - Train Loss")
+    ax.set_title("Generalization Gap")
+    ax.grid(True, alpha=0.3)
 
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     path = os.path.join(output_dir, f"training_curves_{mode}.png")
@@ -630,22 +747,33 @@ def evaluate_finetune(
     device: str,
     class_names: list = None,
 ) -> tuple:
-    """Evaluate fine-tuned encoder + classifier on a DataLoader."""
+    """Evaluate fine-tuned encoder + classifier on a DataLoader.
+
+    Returns:
+        (top1, per_class, cm, all_probs, all_labels)
+        - all_probs: np.ndarray (N, C) softmax probabilities for ROC
+        - all_labels: np.ndarray (N,) integer labels
+    """
     encoder.eval()
     classifier.eval()
 
     all_preds = []
     all_labels = []
+    all_probs = []
 
     for images, labels in tqdm(dataloader, desc="  Evaluating", leave=False):
         images = images.to(device, non_blocking=True)
         features = encoder(images)
         logits = classifier(features)
+        probs = torch.softmax(logits, dim=1)
         all_preds.append(logits.argmax(dim=1).cpu())
         all_labels.append(labels)
+        all_probs.append(probs.cpu())
 
     preds = torch.cat(all_preds)
     labs = torch.cat(all_labels)
+    probs_np = torch.cat(all_probs).numpy()
+    labs_np = labs.numpy()
 
     correct = (preds == labs).sum().item()
     top1 = 100.0 * correct / len(labs)
@@ -661,7 +789,7 @@ def evaluate_finetune(
         name = class_names[c] if class_names else str(c)
         per_class[name] = 100.0 * correct_c / max(1, total_c)
 
-    return top1, per_class, cm.numpy()
+    return top1, per_class, cm.numpy(), probs_np, labs_np
 
 
 # ======================================================================
@@ -706,6 +834,69 @@ def save_confusion_matrix(
     fig.savefig(output_path, dpi=150)
     plt.close(fig)
     print(f"  Confusion matrix saved to: {output_path}")
+
+
+# ======================================================================
+# ROC Curve visualization
+# ======================================================================
+def save_roc_curve(
+    all_probs: np.ndarray,
+    all_labels: np.ndarray,
+    class_names: list,
+    output_dir: str,
+    mode: str,
+) -> None:
+    """Compute and save ROC curve + AUC score as PNG."""
+    from sklearn.metrics import roc_curve, auc, roc_auc_score
+
+    num_classes = len(class_names)
+    fig, ax = plt.subplots(figsize=(8, 7))
+
+    if num_classes == 2:
+        # Binary ROC
+        fpr, tpr, _ = roc_curve(all_labels, all_probs[:, 1])
+        roc_auc = auc(fpr, tpr)
+        ax.plot(fpr, tpr, color="#2980b9", linewidth=2.5,
+                label=f"ROC curve (AUC = {roc_auc:.4f})")
+    else:
+        # One-vs-Rest per class
+        from sklearn.preprocessing import label_binarize
+        y_bin = label_binarize(all_labels, classes=list(range(num_classes)))
+        colors = plt.cm.Set2(np.linspace(0, 1, num_classes))
+
+        for c in range(num_classes):
+            fpr, tpr, _ = roc_curve(y_bin[:, c], all_probs[:, c])
+            roc_auc = auc(fpr, tpr)
+            ax.plot(fpr, tpr, color=colors[c], linewidth=2,
+                    label=f"{class_names[c]} (AUC = {roc_auc:.4f})")
+
+        # Macro-average ROC
+        try:
+            macro_auc = roc_auc_score(
+                all_labels, all_probs, multi_class="ovr", average="macro",
+            )
+            ax.set_title(f"ROC Curves (Macro AUC = {macro_auc:.4f})",
+                         fontsize=14, fontweight="bold")
+        except ValueError:
+            pass
+
+    # Diagonal reference
+    ax.plot([0, 1], [0, 1], color="gray", linewidth=1, linestyle="--", alpha=0.7)
+
+    ax.set_xlabel("False Positive Rate", fontsize=12)
+    ax.set_ylabel("True Positive Rate", fontsize=12)
+    if num_classes == 2:
+        ax.set_title("ROC Curve", fontsize=14, fontweight="bold")
+    ax.legend(loc="lower right", fontsize=10)
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim([-0.02, 1.02])
+    ax.set_ylim([-0.02, 1.02])
+
+    fig.tight_layout()
+    path = os.path.join(output_dir, f"roc_curve_{mode}.png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  ROC curve saved to: {path}")
 
 
 # ======================================================================
@@ -813,8 +1004,8 @@ def main() -> None:
         # Save training curves
         save_training_curves(history, args.output_dir, args.mode)
 
-        # Evaluate
-        top1, per_class, cm = evaluate_finetune(
+        # Evaluate (with probabilities for ROC)
+        top1, per_class, cm, all_probs, all_labels = evaluate_finetune(
             encoder, classifier, test_loader,
             args.num_classes, args.device, class_names,
         )
@@ -837,6 +1028,23 @@ def main() -> None:
     # Classification report
     print_classification_report(cm, class_names, args.output_dir, args.mode)
 
+    # AUC & ROC curve (full_finetune mode has probabilities)
+    if args.mode == "full_finetune":
+        from sklearn.metrics import roc_auc_score
+        try:
+            if args.num_classes == 2:
+                final_auc = roc_auc_score(all_labels, all_probs[:, 1])
+            else:
+                final_auc = roc_auc_score(
+                    all_labels, all_probs, multi_class="ovr", average="macro",
+                )
+            print(f"\n  AUC Score: {final_auc:.4f}")
+        except ValueError:
+            final_auc = 0.0
+            print("\n  AUC Score: N/A (insufficient class coverage)")
+
+        save_roc_curve(all_probs, all_labels, class_names, args.output_dir, args.mode)
+
     # Final summary line
     print(f"\n  {mode_label} Result: {top1:.2f}% on {args.num_classes} classes "
           f"over {len(test_ds)} test samples")
@@ -846,15 +1054,15 @@ def main() -> None:
     # -------------------------------------------------------------------
     print("\n" + "-" * 60)
     print("  BASELINE COMPARISON NOTE:")
-    print(f"    Fed-MAE baseline on Retina Split-3: ~{FEDMAE_BASELINE:.2f}%")
-    print("    (full fine-tuning, NOT linear probing)")
+    print(f"    Centralized MAE baseline on Retina: ~{FEDMAE_BASELINE:.2f}%")
+    print("    (full fine-tuning, centralized setting)")
     print()
     if args.mode == "linear_probe":
         print("    Linear probing is a DIAGNOSTIC -- it measures representation")
-        print("    quality but is NOT an apples-to-apples comparison with Fed-MAE.")
+        print("    quality but is NOT an apples-to-apples comparison.")
         print("    For a fair comparison, also run with --mode full_finetune.")
     else:
-        print(f"    Your full fine-tune result: {top1:.2f}% vs Fed-MAE: {FEDMAE_BASELINE:.2f}%")
+        print(f"    Your full fine-tune result: {top1:.2f}% vs baseline: {FEDMAE_BASELINE:.2f}%")
         diff = top1 - FEDMAE_BASELINE
         sign = "+" if diff >= 0 else ""
         print(f"    Delta: {sign}{diff:.2f}%")
