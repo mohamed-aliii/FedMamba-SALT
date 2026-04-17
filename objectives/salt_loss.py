@@ -131,19 +131,20 @@ def salt_loss(
     Total loss = SmoothL1(student_proj, teacher_emb)
 
     Smooth L1 (Huber loss) matches both direction AND magnitude of the
-    teacher's representation space.  Unlike cosine similarity, it does
-    not allow the student to satisfy the loss by simply pointing all
-    vectors in one direction while inflating magnitude.
+    teacher's representation space. 
 
-    The variance penalty (lambda_var, gamma) arguments are kept for
-    API compatibility but are no longer used.  With a frozen teacher,
-    the teacher's own geometry provides the anti-collapse anchor.
+    Crucially, because the student sees heavily corrupted images while
+    the teacher sees clean images, the network is prone to 'mean-target
+    collapse', where the student just predicts the batch average to 
+    minimize alignment error. To prevent this, we re-instate the VICReg
+    variance penalty, but dynamically set `gamma` to the teacher's 
+    actual standard deviation (instead of an incompatible 1.0).
 
     Args:
         student_proj: ``(B, D)`` output of the projection head.
         teacher_emb:  ``(B, D)`` CLS-token embedding from frozen teacher.
-        lambda_var:   Unused (kept for API compatibility).
-        gamma:        Unused (kept for API compatibility).
+        lambda_var:   Weight for the variance penalty (default 1.0).
+        gamma:        Scale override (if None, dynamic matching is used).
 
     Returns:
         Tuple of ``(total_loss, align_loss, var_loss)`` -- all scalar
@@ -156,11 +157,17 @@ def salt_loss(
     # --- Direct Smooth L1 alignment (matches direction + magnitude) ---
     align_loss = F.smooth_l1_loss(student_proj, teacher_emb)
 
-    # --- No variance penalty (frozen teacher = inherent anti-collapse) ---
-    var_loss = torch.tensor(0.0, device=student_proj.device)
+    # --- Dynamic Variance Penalty ---
+    # Computes the actual batch-level variance of the frozen target
+    target_std = teacher_emb.std(dim=0).mean().item()
+    dynamic_gamma = target_std if gamma is None or gamma == 1.0 else gamma
+    
+    # Penalize the student only if its representations collapse below the
+    # structural variance of the teacher's embeddings.
+    var_loss = variance_loss(student_proj, gamma=dynamic_gamma)
 
-    # --- Total loss = alignment only ---
-    total_loss = align_loss
+    # --- Total loss ---
+    total_loss = align_loss + (lambda_var * var_loss)
 
     return total_loss, align_loss, var_loss
 
