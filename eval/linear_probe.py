@@ -37,7 +37,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, Subset
 from torchvision import transforms
 from tqdm import tqdm
 
@@ -90,6 +90,18 @@ def parse_args() -> argparse.Namespace:
         "--mode", type=str, default="linear_probe",
         choices=["linear_probe", "full_finetune"],
         help="linear_probe: freeze encoder; full_finetune: train encoder + classifier",
+    )
+    p.add_argument(
+        "--label_fraction", type=float, default=1.0,
+        help="Fraction of training labels to use (0.0-1.0). "
+             "Use < 1.0 to test label scarcity robustness. "
+             "Stratified sampling preserves class balance.",
+    )
+    p.add_argument(
+        "--label_scarcity", action="store_true",
+        help="Run label scarcity experiment: automatically evaluates "
+             "at 30%%, 60%%, and 100%% label fractions and produces "
+             "a comparison report.",
     )
     return p.parse_args()
 
@@ -900,6 +912,269 @@ def save_roc_curve(
 
 
 # ======================================================================
+# Label scarcity: stratified subset
+# ======================================================================
+def stratified_subset(dataset, fraction: float, seed: int = 42):
+    """
+    Create a stratified subset of a dataset, preserving class balance.
+
+    Args:
+        dataset: Dataset with (image, label) items.
+        fraction: Fraction of data to keep (0.0 - 1.0).
+        seed: Random seed for reproducibility.
+
+    Returns:
+        torch.utils.data.Subset with stratified indices.
+    """
+    if fraction >= 1.0:
+        return dataset
+
+    from collections import defaultdict
+    import random
+
+    rng = random.Random(seed)
+
+    # Group indices by class
+    class_indices = defaultdict(list)
+    for idx in range(len(dataset)):
+        _, label = dataset[idx]
+        if isinstance(label, torch.Tensor):
+            label = label.item()
+        class_indices[label].append(idx)
+
+    # Sample from each class
+    selected = []
+    for cls, indices in sorted(class_indices.items()):
+        k = max(1, int(len(indices) * fraction))
+        selected.extend(rng.sample(indices, k))
+
+    rng.shuffle(selected)
+    print(f"  [Label Scarcity] Using {len(selected)}/{len(dataset)} "
+          f"samples ({fraction*100:.0f}%), "
+          f"balanced across {len(class_indices)} classes")
+
+    return Subset(dataset, selected)
+
+
+# ======================================================================
+# Label scarcity comparison visualization
+# ======================================================================
+def save_label_scarcity_comparison(
+    results: dict,
+    output_dir: str,
+) -> None:
+    """
+    Save a comparison chart for label scarcity robustness.
+
+    Args:
+        results: dict mapping fraction (float) -> {
+            'accuracy': float, 'auc': float, 'n_samples': int
+        }
+        output_dir: Directory to save the chart.
+    """
+    fractions = sorted(results.keys())
+    accuracies = [results[f]["accuracy"] for f in fractions]
+    aucs = [results[f]["auc"] for f in fractions]
+    n_samples = [results[f]["n_samples"] for f in fractions]
+    pct_labels = [f"{f*100:.0f}%" for f in fractions]
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    fig.suptitle("Label Scarcity Robustness", fontsize=16, fontweight="bold")
+
+    # -- Accuracy vs Label Fraction --
+    ax = axes[0]
+    bars = ax.bar(pct_labels, accuracies, color=["#e74c3c", "#f39c12", "#2ecc71"],
+                  edgecolor="black", linewidth=0.5)
+    for bar, acc in zip(bars, accuracies):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
+                f"{acc:.2f}%", ha="center", fontsize=11, fontweight="bold")
+    ax.set_xlabel("Label Fraction", fontsize=12)
+    ax.set_ylabel("Accuracy (%)", fontsize=12)
+    ax.set_title("Top-1 Accuracy")
+    ax.set_ylim(0, 100)
+    ax.grid(True, alpha=0.3, axis="y")
+
+    # -- AUC vs Label Fraction --
+    ax = axes[1]
+    bars = ax.bar(pct_labels, aucs, color=["#e74c3c", "#f39c12", "#2ecc71"],
+                  edgecolor="black", linewidth=0.5)
+    for bar, a in zip(bars, aucs):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
+                f"{a:.4f}", ha="center", fontsize=11, fontweight="bold")
+    ax.set_xlabel("Label Fraction", fontsize=12)
+    ax.set_ylabel("AUC", fontsize=12)
+    ax.set_title("AUC Score")
+    ax.set_ylim(0, 1.05)
+    ax.grid(True, alpha=0.3, axis="y")
+
+    # -- Sample Count --
+    ax = axes[2]
+    bars = ax.bar(pct_labels, n_samples, color=["#e74c3c", "#f39c12", "#2ecc71"],
+                  edgecolor="black", linewidth=0.5)
+    for bar, n in zip(bars, n_samples):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 20,
+                str(n), ha="center", fontsize=11, fontweight="bold")
+    ax.set_xlabel("Label Fraction", fontsize=12)
+    ax.set_ylabel("Training Samples", fontsize=12)
+    ax.set_title("Dataset Size")
+    ax.grid(True, alpha=0.3, axis="y")
+
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    path = os.path.join(output_dir, "label_scarcity_comparison.png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  Label scarcity comparison saved to: {path}")
+
+    # Also save as CSV
+    csv_path = os.path.join(output_dir, "label_scarcity_results.csv")
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["label_fraction", "n_samples", "accuracy", "auc"])
+        for frac in fractions:
+            r = results[frac]
+            writer.writerow([
+                f"{frac:.2f}", r["n_samples"],
+                f"{r['accuracy']:.2f}", f"{r['auc']:.4f}",
+            ])
+    print(f"  Label scarcity CSV saved to: {csv_path}")
+
+
+# ======================================================================
+# Single-run evaluation (supports label_fraction)
+# ======================================================================
+def run_evaluation(
+    args,
+    train_ds,
+    test_ds,
+    test_loader,
+    class_names,
+    label_fraction: float = 1.0,
+    output_suffix: str = "",
+) -> dict:
+    """
+    Run a single evaluation pass (linear probe or full fine-tune).
+
+    Args:
+        args: CLI arguments.
+        train_ds: Full training dataset.
+        test_ds: Test dataset (never subsetted).
+        test_loader: DataLoader for test set.
+        class_names: List of class name strings.
+        label_fraction: Fraction of train labels to use.
+        output_suffix: Appended to output filenames for uniqueness.
+
+    Returns:
+        dict with 'accuracy', 'auc', 'n_samples'.
+    """
+    # --- Subset training data ---
+    if label_fraction < 1.0:
+        subset_ds = stratified_subset(train_ds, label_fraction)
+    else:
+        subset_ds = train_ds
+
+    n_train = len(subset_ds)
+
+    train_loader = DataLoader(
+        subset_ds, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, pin_memory=True, drop_last=False,
+    )
+
+    # --- Fresh encoder + classifier for each run ---
+    freeze = (args.mode == "linear_probe")
+    encoder = load_encoder(args.encoder_ckpt, args.device, freeze=freeze)
+
+    classifier = nn.Sequential(
+        nn.BatchNorm1d(768),
+        nn.Linear(768, args.num_classes),
+    ).to(args.device)
+    nn.init.kaiming_uniform_(classifier[1].weight)
+    nn.init.zeros_(classifier[1].bias)
+
+    # --- Suffix for filenames ---
+    frac_tag = f"_{label_fraction*100:.0f}pct" if label_fraction < 1.0 else ""
+    mode_tag = f"{args.mode}{frac_tag}{output_suffix}"
+
+    final_auc = 0.0
+
+    if args.mode == "linear_probe":
+        print(f"\n  [Phase 1] Extracting train features ({n_train} samples)...")
+        train_feats, train_labels = extract_features(encoder, train_loader, args.device)
+        print(f"    Cached {train_feats.shape[0]} features of dim {train_feats.shape[1]}")
+
+        print("  [Phase 2] Extracting test features...")
+        test_feats, test_labels = extract_features(encoder, test_loader, args.device)
+        print(f"    Cached {test_feats.shape[0]} features of dim {test_feats.shape[1]}")
+
+        classifier = train_linear_classifier(
+            train_feats, train_labels,
+            num_classes=args.num_classes,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            device=args.device,
+        )
+
+        top1, per_class, cm = evaluate(
+            test_feats, test_labels, classifier,
+            args.num_classes, args.device, class_names,
+        )
+
+    else:  # full_finetune
+        sub_output = os.path.join(args.output_dir, f"finetune{frac_tag}")
+        os.makedirs(sub_output, exist_ok=True)
+
+        history = train_finetune(
+            encoder, classifier, train_loader, test_loader,
+            epochs=args.epochs, lr=args.lr, device=args.device,
+            num_classes=args.num_classes, class_names=class_names,
+            output_dir=sub_output,
+        )
+
+        save_training_curves(history, sub_output, mode_tag)
+
+        top1, per_class, cm, all_probs, all_labels = evaluate_finetune(
+            encoder, classifier, test_loader,
+            args.num_classes, args.device, class_names,
+        )
+
+        # AUC & ROC
+        from sklearn.metrics import roc_auc_score
+        try:
+            if args.num_classes == 2:
+                final_auc = roc_auc_score(all_labels, all_probs[:, 1])
+            else:
+                final_auc = roc_auc_score(
+                    all_labels, all_probs, multi_class="ovr", average="macro",
+                )
+        except ValueError:
+            final_auc = 0.0
+
+        save_roc_curve(all_probs, all_labels, class_names, sub_output, mode_tag)
+
+    # --- Report ---
+    mode_label = "Linear Probe" if args.mode == "linear_probe" else "Full Fine-tune"
+    frac_label = f" ({label_fraction*100:.0f}% labels)" if label_fraction < 1.0 else ""
+
+    print("\n" + "=" * 60)
+    print(f"  {mode_label} Results{frac_label}")
+    print("=" * 60)
+    print(f"\n  Top-1 Accuracy: {top1:.2f}%")
+    if final_auc > 0:
+        print(f"  AUC Score:      {final_auc:.4f}")
+    print(f"  Training samples: {n_train}\n")
+    print("  Per-class accuracy:")
+    for name, acc in per_class.items():
+        print(f"    {name:>20s}: {acc:.2f}%")
+
+    out_dir = sub_output if args.mode == "full_finetune" and label_fraction < 1.0 else args.output_dir
+    cm_path = os.path.join(out_dir, f"confusion_matrix_{mode_tag}.png")
+    save_confusion_matrix(cm, class_names, cm_path, title=f"{mode_label} Confusion Matrix{frac_label}")
+    print_classification_report(cm, class_names, out_dir, mode_tag)
+
+    return {"accuracy": top1, "auc": final_auc, "n_samples": n_train}
+
+
+# ======================================================================
 # Main
 # ======================================================================
 def main() -> None:
@@ -907,12 +1182,9 @@ def main() -> None:
     os.makedirs(args.output_dir, exist_ok=True)
 
     mode_label = "Linear Probe" if args.mode == "linear_probe" else "Full Fine-tune"
-    print("=" * 60)
-    print(f"  FedMamba-SALT Evaluation -- {mode_label}")
-    print("=" * 60)
 
     # -------------------------------------------------------------------
-    # Data
+    # Data (full dataset — subsetting happens per-run)
     # -------------------------------------------------------------------
     eval_transform = get_eval_transform(dataset="retina")
     train_transform = get_train_transform(dataset="retina") if args.mode == "full_finetune" else eval_transform
@@ -937,121 +1209,77 @@ def main() -> None:
     print(f"  Test:  {len(test_ds)} images")
     print(f"  Classes: {class_names}")
 
-    train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=True, drop_last=False,
-    )
     test_loader = DataLoader(
         test_ds, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=True,
     )
 
     # -------------------------------------------------------------------
-    # Encoder
+    # Label scarcity experiment (automatic 30% / 60% / 100%)
     # -------------------------------------------------------------------
-    freeze = (args.mode == "linear_probe")
-    encoder = load_encoder(args.encoder_ckpt, args.device, freeze=freeze)
+    if args.label_scarcity:
+        fractions = [0.30, 0.60, 1.00]
+        scarcity_results = {}
 
-    # -------------------------------------------------------------------
-    # Classifier (Wrapped with BatchNorm to fix numerical saddle point)
-    # -------------------------------------------------------------------
-    classifier = nn.Sequential(
-        nn.BatchNorm1d(768),
-        nn.Linear(768, args.num_classes)
-    ).to(args.device)
-    
-    nn.init.kaiming_uniform_(classifier[1].weight)
-    nn.init.zeros_(classifier[1].bias)
+        print("\n" + "=" * 60)
+        print("  LABEL SCARCITY ROBUSTNESS EXPERIMENT")
+        print(f"  Fractions: {[f'{f*100:.0f}%' for f in fractions]}")
+        print(f"  Mode: {mode_label}")
+        print("=" * 60)
 
-    # -------------------------------------------------------------------
-    # Train + Evaluate
-    # -------------------------------------------------------------------
-    if args.mode == "linear_probe":
-        # Pre-compute features for efficiency (DINO-style)
-        print("\n  [Phase 1] Extracting train features...")
-        train_feats, train_labels = extract_features(encoder, train_loader, args.device)
-        print(f"    Cached {train_feats.shape[0]} features of dim {train_feats.shape[1]}")
+        for frac in fractions:
+            print(f"\n{'─'*60}")
+            print(f"  Running with {frac*100:.0f}% of training labels...")
+            print(f"{'─'*60}")
 
-        print("  [Phase 2] Extracting test features...")
-        test_feats, test_labels = extract_features(encoder, test_loader, args.device)
-        print(f"    Cached {test_feats.shape[0]} features of dim {test_feats.shape[1]}")
+            result = run_evaluation(
+                args, train_ds, test_ds, test_loader, class_names,
+                label_fraction=frac,
+            )
+            scarcity_results[frac] = result
 
-        # Train linear classifier on cached features
-        classifier = train_linear_classifier(
-            train_feats, train_labels,
-            num_classes=args.num_classes,
-            epochs=args.epochs,
-            batch_size=args.batch_size,
-            lr=args.lr,
-            device=args.device,
-        )
+        # --- Comparison summary ---
+        print("\n" + "=" * 60)
+        print("  LABEL SCARCITY COMPARISON")
+        print("=" * 60)
+        print(f"\n  {'Fraction':>10s}  {'Samples':>10s}  {'Accuracy':>10s}  {'AUC':>10s}")
+        print("  " + "-" * 46)
+        for frac in fractions:
+            r = scarcity_results[frac]
+            print(f"  {frac*100:>9.0f}%  {r['n_samples']:>10d}  "
+                  f"{r['accuracy']:>9.2f}%  {r['auc']:>10.4f}")
+        print("  " + "-" * 46)
 
-        # Evaluate on cached test features
-        top1, per_class, cm = evaluate(
-            test_feats, test_labels, classifier,
-            args.num_classes, args.device, class_names,
-        )
+        # Degradation analysis
+        full = scarcity_results[1.00]
+        for frac in [0.30, 0.60]:
+            r = scarcity_results[frac]
+            acc_drop = full["accuracy"] - r["accuracy"]
+            auc_drop = full["auc"] - r["auc"]
+            print(f"  {frac*100:.0f}% -> 100%: "
+                  f"acc drop={acc_drop:+.2f}%  auc drop={auc_drop:+.4f}")
 
-    else:  # full_finetune
-        # Train end-to-end with differential LR + best-checkpoint tracking
-        history = train_finetune(
-            encoder, classifier, train_loader, test_loader,
-            epochs=args.epochs, lr=args.lr, device=args.device,
-            num_classes=args.num_classes, class_names=class_names,
-            output_dir=args.output_dir,
-        )
-
-        # Save training curves
-        save_training_curves(history, args.output_dir, args.mode)
-
-        # Evaluate (with probabilities for ROC)
-        top1, per_class, cm, all_probs, all_labels = evaluate_finetune(
-            encoder, classifier, test_loader,
-            args.num_classes, args.device, class_names,
-        )
+        save_label_scarcity_comparison(scarcity_results, args.output_dir)
+        return
 
     # -------------------------------------------------------------------
-    # Report
+    # Single evaluation run (with optional --label_fraction)
     # -------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print(f"  {mode_label} Results")
     print("=" * 60)
-    print(f"\n  Top-1 Accuracy: {top1:.2f}%\n")
-    print("  Per-class accuracy:")
-    for name, acc in per_class.items():
-        print(f"    {name:>20s}: {acc:.2f}%")
+    print(f"  FedMamba-SALT Evaluation -- {mode_label}")
+    if args.label_fraction < 1.0:
+        print(f"  Label fraction: {args.label_fraction*100:.0f}%")
+    print("=" * 60)
 
-    # Save confusion matrix
-    cm_path = os.path.join(args.output_dir, f"confusion_matrix_{args.mode}.png")
-    save_confusion_matrix(cm, class_names, cm_path, title=f"{mode_label} Confusion Matrix")
-
-    # Classification report
-    print_classification_report(cm, class_names, args.output_dir, args.mode)
-
-    # AUC & ROC curve (full_finetune mode has probabilities)
-    if args.mode == "full_finetune":
-        from sklearn.metrics import roc_auc_score
-        try:
-            if args.num_classes == 2:
-                final_auc = roc_auc_score(all_labels, all_probs[:, 1])
-            else:
-                final_auc = roc_auc_score(
-                    all_labels, all_probs, multi_class="ovr", average="macro",
-                )
-            print(f"\n  AUC Score: {final_auc:.4f}")
-        except ValueError:
-            final_auc = 0.0
-            print("\n  AUC Score: N/A (insufficient class coverage)")
-
-        save_roc_curve(all_probs, all_labels, class_names, args.output_dir, args.mode)
-
-    # Final summary line
-    print(f"\n  {mode_label} Result: {top1:.2f}% on {args.num_classes} classes "
-          f"over {len(test_ds)} test samples")
+    result = run_evaluation(
+        args, train_ds, test_ds, test_loader, class_names,
+        label_fraction=args.label_fraction,
+    )
 
     # -------------------------------------------------------------------
     # Baseline comparison reminder
     # -------------------------------------------------------------------
+    top1 = result["accuracy"]
     print("\n" + "-" * 60)
     print("  BASELINE COMPARISON NOTE:")
     print(f"    Centralized MAE baseline on Retina: ~{FEDMAE_BASELINE:.2f}%")
@@ -1071,3 +1299,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
