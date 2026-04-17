@@ -38,6 +38,7 @@ import torch.nn.functional as F
 from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, TensorDataset, Subset
+from torch.cuda.amp import autocast, GradScaler
 from torchvision import transforms
 from tqdm import tqdm
 
@@ -361,6 +362,8 @@ def train_finetune(
     print(f"  Encoder LR: {encoder_lr:.1e}  |  Classifier LR: {lr:.1e}  |  Epochs: {epochs}")
     print(f"  Early stopping patience: {FINETUNE_PATIENCE} epochs")
     total_start = time.time()
+    
+    scaler = GradScaler(enabled=(device == "cuda"))
 
     for epoch in range(epochs):
         epoch_start = time.time()
@@ -376,14 +379,19 @@ def train_finetune(
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
 
-            features = encoder(images)
-            logits = classifier(features)
-            loss = criterion(logits, labels)
+            with autocast(enabled=(device == "cuda")):
+                features = encoder(images)
+                logits = classifier(features)
+                loss = criterion(logits, labels)
 
             optimizer.zero_grad()
-            loss.backward()
+            scaler.scale(loss).backward()
+            
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
-            optimizer.step()
+            
+            scaler.step(optimizer)
+            scaler.update()
 
             total_loss += loss.item() * images.size(0)
             correct += (logits.argmax(dim=1) == labels).sum().item()

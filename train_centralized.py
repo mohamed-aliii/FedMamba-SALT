@@ -34,6 +34,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+from torch.cuda.amp import autocast, GradScaler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
@@ -421,6 +422,7 @@ def train_one_epoch(
     projector: nn.Module,
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
+    scaler: GradScaler,
     device: str,
 ) -> tuple:
     """
@@ -443,29 +445,36 @@ def train_one_epoch(
         teacher_view = teacher_view.to(device, non_blocking=True)
         student_view = student_view.to(device, non_blocking=True)
 
-        # ----- Teacher embedding (frozen, no gradient) -----
-        with torch.no_grad():
-            t_emb = teacher(teacher_view)               # (B, 768)
+        # ----- Mixed Precision Forward Pass -----
+        with autocast(enabled=True):
+            # Teacher embedding (frozen, no gradient)
+            with torch.no_grad():
+                t_emb = teacher(teacher_view)            # (B, 768)
 
-        # ----- Student embedding + projection -----
-        s_emb = student(student_view)                    # (B, 768)
-        s_proj = projector(s_emb)                        # (B, 768)
+            # Student embedding + projection
+            s_emb = student(student_view)                # (B, 768)
+            s_proj = projector(s_emb)                    # (B, 768)
 
-        # ----- SALT loss (Smooth L1 direct manifold distillation) -----
-        loss, align_loss, var_loss = salt_loss(s_proj, t_emb)
+            # SALT loss (Smooth L1 direct manifold distillation)
+            loss, align_loss, var_loss = salt_loss(s_proj, t_emb)
 
         # ----- Collapse diagnostics -----
         s_std = embedding_std(s_proj.detach())
         t_std = embedding_std(t_emb.detach())
 
-        # ----- Backward + gradient clipping + step -----
+        # ----- Backward pass with Dynamic Loss Scaling -----
         optimizer.zero_grad()
-        loss.backward()
+        scaler.scale(loss).backward()
+        
+        # Unscale before clipping
+        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(
             list(student.parameters()) + list(projector.parameters()),
             max_norm=1.0,
         )
-        optimizer.step()
+        
+        scaler.step(optimizer)
+        scaler.update()
 
         # ----- Accumulate metrics -----
         total_loss += loss.item()
@@ -540,6 +549,9 @@ def main() -> None:
           f"collapse strikes={COLLAPSE_STRIKES_MAX}")
     print(f"{'='*55}\n")
 
+    # ----- Automated Mixed Precision -----
+    scaler = GradScaler(enabled=(device == "cuda"))
+
     # Reset peak GPU memory counter for accurate per-run tracking
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
@@ -553,7 +565,7 @@ def main() -> None:
         t0 = time.time()
 
         avg_loss, avg_align, avg_var, avg_s_std, avg_t_std = train_one_epoch(
-            teacher, student, projector, dataloader, optimizer, args.device,
+            teacher, student, projector, dataloader, optimizer, scaler, args.device,
         )
 
         # --- NaN safety ---
