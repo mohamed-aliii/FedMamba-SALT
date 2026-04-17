@@ -550,7 +550,7 @@ def main() -> None:
     print(f"{'='*55}\n")
 
     # ----- Automated Mixed Precision -----
-    scaler = GradScaler(enabled=(device == "cuda"))
+    scaler = GradScaler(enabled=(args.device == "cuda"))
 
     # Reset peak GPU memory counter for accurate per-run tracking
     if torch.cuda.is_available():
