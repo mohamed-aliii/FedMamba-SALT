@@ -187,10 +187,12 @@ def extract_features(
 
     for images, labels in tqdm(dataloader, desc="  Extracting features", leave=False):
         images = images.to(device, non_blocking=True)
-        # Extract and explicitly L2-normalize. SALT optimized cosine similarity,
-        # so features MUST be on the unit sphere for linear probing to work effectively.
+        # Extract raw features -- do NOT L2-normalize.
+        # With Smooth L1 distillation, the encoder learns to match the
+        # teacher's actual geometry (direction + magnitude).  Normalizing
+        # here would erase the magnitude information that the downstream
+        # BatchNorm1d classifier head expects.
         features = encoder(images)  # (B, 768)
-        features = F.normalize(features, dim=-1, p=2)
         all_features.append(features.cpu())
         all_labels.append(labels)
 
@@ -298,10 +300,12 @@ def train_finetune(
     Returns:
         dict with lists of per-epoch metrics for visualization.
     """
-    # -- Full Learning Rates --
-    # Differential LR was trapping us in the saddle point. MAE geometries must 
-    # be aggressively reorganized for medical semantic classification.
-    encoder_lr = lr
+    # -- Differential Learning Rates --
+    # The encoder has learned the teacher's manifold geometry during
+    # pre-training. Using the full LR would destroy these features
+    # in the first few batches (catastrophic forgetting).
+    # The classifier head needs aggressive LR to learn the decision boundary.
+    encoder_lr = lr / 20.0
     param_groups = [
         {"params": encoder.parameters(), "lr": encoder_lr},
         {"params": classifier.parameters(), "lr": lr},

@@ -12,15 +12,15 @@ Usage:
 
 Expected training behavior (healthy run)
 =========================================
-  Loss = 1 - cosine_similarity  (range [0, 2])
-  Epoch   1:  loss ~ 0.9-1.0  (random init, cosine sim near 0)
-  Epoch  10:  loss ~ 0.4-0.7  (warmup complete, student starting to align)
-  Epoch  30:  loss ~ 0.15-0.4
-  Epoch 100:  loss ~ 0.05-0.2  (plateau)
+  Loss = SmoothL1(student_proj, teacher_emb)  (range [0, +inf))
+  Epoch   1:  loss ~ 0.3-0.5  (random init, large vector mismatch)
+  Epoch  10:  loss ~ 0.1-0.3  (warmup complete, student converging)
+  Epoch  50:  loss ~ 0.01-0.1
+  Epoch 100:  loss ~ 0.005-0.05  (plateau)
 
-  embedding_std should stay ABOVE 0.1 throughout training.
-  If it drops below 0.05, representations are collapsing --
-  stop training and debug (check augmentations, LR, loss).
+  student_std should track towards teacher_std (~0.04).
+  If student_std diverges wildly (>10x teacher_std) or drops
+  to near zero (<0.2x teacher_std), investigate.
 =========================================
 """
 
@@ -52,7 +52,7 @@ from utils.ckpt_compat import safe_torch_load
 # Constants
 # ======================================================================
 WARMUP_EPOCHS = 10
-COLLAPSE_THRESHOLD = 0.05  # embedding_std below this -> likely collapse
+COLLAPSE_RATIO = 0.2  # warn if student_std < teacher_std * this ratio
 METRICS_FILENAME = "training_metrics.csv"
 
 
@@ -446,7 +446,7 @@ def train_one_epoch(
         s_emb = student(student_view)                    # (B, 768)
         s_proj = projector(s_emb)                        # (B, 768)
 
-        # ----- SALT loss + VICReg variance penalty -----
+        # ----- SALT loss (Smooth L1 direct manifold distillation) -----
         loss, align_loss, var_loss = salt_loss(s_proj, t_emb)
 
         # ----- Collapse diagnostics -----
@@ -514,23 +514,17 @@ def main() -> None:
     )
 
     # ----- Training loop -----
-    # Expected loss trajectory (healthy training):
-    #   Loss = 1 - cosine_similarity  (range [0, 2])
-    #   Epoch   1: ~0.9-1.0  (random init, cosine sim near 0)
-    #   Epoch  10: ~0.4-0.7  (warmup complete, student starting to align)
-    #   Epoch  30: ~0.15-0.4
-    #   Epoch 100: ~0.05-0.2 (plateau)
+    # Expected loss trajectory (healthy training, Smooth L1):
+    #   Loss = SmoothL1(student_proj, teacher_emb)
+    #   Epoch   1: ~0.3-0.5  (random init, large vector mismatch)
+    #   Epoch  10: ~0.1-0.3  (warmup complete, student converging)
+    #   Epoch  50: ~0.01-0.1
+    #   Epoch 100: ~0.005-0.05 (plateau)
     #
     # Collapse detection:
-    #   embedding_std measures the average per-dimension standard deviation
-    #   of the student projections across a batch.
-    #     - Healthy:   > 0.1
-    #     - Warning:   0.05 - 0.1
-    #     - Collapsed: < 0.05  --> STOP and debug
-    #
-    #   A collapsed model outputs nearly identical embeddings for all inputs,
-    #   meaning it has found a degenerate shortcut instead of learning
-    #   meaningful representations.
+    #   student_std should track towards teacher_std (~0.04).
+    #   If student_std < teacher_std * 0.2, the student is collapsing.
+    #   If student_std > teacher_std * 10, the student is diverging.
 
     # ----- Metrics logger -----
     metrics_logger = MetricsLogger(args.output_dir)
@@ -575,15 +569,22 @@ def main() -> None:
             current_lr, elapsed, gpu_mem,
         )
 
-        # ----- Collapse warning -----
-        if avg_s_std < COLLAPSE_THRESHOLD:
+        # ----- Collapse warning (dynamic, relative to teacher) -----
+        collapse_floor = avg_t_std * COLLAPSE_RATIO
+        if avg_s_std < collapse_floor:
             print(
-                f"  [WARNING] Student embedding_std={avg_s_std:.4f} < {COLLAPSE_THRESHOLD} "
+                f"  [WARNING] Student embedding_std={avg_s_std:.4f} < "
+                f"{collapse_floor:.4f} (teacher_std * {COLLAPSE_RATIO}) "
                 f"-- possible representation collapse!"
             )
             print(
                 f"  [WARNING] Consider stopping training and debugging "
                 f"augmentations, learning rate, or loss function."
+            )
+        elif avg_s_std > avg_t_std * 10:
+            print(
+                f"  [WARNING] Student embedding_std={avg_s_std:.4f} >> "
+                f"teacher_std={avg_t_std:.4f} -- student may be diverging."
             )
 
         # ----- Save ckpt_latest.pth every epoch (resume point) -----

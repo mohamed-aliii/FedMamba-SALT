@@ -1,34 +1,33 @@
 """
 objectives/salt_loss.py -- Learning objective for FedMamba-SALT.
 
-The core loss is 1 - cosine_similarity between the student's projected
-embedding and the teacher's embedding, averaged over the batch.
+The core loss is Smooth L1 (Huber) between the student's projected
+embedding and the frozen teacher's embedding, averaged over the batch.
 
-To prevent representation collapse (all embeddings converging to the same
-point), a VICReg-style **variance penalty** is added.  The variance term
-computes ``max(0, gamma - std(z_i))`` for each embedding dimension ``i``
-and averages over dimensions.  This creates a hinge force that activates
-*only* when per-dimension standard deviation drops below ``gamma``,
-pushing embeddings apart without interfering when variance is healthy.
+Smooth L1 was chosen over cosine similarity because:
+    1. It matches both **direction and magnitude** of the teacher's
+       representation space, preventing the angular-collapse trap where
+       cosine similarity allows all vectors to point in one direction
+       while scaling magnitude to satisfy a variance penalty.
+    2. With a frozen teacher, there is no risk of joint collapse,
+       so the VICReg variance penalty is unnecessary and was in fact
+       creating a geometric paradox (forcing variance the teacher
+       itself doesn't possess: t_std ≈ 0.04).
 
 Total loss::
 
-    L = L_align  +  lambda_var * L_var
-
-where:
-    L_align = 1 - cos_sim(student_proj, teacher_emb)
-    L_var   = mean(max(0, gamma - std(student_proj, dim=batch)))
+    L = SmoothL1(student_proj, teacher_emb.detach())
 
 Implementation details:
     1. **Detach the teacher** -- explicit ``.detach()`` as safety net.
-    2. **L2-normalise both vectors** before cosine for numerical stability.
-    3. **Variance is on raw (unnormalized) student projections** -- computing
-       std on L2-normalized vectors would hide collapse because
-       normalization maps every vector to the unit sphere.
+    2. **No L2-normalisation** -- Smooth L1 operates on raw vectors
+       so the student must match the teacher's actual geometry.
+    3. **LayerNorm in projection head** -- replaces BatchNorm1d which
+       was laundering collapsed encoder outputs into fake variance.
 
 References:
     - BYOL (Grill et al., 2020) -- projection-head architectural pattern
-    - VICReg (Bardes et al., 2022) -- variance-invariance-covariance
+    - Smooth L1 / Huber loss -- robust regression standard
 """
 
 import torch
@@ -67,10 +66,10 @@ class ProjectionHead(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, out_dim),
         )
@@ -118,7 +117,7 @@ def variance_loss(
 
 
 # ======================================================================
-# SALT loss function (with VICReg variance regularisation)
+# SALT loss function (Smooth L1 direct manifold distillation)
 # ======================================================================
 def salt_loss(
     student_proj: torch.Tensor,
@@ -127,42 +126,41 @@ def salt_loss(
     gamma: float = 1.0,
 ) -> tuple:
     """
-    Combined alignment + variance loss for FedMamba-SALT.
+    Direct manifold distillation loss for FedMamba-SALT.
 
-    Total loss = L_align + lambda_var * L_var
+    Total loss = SmoothL1(student_proj, teacher_emb)
 
-    where:
-        L_align = 1 - cosine_similarity   (range [0, 2])
-        L_var   = VICReg variance hinge    (range [0, gamma])
+    Smooth L1 (Huber loss) matches both direction AND magnitude of the
+    teacher's representation space.  Unlike cosine similarity, it does
+    not allow the student to satisfy the loss by simply pointing all
+    vectors in one direction while inflating magnitude.
+
+    The variance penalty (lambda_var, gamma) arguments are kept for
+    API compatibility but are no longer used.  With a frozen teacher,
+    the teacher's own geometry provides the anti-collapse anchor.
 
     Args:
         student_proj: ``(B, D)`` output of the projection head.
         teacher_emb:  ``(B, D)`` CLS-token embedding from frozen teacher.
-        lambda_var:   Weight for the variance penalty (default 1.0).
-        gamma:        Target minimum per-dimension std (default 1.0).
+        lambda_var:   Unused (kept for API compatibility).
+        gamma:        Unused (kept for API compatibility).
 
     Returns:
         Tuple of ``(total_loss, align_loss, var_loss)`` -- all scalar
         tensors.  ``total_loss`` is the value to call ``.backward()`` on.
-        The other two are for logging.
+        ``var_loss`` is always 0.0 (kept for logging compatibility).
     """
     # --- Detach the teacher ---
     teacher_emb = teacher_emb.detach()
 
-    # --- Variance loss on RAW (unnormalized) student projections ---
-    # Must be computed BEFORE L2-normalization, because normalization
-    # maps everything to the unit sphere and hides collapse.
-    var_loss = variance_loss(student_proj, gamma=gamma)
+    # --- Direct Smooth L1 alignment (matches direction + magnitude) ---
+    align_loss = F.smooth_l1_loss(student_proj, teacher_emb)
 
-    # --- L2-normalise for cosine alignment ---
-    student_norm = F.normalize(student_proj, dim=-1, p=2)
-    teacher_norm = F.normalize(teacher_emb, dim=-1, p=2)
+    # --- No variance penalty (frozen teacher = inherent anti-collapse) ---
+    var_loss = torch.tensor(0.0, device=student_proj.device)
 
-    # --- Cosine alignment loss ---
-    align_loss = (1.0 - F.cosine_similarity(student_norm, teacher_norm, dim=-1)).mean()
-
-    # --- Combined ---
-    total_loss = align_loss + lambda_var * var_loss
+    # --- Total loss = alignment only ---
+    total_loss = align_loss
 
     return total_loss, align_loss, var_loss
 
