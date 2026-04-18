@@ -76,8 +76,6 @@ def get_teacher_transform(dataset: str = "imagenet") -> transforms.Compose:
     mean = RETINA_MEAN if dataset == "retina" else IMAGENET_MEAN
     std = RETINA_STD if dataset == "retina" else IMAGENET_STD
     return transforms.Compose([
-        transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
-        transforms.RandomHorizontalFlip(p=0.5),
         transforms.ToTensor(),
         transforms.Normalize(mean=mean, std=std),
     ])
@@ -103,8 +101,6 @@ def get_student_transform(dataset: str = "imagenet") -> transforms.Compose:
     mean = RETINA_MEAN if dataset == "retina" else IMAGENET_MEAN
     std = RETINA_STD if dataset == "retina" else IMAGENET_STD
     return transforms.Compose([
-        transforms.RandomResizedCrop(224, scale=(0.5, 1.0)),
-        transforms.RandomHorizontalFlip(p=0.5),
         transforms.ColorJitter(
             brightness=0.6,
             contrast=0.6,
@@ -151,6 +147,12 @@ class DualViewDataset(Dataset):
         self.teacher_transform = teacher_transform or get_teacher_transform()
         self.student_transform = student_transform or get_student_transform()
 
+        # Shared spatial geometry constraint. Evaluated strictly once per image.
+        self.shared_spatial = transforms.Compose([
+            transforms.RandomResizedCrop(224, scale=(0.5, 1.0)),
+            transforms.RandomHorizontalFlip(p=0.5),
+        ])
+
     def __len__(self) -> int:
         return len(self.base_dataset)  # type: ignore[arg-type]
 
@@ -162,9 +164,11 @@ class DualViewDataset(Dataset):
         """
         img, _label = self.base_dataset[index]
 
-        # Both transforms receive the SAME PIL image; randomness inside
-        # each Compose pipeline is independent.
-        teacher_view: torch.Tensor = self.teacher_transform(img)
-        student_view: torch.Tensor = self.student_transform(img)
+        # 1. Evaluate spatial augmentations EXACTLY ONCE to lock geometry
+        shared_img = self.shared_spatial(img)
+
+        # 2. Apply independent photometric corruptions / standardizations
+        teacher_view: torch.Tensor = self.teacher_transform(shared_img)
+        student_view: torch.Tensor = self.student_transform(shared_img)
 
         return teacher_view, student_view
