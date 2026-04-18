@@ -35,54 +35,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ======================================================================
-# Projection Head (BYOL-style 3-layer MLP)
-# ======================================================================
-class ProjectionHead(nn.Module):
-    """
-    3-layer MLP that maps the student encoder's output to a projected
-    embedding aligned with the teacher's representation space.
-
-    Architecture::
-
-        Linear(in_dim, hidden_dim)
-        → BatchNorm1d(hidden_dim) → GELU
-        → Linear(hidden_dim, hidden_dim)
-        → BatchNorm1d(hidden_dim) → GELU
-        → Linear(hidden_dim, out_dim)
-        (no activation after the final linear layer)
-
-    The projection head absorbs the geometric mismatch between the Mamba
-    student and the ViT teacher without distorting either encoder's
-    internal representations.
-    """
-
-    def __init__(
-        self,
-        in_dim: int = 768,
-        hidden_dim: int = 2048,
-        out_dim: int = 768,
-    ):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, out_dim),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: ``(B, in_dim)`` student encoder output.
-
-        Returns:
-            ``(B, out_dim)`` projected embedding.
-        """
-        return self.net(x)
+# (Projection Head removed to force absolute Encoder-to-Teacher regression geometry)
 
 
 # ======================================================================

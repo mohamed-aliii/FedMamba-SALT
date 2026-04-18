@@ -230,7 +230,7 @@ def train_linear_classifier(
     """Train a single nn.Linear layer on cached features."""
     feat_dim = train_features.shape[1]
     classifier = nn.Sequential(
-        nn.BatchNorm1d(feat_dim),
+        nn.LayerNorm(feat_dim),
         nn.Linear(feat_dim, num_classes)
     ).to(device)
     
@@ -1092,7 +1092,7 @@ def run_evaluation(
     encoder = load_encoder(args.encoder_ckpt, args.device, freeze=freeze)
 
     classifier = nn.Sequential(
-        nn.BatchNorm1d(768),
+        nn.LayerNorm(768),
         nn.Linear(768, args.num_classes),
     ).to(args.device)
     nn.init.kaiming_uniform_(classifier[1].weight)
