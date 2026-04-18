@@ -27,7 +27,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.inception_mamba import InceptionMambaEncoder
 from models.vit_teacher import FrozenViTTeacher
-from objectives.salt_loss import ProjectionHead, embedding_std, salt_loss
+from objectives.salt_loss import embedding_std, salt_loss
 
 BATCH = 4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -72,7 +72,7 @@ def test_end_to_end() -> bool:
     }
 
     # Optimizer on student + projector only
-    params = list(student.parameters()) + list(projector.parameters())
+    params = list(student.parameters())
     optimizer = AdamW(params, lr=1e-3, weight_decay=0.05)
 
     # ----- Synthetic batch -----
@@ -87,9 +87,8 @@ def test_end_to_end() -> bool:
 
     print("  [4/8] Student + projector forward...")
     student.train()
-    projector.train()
     s_emb = student(student_view)                 # (B, 768)
-    s_proj = projector(s_emb)                     # (B, 768)
+    s_proj = s_emb                     # (B, 768)
 
     # ----- SALT loss -----
     print("  [5/8] Computing SALT loss...")

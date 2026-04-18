@@ -21,7 +21,7 @@ import torch
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from objectives.salt_loss import ProjectionHead, embedding_std, salt_loss
+from objectives.salt_loss import embedding_std, salt_loss
 
 DIM = 768
 BATCH = 8
@@ -139,15 +139,7 @@ def test_gradient_isolation() -> bool:
 # =====================================================================
 #  Bonus -- ProjectionHead and embedding_std quick checks
 # =====================================================================
-def test_projection_head_shape() -> bool:
-    """ProjectionHead must map (B, 768) -> (B, 768)."""
-    head = ProjectionHead(in_dim=768, hidden_dim=2048, out_dim=768)
-    x = torch.randn(BATCH, 768)
-    out = head(x)
-    passed = out.shape == (BATCH, 768)
-    tag = "PASS" if passed else "FAIL"
-    print(f"  [{tag}] Bonus A -- ProjectionHead shape: {tuple(out.shape)}")
-    return passed
+
 
 
 def test_embedding_std_healthy() -> bool:
@@ -156,7 +148,7 @@ def test_embedding_std_healthy() -> bool:
     std = embedding_std(embeddings)
     passed = std > 0.1
     tag = "PASS" if passed else "FAIL"
-    print(f"  [{tag}] Bonus B -- embedding_std = {std:.4f}  (healthy > 0.1)")
+    print(f"  [{tag}] Bonus A -- embedding_std = {std:.4f}  (healthy > 0.1)")
     return passed
 
 
@@ -166,7 +158,7 @@ def test_embedding_std_collapsed() -> bool:
     std = embedding_std(embeddings)
     passed = std < 0.01
     tag = "PASS" if passed else "FAIL"
-    print(f"  [{tag}] Bonus C -- embedding_std (collapsed) = {std:.6f}  "
+    print(f"  [{tag}] Bonus A -- embedding_std (collapsed) = {std:.6f}  "
           f"(expected < 0.01)")
     return passed
 
@@ -190,7 +182,6 @@ if __name__ == "__main__":
     print()
     print("  -- Bonus checks --")
     bonus_results = [
-        test_projection_head_shape(),
         test_embedding_std_healthy(),
         test_embedding_std_collapsed(),
     ]
@@ -201,7 +192,7 @@ if __name__ == "__main__":
     n_total = len(all_results)
     n_core = sum(core_results)
     print(f"  Core:  {n_core}/5 passed")
-    print(f"  Bonus: {sum(bonus_results)}/3 passed")
+    print(f"  Bonus: {sum(bonus_results)}/2 passed")
     print(f"  Total: {n_passed}/{n_total} passed")
     if n_core == 5:
         print("  [OK] All core tests PASSED -- loss function is ready.")
