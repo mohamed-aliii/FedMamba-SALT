@@ -176,18 +176,29 @@ class FrozenViTTeacher(nn.Module):
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Extract the CLS-token embedding from a batch of images.
+        Extract the Global Average Pooling (GAP) of patch features.
 
         Args:
             x: Image batch of shape ``(B, 3, 224, 224)``.
 
         Returns:
-            CLS-token embeddings of shape ``(B, 768)``.
+            GAP patch embeddings of shape ``(B, 768)``.
         """
-        # Defensive: re-assert eval mode in case .train() was called on a
-        # parent module that recursively set this module to train mode.
+        # Defensive: re-assert eval mode
         self.eval()
 
-        # timm 0.3.2: forward_features returns pre_logits(x[:, 0]) = (B, 768)
-        # i.e. the CLS token is already extracted and normalized.
-        return self.encoder.forward_features(x)  # (B, 768)
+        # MAE CLS tokens harbor random noise due to lack of reconstruction loss.
+        # We must extract the patch features directly.
+        x = self.encoder.patch_embed(x)
+        cls_token = self.encoder.cls_token.expand(x.shape[0], -1, -1)
+        x = torch.cat((cls_token, x), dim=1)
+        x = x + self.encoder.pos_embed
+        x = self.encoder.pos_drop(x)
+
+        for blk in self.encoder.blocks:
+            x = blk(x)
+
+        x = self.encoder.norm(x)
+
+        # Drop the CLS token (index 0) and average pool the 196 patch tokens
+        return x[:, 1:].mean(dim=1)  # (B, 768)
