@@ -91,9 +91,11 @@ class PatchEmbedding(nn.Module):
         super().__init__()
         self.num_patches = (img_size // patch_size) ** 2  # 196 for 224/16
 
+        _get_groups = lambda c: next((g for g in [32, 16, 8, 4, 2, 1] if c % g == 0), 1)
+
         self.proj = nn.Sequential(
             nn.Conv2d(3, embed_dim, kernel_size=patch_size, stride=patch_size),
-            nn.BatchNorm2d(embed_dim),
+            nn.GroupNorm(_get_groups(embed_dim), embed_dim),
             nn.GELU(),
         )
 
@@ -131,13 +133,15 @@ class InceptionConvBlock(nn.Module):
         super().__init__()
         branch_dim = embed_dim // 4
 
-        # Helper: pointwise reduction + depthwise spatial conv + BN + GELU
+        _get_groups = lambda c: next((g for g in [32, 16, 8, 4, 2, 1] if c % g == 0), 1)
+
+        # Helper: pointwise reduction + depthwise spatial conv + GN + GELU
         def _make_dw_branch(kernel_size: int) -> nn.Sequential:
             return nn.Sequential(
                 nn.Conv2d(embed_dim, branch_dim, 1),                             # pointwise reduce
                 nn.Conv2d(branch_dim, branch_dim, kernel_size,
                           padding=kernel_size // 2, groups=branch_dim),           # depthwise
-                nn.BatchNorm2d(branch_dim),
+                nn.GroupNorm(_get_groups(branch_dim), branch_dim),
                 nn.GELU(),
             )
 
@@ -149,7 +153,7 @@ class InceptionConvBlock(nn.Module):
         self.branch_pool = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(embed_dim, branch_dim, 1),
-            nn.BatchNorm2d(branch_dim),
+            nn.GroupNorm(_get_groups(branch_dim), branch_dim),
             nn.GELU(),
         )
 
