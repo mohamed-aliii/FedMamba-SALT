@@ -128,8 +128,14 @@ class RetinaDataset(Dataset):
         elif img.shape[2] >= 3:
             img = img[:, :, :3]
 
-        # Convert to PIL
-        img_uint8 = (img * 255).clip(0, 255).astype(np.uint8)
+        # Convert to PIL intelligently based on the mathematical data bounds
+        # skimage.resize outputs float type. If original array natively spanned
+        # 0.0 - 255.0, multiplying by 255 corrupts it into pure white noise.
+        if img.max() <= 1.0:
+            img_uint8 = (img * 255).clip(0, 255).astype(np.uint8)
+        else:
+            img_uint8 = img.clip(0, 255).astype(np.uint8)
+            
         pil_img = Image.fromarray(img_uint8)
 
         # Label
