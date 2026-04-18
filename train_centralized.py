@@ -623,7 +623,7 @@ def main() -> None:
 
         # ----- Save ckpt_latest.pth every epoch (resume point) -----
         save_checkpoint(
-            student, projector, optimizer, scheduler,
+            student, optimizer, scheduler,
             epoch, avg_loss, args.output_dir, "ckpt_latest.pth",
         )
 
@@ -631,7 +631,7 @@ def main() -> None:
         if (epoch + 1) % args.save_every == 0:
             name = f"ckpt_epoch_{epoch + 1:04d}.pth"
             save_checkpoint(
-                student, projector, optimizer, scheduler,
+                student, optimizer, scheduler,
                 epoch, avg_loss, args.output_dir, name,
             )
             print(f"    -> Saved {name}")
