@@ -263,7 +263,8 @@ class InceptionMambaBlock(nn.Module):
     def __init__(self, embed_dim: int = 256, ffn_ratio: int = 4):
         super().__init__()
 
-        # Local multi-scale convolution
+        # Local multi-scale convolution with pre-norm
+        self.norm_conv = nn.LayerNorm(embed_dim)
         self.conv_block = InceptionConvBlock(embed_dim)
 
         # Global 4-directional Mamba scan (has internal pre-norm + residual)
@@ -278,7 +279,7 @@ class InceptionMambaBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.conv_block(x)                  # residual from conv block
+        x = x + self.conv_block(self.norm_conv(x))   # pre-norm + residual from conv block
         x = self.mamba_block(x)                      # MambaBlock internal residual
         x = x + self.ffn(self.norm_ffn(x))           # FFN with pre-norm + residual
         return x
