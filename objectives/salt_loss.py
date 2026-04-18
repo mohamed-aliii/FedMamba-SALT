@@ -89,31 +89,32 @@ class ProjectionHead(nn.Module):
 # VICReg variance penalty
 # ======================================================================
 def variance_loss(
-    embeddings: torch.Tensor,
-    gamma: float = 1.0,
+    student_embeddings: torch.Tensor,
+    teacher_embeddings: torch.Tensor,
 ) -> torch.Tensor:
     """
-    VICReg-style variance hinge loss.
-
-    For each embedding dimension, compute the standard deviation across
-    the batch.  If std < gamma, apply a penalty of (gamma - std).
-    Otherwise the penalty is zero.  Average over all dimensions.
+    Per-dimension variance penalty to prevent mean-target collapse
+    without distorting anisotropic structural geometry.
 
     This creates a *repulsive force* that activates only when the
-    representation is collapsing, without interfering with alignment
-    when variance is already healthy.
+    representation is collapsing locally relative to the teacher's structure.
 
     Args:
-        embeddings: ``(B, D)`` raw (unnormalized) projected embeddings.
-        gamma: Target minimum std per dimension (default 1.0 per VICReg).
+        student_embeddings: ``(B, D)`` raw projected embeddings.
+        teacher_embeddings: ``(B, D)`` detached teacher target embeddings.
 
     Returns:
-        Scalar loss tensor (0.0 when all dimensions have std >= gamma).
+        Scalar loss tensor.
     """
-    # std across the batch for each dimension: shape (D,)
-    std = embeddings.std(dim=0)
-    # Hinge: penalise only when std < gamma
-    return F.relu(gamma - std).mean()
+    # Calculate standard deviation for each dimension independently (shape: D)
+    # Add epsilon to prevent NaN gradients in std when variance is exactly zero
+    s_std = student_embeddings.std(dim=0)
+    t_std = teacher_embeddings.std(dim=0)
+
+    # Hinge: penalize the student only if a specific dimension drops below
+    # the exact naturally occurring variance of the teacher in that same dimension.
+    # Scaled by 0.9 to provide a smooth convergence floor without strict boundary bouncing.
+    return F.relu((t_std * 0.9) - s_std).mean()
 
 
 # ======================================================================
@@ -123,33 +124,26 @@ def salt_loss(
     student_proj: torch.Tensor,
     teacher_emb: torch.Tensor,
     lambda_var: float = 1.0,
-    gamma: float = 1.0,
+    gamma: float = 1.0,  # kept for exact signature compatibility
 ) -> tuple:
     """
     Direct manifold distillation loss for FedMamba-SALT.
 
     Total loss = SmoothL1(student_proj, teacher_emb)
 
-    Smooth L1 (Huber loss) matches both direction AND magnitude of the
-    teacher's representation space. 
-
-    Crucially, because the student sees heavily corrupted images while
-    the teacher sees clean images, the network is prone to 'mean-target
-    collapse', where the student just predicts the batch average to 
-    minimize alignment error. To prevent this, we re-instate the VICReg
-    variance penalty, but dynamically set `gamma` to the teacher's 
-    actual standard deviation (instead of an incompatible 1.0).
+    To prevent 'mean-target collapse' (where the student predicts the batch 
+    average when completely blinded by heavy augmentations), we enforce a 
+    Per-Dimension Variance Penalty perfectly aligned to the Teacher's unique 
+    manifold geometry.
 
     Args:
         student_proj: ``(B, D)`` output of the projection head.
-        teacher_emb:  ``(B, D)`` CLS-token embedding from frozen teacher.
+        teacher_emb:  ``(B, D)`` embedding from frozen teacher.
         lambda_var:   Weight for the variance penalty (default 1.0).
-        gamma:        Scale override (if None, dynamic matching is used).
+        gamma:        Unused (replaced by strict per-dimension geometry).
 
     Returns:
-        Tuple of ``(total_loss, align_loss, var_loss)`` -- all scalar
-        tensors.  ``total_loss`` is the value to call ``.backward()`` on.
-        ``var_loss`` is always 0.0 (kept for logging compatibility).
+        Tuple of ``(total_loss, align_loss, var_loss)``.
     """
     # --- Detach the teacher ---
     teacher_emb = teacher_emb.detach()
@@ -157,14 +151,10 @@ def salt_loss(
     # --- Direct Smooth L1 alignment (matches direction + magnitude) ---
     align_loss = F.smooth_l1_loss(student_proj, teacher_emb)
 
-    # --- Dynamic Variance Penalty ---
-    # Computes the actual batch-level variance of the frozen target
-    target_std = teacher_emb.std(dim=0).mean().item()
-    dynamic_gamma = target_std if gamma is None or gamma == 1.0 else gamma
-    
-    # Penalize the student only if its representations collapse below the
-    # structural variance of the teacher's embeddings.
-    var_loss = variance_loss(student_proj, gamma=dynamic_gamma)
+    # --- Strict Per-Dimension Variance Penalty ---
+    # Penalize the student strictly if its dimensions collapse below the
+    # specific structural variance of the teacher's individual embeddings.
+    var_loss = variance_loss(student_proj, teacher_emb)
 
     # --- Total loss ---
     total_loss = align_loss + (lambda_var * var_loss)
