@@ -66,11 +66,11 @@ def test_loss_identical() -> bool:
 
 
 # =====================================================================
-#  Test 3 -- Orthogonal normalised vectors -> loss ~ 1/768
+#  Test 3 -- Orthogonal normalised vectors -> loss ~ 1.0
 # =====================================================================
-# Smooth L1 evaluates Mean(0.5 * (a - b)^2). For orthogonal unit vectors,
-# sum((a - b)^2) = 2.0. Mean is 2.0 / (2 * 768).
-EXPECTED_ORTHO = 1.0 / DIM
+# Loss = 1 - cosine_similarity. For orthogonal unit vectors,
+# cosine_similarity = 0, so loss = 1.0 exactly.
+EXPECTED_ORTHO = 1.0
 
 
 def test_loss_orthogonal() -> bool:
@@ -90,11 +90,11 @@ def test_loss_orthogonal() -> bool:
 
 
 # =====================================================================
-#  Test 4 -- Opposite normalised vectors -> loss ~ 2/768
+#  Test 4 -- Opposite normalised vectors -> loss ~ 2.0
 # =====================================================================
-# For opposite unit vectors b = -a, sum((a - b)^2) = 4.0.
-# Mean of 0.5 * 4.0 across 768 dims is 2.0 / 768.
-EXPECTED_OPP = 2.0 / DIM
+# Loss = 1 - cosine_similarity. For opposite unit vectors,
+# cosine_similarity = -1, so loss = 1 - (-1) = 2.0 exactly.
+EXPECTED_OPP = 2.0
 
 
 def test_loss_opposite() -> bool:

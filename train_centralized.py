@@ -12,16 +12,16 @@ Usage:
 
 Expected training behavior (healthy run)
 =========================================
-  Loss = SmoothL1(student_proj, teacher_emb)  (range [0, +inf))
-  Epoch   1:  loss ~ 0.3-0.5  (random init, large vector mismatch)
-  Epoch  10:  loss ~ 0.1-0.3  (warmup complete, student converging)
-  Epoch  50:  loss ~ 0.01-0.1
-  Epoch 100:  loss ~ 0.005-0.05  (plateau)
+  Loss = 1 - cosine_similarity(student_emb, teacher_emb)  (range [0, 2])
+  Epoch   1:  loss ~ 0.5-0.9  (random init, low angular alignment)
+  Epoch  10:  loss ~ 0.3-0.5  (warmup complete, student converging)
+  Epoch  50:  loss ~ 0.1-0.3
+  Epoch 100:  loss ~ 0.05-0.2  (plateau)
 
-  student_std should track towards teacher_std (~0.04).
-  If student_std diverges wildly (>10x teacher_std) or drops
-  to near zero (<0.2x teacher_std), investigate.
+  student_std is informational only (cosine loss is scale-invariant).
+  If loss plateaus above 0.5, the student is not learning.
 =========================================
+
 """
 
 import argparse

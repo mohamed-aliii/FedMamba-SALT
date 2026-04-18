@@ -1,33 +1,32 @@
 """
 objectives/salt_loss.py -- Learning objective for FedMamba-SALT.
 
-The core loss is Smooth L1 (Huber) between the student's projected
+The core loss is Negative Cosine Similarity between the student's
 embedding and the frozen teacher's embedding, averaged over the batch.
 
-Smooth L1 was chosen over cosine similarity because:
-    1. It matches both **direction and magnitude** of the teacher's
-       representation space, preventing the angular-collapse trap where
-       cosine similarity allows all vectors to point in one direction
-       while scaling magnitude to satisfy a variance penalty.
-    2. With a frozen teacher, there is no risk of joint collapse,
-       so the VICReg variance penalty is unnecessary and was in fact
-       creating a geometric paradox (forcing variance the teacher
-       itself doesn't possess: t_std ≈ 0.04).
+Cosine similarity is used because:
+    1. It is **scale-invariant** -- it measures angular alignment on the
+       unit sphere, entirely immune to the absolute magnitude of the
+       teacher's representation space (~0.059 std).
+    2. A student that predicts a constant (mean-target collapse) gets
+       cosine similarity ~ 0 against varying teacher targets, making
+       collapse a high-loss state rather than a trivial minimum.
+    3. With a frozen teacher producing diverse per-image targets, there
+       is no risk of joint angular collapse.
 
 Total loss::
 
-    L = SmoothL1(student_proj, teacher_emb.detach())
+    L = mean(1 - cosine_similarity(student_emb, teacher_emb))
 
 Implementation details:
     1. **Detach the teacher** -- explicit ``.detach()`` as safety net.
-    2. **No L2-normalisation** -- Smooth L1 operates on raw vectors
-       so the student must match the teacher's actual geometry.
-    3. **LayerNorm in projection head** -- replaces BatchNorm1d which
-       was laundering collapsed encoder outputs into fake variance.
+    2. **No L2-normalisation needed** -- cosine_similarity handles it.
+    3. **No variance penalty needed** -- cosine loss on a frozen teacher
+       inherently prevents collapse; variance terms add noise.
 
 References:
-    - BYOL (Grill et al., 2020) -- projection-head architectural pattern
-    - Smooth L1 / Huber loss -- robust regression standard
+    - BYOL (Grill et al., 2020) -- negative cosine similarity loss
+    - DINO (Caron et al., 2021) -- self-distillation with frozen teacher
 """
 
 import torch
@@ -35,82 +34,44 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# (Projection Head removed to force absolute Encoder-to-Teacher regression geometry)
-
-
 # ======================================================================
-# VICReg variance penalty
-# ======================================================================
-def variance_loss(
-    student_embeddings: torch.Tensor,
-    teacher_embeddings: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Per-dimension variance penalty to prevent mean-target collapse
-    without distorting anisotropic structural geometry.
-
-    This creates a *repulsive force* that activates only when the
-    representation is collapsing locally relative to the teacher's structure.
-
-    Args:
-        student_embeddings: ``(B, D)`` raw projected embeddings.
-        teacher_embeddings: ``(B, D)`` detached teacher target embeddings.
-
-    Returns:
-        Scalar loss tensor.
-    """
-    # Calculate standard deviation for each dimension independently (shape: D)
-    # Add epsilon to prevent NaN gradients in std when variance is exactly zero
-    s_std = student_embeddings.std(dim=0)
-    t_std = teacher_embeddings.std(dim=0)
-
-    # Hinge: penalize the student only if a specific dimension drops below
-    # the exact naturally occurring variance of the teacher in that same dimension.
-    # Scaled by 0.9 to provide a smooth convergence floor without strict boundary bouncing.
-    return F.relu((t_std * 0.9) - s_std).mean()
-
-
-# ======================================================================
-# SALT loss function (Smooth L1 direct manifold distillation)
+# SALT loss function (Cosine Similarity distillation)
 # ======================================================================
 def salt_loss(
     student_proj: torch.Tensor,
     teacher_emb: torch.Tensor,
-    lambda_var: float = 1.0,
-    gamma: float = 1.0,  # kept for exact signature compatibility
+    lambda_var: float = 0.0,   # kept for signature compat, unused
+    gamma: float = 0.0,        # kept for signature compat, unused
 ) -> tuple:
     """
-    Direct manifold distillation loss for FedMamba-SALT.
+    Cosine similarity distillation loss for FedMamba-SALT.
 
-    Total loss = SmoothL1(student_proj, teacher_emb)
+    Total loss = mean(1 - cosine_similarity(student, teacher))
 
-    To prevent 'mean-target collapse' (where the student predicts the batch 
-    average when completely blinded by heavy augmentations), we enforce a 
-    Per-Dimension Variance Penalty perfectly aligned to the Teacher's unique 
-    manifold geometry.
+    Range: [0, 2].  0 = perfect alignment, 1 = orthogonal, 2 = opposite.
 
     Args:
-        student_proj: ``(B, D)`` output of the projection head.
+        student_proj: ``(B, D)`` output of the student encoder.
         teacher_emb:  ``(B, D)`` embedding from frozen teacher.
-        lambda_var:   Weight for the variance penalty (default 1.0).
-        gamma:        Unused (replaced by strict per-dimension geometry).
+        lambda_var:   Unused (kept for API compatibility).
+        gamma:        Unused (kept for API compatibility).
 
     Returns:
         Tuple of ``(total_loss, align_loss, var_loss)``.
+        var_loss is always 0 (cosine loss needs no variance penalty).
     """
     # --- Detach the teacher ---
     teacher_emb = teacher_emb.detach()
 
-    # --- Direct Smooth L1 alignment (matches direction + magnitude) ---
-    align_loss = F.smooth_l1_loss(student_proj, teacher_emb)
+    # --- Negative Cosine Similarity ---
+    # F.cosine_similarity returns per-sample similarity in [-1, 1]
+    # We want to minimize (1 - cos_sim), which is 0 at perfect alignment.
+    align_loss = (1 - F.cosine_similarity(student_proj, teacher_emb, dim=-1)).mean()
 
-    # --- Strict Per-Dimension Variance Penalty ---
-    # Penalize the student strictly if its dimensions collapse below the
-    # specific structural variance of the teacher's individual embeddings.
-    var_loss = variance_loss(student_proj, teacher_emb)
+    # No variance penalty needed -- cosine loss inherently prevents collapse
+    var_loss = torch.tensor(0.0, device=student_proj.device)
 
-    # --- Total loss ---
-    total_loss = align_loss + (lambda_var * var_loss)
+    total_loss = align_loss
 
     return total_loss, align_loss, var_loss
 
@@ -138,4 +99,3 @@ def embedding_std(embeddings: torch.Tensor) -> float:
     # std across the batch dimension for each embedding dimension,
     # then average over dimensions.
     return embeddings.std(dim=0).mean().item()
-
