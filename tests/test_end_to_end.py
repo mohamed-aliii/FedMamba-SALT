@@ -53,10 +53,6 @@ def test_end_to_end() -> bool:
     student = InceptionMambaEncoder(
         patch_size=16, embed_dim=256, depth=4, out_dim=768,
     ).to(DEVICE)
-    projector = ProjectionHead(
-        in_dim=768, hidden_dim=2048, out_dim=768,
-    ).to(DEVICE)
-
     # Verify teacher is frozen
     teacher_trainable = sum(p.numel() for p in teacher.parameters() if p.requires_grad)
     ok = teacher_trainable == 0
