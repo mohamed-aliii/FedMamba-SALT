@@ -12,14 +12,15 @@ Usage:
 
 Expected training behavior (healthy run)
 =========================================
-  Loss = 1 - cosine_similarity(student_emb, teacher_emb)  (range [0, 2])
-  Epoch   1:  loss ~ 0.5-0.9  (random init, low angular alignment)
-  Epoch  10:  loss ~ 0.3-0.5  (warmup complete, student converging)
-  Epoch  50:  loss ~ 0.1-0.3
-  Epoch 100:  loss ~ 0.05-0.2  (plateau)
+  Loss = SmoothL1(projector(student_emb), teacher_emb)  (range [0, +inf))
+  Epoch   1:  loss ~ 0.3-0.5  (random init, large vector mismatch)
+  Epoch  10:  loss ~ 0.1-0.3  (warmup complete, student converging)
+  Epoch  50:  loss ~ 0.01-0.1
+  Epoch 100:  loss ~ 0.005-0.05  (plateau)
 
-  student_std is informational only (cosine loss is scale-invariant).
-  If loss plateaus above 0.5, the student is not learning.
+  student_std should track towards teacher_std (~0.04-0.06).
+  If student_std diverges wildly (>10x teacher_std) or drops
+  to near zero (<0.2x teacher_std), investigate.
 =========================================
 
 """
@@ -46,7 +47,7 @@ from augmentations.medical_aug import (
 from augmentations.retina_dataset import RetinaDataset
 from models.inception_mamba import InceptionMambaEncoder
 from models.vit_teacher import FrozenViTTeacher
-from objectives.salt_loss import embedding_std, salt_loss
+from objectives.salt_loss import ProjectionHead, embedding_std, salt_loss
 from utils.ckpt_compat import safe_torch_load
 
 # ======================================================================
@@ -268,7 +269,7 @@ def build_dataloader(args: argparse.Namespace) -> DataLoader:
 # Models
 # ======================================================================
 def build_models(args: argparse.Namespace):
-    """Instantiate teacher and student."""
+    """Instantiate teacher, student, and projection head."""
 
     # Teacher: frozen ViT-B/16 (checkpoint is required)
     if not os.path.isfile(args.teacher_ckpt):
@@ -282,6 +283,11 @@ def build_models(args: argparse.Namespace):
     # Student: Inception-Mamba encoder
     student = InceptionMambaEncoder(
         patch_size=16, embed_dim=256, depth=4, out_dim=768,
+    ).to(args.device)
+
+    # Projection head: BYOL-style MLP (LayerNorm, federated-safe)
+    projector = ProjectionHead(
+        in_dim=768, hidden_dim=2048, out_dim=768,
     ).to(args.device)
 
     # -------------------------------------------------------------------
@@ -298,15 +304,17 @@ def build_models(args: argparse.Namespace):
     # Print trainable parameter counts
     # -------------------------------------------------------------------
     student_params = sum(p.numel() for p in student.parameters() if p.requires_grad)
-    total_params = student_params
+    proj_params = sum(p.numel() for p in projector.parameters() if p.requires_grad)
+    total_params = student_params + proj_params
 
     print(f"\n{'='*55}")
     print(f"  Teacher (frozen): {sum(p.numel() for p in teacher.parameters()) / 1e6:.2f}M params")
     print(f"  Student encoder:  {student_params / 1e6:.2f}M trainable params")
+    print(f"  Projection head:  {proj_params / 1e6:.2f}M trainable params")
     print(f"  Total trainable:  {total_params / 1e6:.2f}M params")
     print(f"{'='*55}\n")
 
-    return teacher, student
+    return teacher, student, projector
 
 
 # ======================================================================
@@ -314,14 +322,15 @@ def build_models(args: argparse.Namespace):
 # ======================================================================
 def build_optimizer_and_scheduler(
     student: nn.Module,
+    projector: nn.Module,
     args: argparse.Namespace,
 ):
     """
-    AdamW on student params only (teacher excluded).
+    AdamW on student + projector params only (teacher excluded).
     LR schedule: 10-epoch linear warmup (lr/10 -> lr) followed by
     cosine annealing over the remaining epochs.
     """
-    params = list(student.parameters())
+    params = list(student.parameters()) + list(projector.parameters())
 
     optimizer = AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
 
@@ -351,6 +360,7 @@ def build_optimizer_and_scheduler(
 # ======================================================================
 def save_checkpoint(
     student: nn.Module,
+    projector: nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler,
     epoch: int,
@@ -366,6 +376,7 @@ def save_checkpoint(
             "epoch": epoch,
             "loss": loss,
             "student_state_dict": student.state_dict(),
+            "projector_state_dict": projector.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
         },
@@ -376,6 +387,7 @@ def save_checkpoint(
 def try_resume(
     output_dir: str,
     student: nn.Module,
+    projector: nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler,
     device: str,
@@ -391,7 +403,13 @@ def try_resume(
     print(f"[RESUME] Loading checkpoint: {latest_path}")
     ckpt = safe_torch_load(latest_path, map_location=device)
 
+    # Safety: skip incompatible checkpoints from before ProjectionHead was restored
+    if "projector_state_dict" not in ckpt:
+        print("[RESUME] Checkpoint is from an older architecture (no projector). Starting fresh.")
+        return 0
+
     student.load_state_dict(ckpt["student_state_dict"])
+    projector.load_state_dict(ckpt["projector_state_dict"])
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     scheduler.load_state_dict(ckpt["scheduler_state_dict"])
 
@@ -407,6 +425,7 @@ def try_resume(
 def train_one_epoch(
     teacher: nn.Module,
     student: nn.Module,
+    projector: nn.Module,
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
     scaler: GradScaler,
@@ -417,6 +436,7 @@ def train_one_epoch(
     Returns (avg_loss, avg_align, avg_var, avg_student_std, avg_teacher_std).
     """
     student.train()
+    projector.train()
     # teacher stays in eval() permanently (enforced inside its forward())
 
     total_loss = 0.0
@@ -437,14 +457,15 @@ def train_one_epoch(
             with torch.no_grad():
                 t_emb = teacher(teacher_view)            # (B, 768)
 
-            # Student embedding (Direct to Teacher)
+            # Student embedding + projection
             s_emb = student(student_view)                # (B, 768)
+            s_proj = projector(s_emb)                    # (B, 768)
 
-            # SALT loss (Smooth L1 direct manifold distillation)
-            loss, align_loss, var_loss = salt_loss(s_emb, t_emb)
+            # SALT loss (Smooth L1 manifold distillation)
+            loss, align_loss, var_loss = salt_loss(s_proj, t_emb)
 
         # ----- Collapse diagnostics -----
-        s_std = embedding_std(s_emb.detach())
+        s_std = embedding_std(s_proj.detach())
         t_std = embedding_std(t_emb.detach())
 
         # ----- Backward pass with Dynamic Loss Scaling -----
@@ -454,7 +475,7 @@ def train_one_epoch(
         # Unscale before clipping
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(
-            list(student.parameters()),
+            list(student.parameters()) + list(projector.parameters()),
             max_norm=1.0,
         )
         
@@ -504,12 +525,12 @@ def main() -> None:
 
     # ----- Build components -----
     dataloader = build_dataloader(args)
-    teacher, student = build_models(args)
-    optimizer, scheduler = build_optimizer_and_scheduler(student, args)
+    teacher, student, projector = build_models(args)
+    optimizer, scheduler = build_optimizer_and_scheduler(student, projector, args)
 
     # ----- Resume from checkpoint if available -----
     start_epoch = try_resume(
-        args.output_dir, student, optimizer, scheduler, args.device,
+        args.output_dir, student, projector, optimizer, scheduler, args.device,
     )
 
     # ----- Training loop -----
@@ -550,7 +571,7 @@ def main() -> None:
         t0 = time.time()
 
         avg_loss, avg_align, avg_var, avg_s_std, avg_t_std = train_one_epoch(
-            teacher, student, dataloader, optimizer, scaler, args.device,
+            teacher, student, projector, dataloader, optimizer, scaler, args.device,
         )
 
         # --- NaN safety ---
@@ -623,7 +644,7 @@ def main() -> None:
 
         # ----- Save ckpt_latest.pth every epoch (resume point) -----
         save_checkpoint(
-            student, optimizer, scheduler,
+            student, projector, optimizer, scheduler,
             epoch, avg_loss, args.output_dir, "ckpt_latest.pth",
         )
 
@@ -631,7 +652,7 @@ def main() -> None:
         if (epoch + 1) % args.save_every == 0:
             name = f"ckpt_epoch_{epoch + 1:04d}.pth"
             save_checkpoint(
-                student, optimizer, scheduler,
+                student, projector, optimizer, scheduler,
                 epoch, avg_loss, args.output_dir, name,
             )
             print(f"    -> Saved {name}")
