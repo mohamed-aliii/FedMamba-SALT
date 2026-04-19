@@ -62,7 +62,7 @@ IMAGENET_STD = [0.229, 0.224, 0.225]
 FEDMAE_BASELINE = 81.93  # % accuracy, centralized baseline, Retina
 
 # Early stopping for fine-tuning
-FINETUNE_PATIENCE = 25  # stop if val_acc doesn't improve for this many epochs
+FINETUNE_PATIENCE = 15  # stop if val_acc doesn't improve for this many epochs
 FINETUNE_WARMUP = 5     # warmup epochs for fine-tuning
 
 
@@ -129,14 +129,21 @@ def get_eval_transform(dataset: str = "retina") -> transforms.Compose:
 
 def get_train_transform(dataset: str = "retina") -> transforms.Compose:
     """
-    Mild training transform for full fine-tuning mode.
-    Slightly stronger than eval but much weaker than the SALT student pipeline.
+    Moderate training transform for full fine-tuning mode.
+
+    Stronger than eval to provide regularisation during fine-tuning,
+    but still medical-safe (no heavy blur that destroys pathology).
     """
     mean = RETINA_MEAN if dataset == "retina" else IMAGENET_MEAN
     std = RETINA_STD if dataset == "retina" else IMAGENET_STD
     return transforms.Compose([
-        transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
+        transforms.RandomResizedCrop(224, scale=(0.7, 1.0)),
         transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomVerticalFlip(p=0.5),
+        transforms.RandomRotation(degrees=15),
+        transforms.ColorJitter(
+            brightness=0.15, contrast=0.15, saturation=0.05, hue=0.02,
+        ),
         transforms.ToTensor(),
         transforms.Normalize(mean=mean, std=std),
     ])
@@ -327,30 +334,30 @@ def train_finetune(
     """End-to-end fine-tuning of encoder + classifier.
 
     Key design decisions:
-      1. Encoder LR = lr/2 (NOT lr/10).  The pre-trained features have
-         only 58% linear probe (near-random for binary), so they need
-         substantial adaptation, not gentle preservation.
+      1. Encoder LR = lr/10.  The pre-trained features now achieve 74% val
+         accuracy, so they are USEFUL and should be preserved with gentle
+         adaptation (not destroyed with high LR).
       2. Warmup: 5 epochs linear warmup from lr/20 to target LR.
       3. CosineAnnealingLR after warmup for smooth convergence.
       4. Label smoothing (0.1) for regularization.
-      5. Per-epoch validation with early stopping.
-      6. AUC/ROC tracking per epoch.
+      5. Strong weight decay (0.1) to prevent overfitting on 9K images.
+      6. Per-epoch validation with early stopping.
+      7. AUC/ROC tracking per epoch.
 
     Returns:
         dict with lists of per-epoch metrics for visualization.
     """
     # -- Learning Rates --
-    # The pre-trained features scored 58% linear probe (barely above random
-    # for binary classification).  lr/10 was too conservative -- the encoder
-    # needs substantial reorganization to become discriminative.  lr/2
-    # provides enough plasticity while still benefiting from the structural
-    # initialization (patch embedding, position encoding, etc.).
-    encoder_lr = lr / 2.0
+    # Pre-trained features score ~74% val accuracy, so they ARE useful.
+    # lr/10 preserves the learned representations while allowing gentle
+    # adaptation.  The classifier head gets the full LR since it starts
+    # from random init.
+    encoder_lr = lr / 10.0
     param_groups = [
         {"params": encoder.parameters(), "lr": encoder_lr},
         {"params": classifier.parameters(), "lr": lr},
     ]
-    optimizer = AdamW(param_groups, weight_decay=0.05)
+    optimizer = AdamW(param_groups, weight_decay=0.1)
     # Scheduler: warmup + cosine decay
     # We'll handle warmup manually in the loop
     scheduler = CosineAnnealingLR(optimizer, T_max=max(1, epochs - FINETUNE_WARMUP))
@@ -1125,10 +1132,11 @@ def run_evaluation(
 
     classifier = nn.Sequential(
         nn.LayerNorm(768),
+        nn.Dropout(0.3),
         nn.Linear(768, args.num_classes),
     ).to(args.device)
-    nn.init.kaiming_uniform_(classifier[1].weight)
-    nn.init.zeros_(classifier[1].bias)
+    nn.init.kaiming_uniform_(classifier[2].weight)
+    nn.init.zeros_(classifier[2].bias)
 
     # --- Suffix for filenames ---
     frac_tag = f"_{label_fraction*100:.0f}pct" if label_fraction < 1.0 else ""
