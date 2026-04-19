@@ -56,7 +56,7 @@ def test_loss_identical() -> bool:
     # Pass with no regularization terms to isolate direction loss
     loss, align, var = salt_loss(
         v.clone().requires_grad_(True), v.clone(),
-        lambda_mag=0.0, lambda_cov=0.0,
+        lambda_cov=0.0,
     )
     passed = align.item() < TOL
     tag = "PASS" if passed else "FAIL"
@@ -72,7 +72,7 @@ def test_loss_dissimilar() -> bool:
     """Unrelated random vectors should give non-trivial loss."""
     s = torch.randn(BATCH, DIM, requires_grad=True)
     t = torch.randn(BATCH, DIM)
-    loss, align, var = salt_loss(s, t, lambda_mag=0.0, lambda_cov=0.0)
+    loss, align, var = salt_loss(s, t, lambda_cov=0.0)
     passed = align.item() > 0.0005
     tag = "PASS" if passed else "FAIL"
     print(f"  [{tag}] Test 3 -- Dissimilar vectors: align_loss = {align.item():.6f}  "
@@ -88,11 +88,11 @@ def test_loss_ordering() -> bool:
     # Random misalignment
     s1 = torch.randn(BATCH, DIM, requires_grad=True)
     t1 = torch.randn(BATCH, DIM)
-    _, align_random, _ = salt_loss(s1, t1, lambda_mag=0.0, lambda_cov=0.0)
+    _, align_random, _ = salt_loss(s1, t1, lambda_cov=0.0)
 
     # Near-opposite: negate teacher
     s2 = torch.randn(BATCH, DIM, requires_grad=True)
-    _, align_opp, _ = salt_loss(s2, -s2.detach(), lambda_mag=0.0, lambda_cov=0.0)
+    _, align_opp, _ = salt_loss(s2, -s2.detach(), lambda_cov=0.0)
 
     # opposite or near-opposite should give >= random
     passed = align_opp.item() >= align_random.item() * 0.5  # relaxed check
@@ -162,7 +162,7 @@ def test_batch_centering() -> bool:
     student_good = teacher.clone() + torch.randn(BATCH, DIM) * 0.05
     _, align_good, _ = salt_loss(
         student_good.requires_grad_(True), teacher,
-        lambda_mag=0.0, lambda_cov=0.0,
+        lambda_cov=0.0,
     )
 
     # BAD student: class pattern is REVERSED (A where B should be)
@@ -170,7 +170,7 @@ def test_batch_centering() -> bool:
     student_bad = student_bad + torch.randn(BATCH, DIM) * 0.05
     _, align_bad, _ = salt_loss(
         student_bad.requires_grad_(True), teacher,
-        lambda_mag=0.0, lambda_cov=0.0,
+        lambda_cov=0.0,
     )
 
     # Good alignment should have lower loss than reversed alignment

@@ -1,7 +1,7 @@
 """
 objectives/salt_loss.py -- Learning objective for FedMamba-SALT.
 
-Loss formulation: Zero-Mean Normalized Distillation.
+Loss formulation: Centered Smooth L1 Distillation.
 
 The critical insight: teacher embeddings for class 0 and class 1 have
 cosine similarity 0.9996 (angle = 1.6°) in RAW space.  This means 99.97%
@@ -10,21 +10,27 @@ is class-discriminative.  Any regression loss in raw space will learn the
 shared mean and ignore the discriminative residual.
 
 Solution: **Batch-center** both student and teacher embeddings before
-alignment.  Centering removes the global mean, amplifying the residual
-signal from 1.6° to 180° (centered cosine sim = -1.0).
+alignment.  Centering removes the global mean, so the remaining signal
+IS the discriminative residual.  Then SmoothL1 matches these residuals
+directly — no L2-normalization needed (which caused NaN when centered
+vectors were near-zero early in training).
 
 Total loss::
 
     t_centered = t_emb - mean(t_emb)       # remove global mean
     s_centered = s_proj - mean(s_proj)      # remove global mean
-    L = SmoothL1(normalise(s_centered), normalise(t_centered))
+    L = SmoothL1(s_centered, t_centered)    # match residuals
         + lambda_cov * off_diag_penalty     # prevent dimension collapse
-        + lambda_mag * norm_anchor          # prevent magnitude divergence
         + lambda_var * var_loss(s_emb)      # prevent encoder collapse
 
+Why NOT normalise after centering?
+    Early in training, all student outputs are similar → centered vectors
+    are near-zero → F.normalize divides by ~1e-6 → gradient explosion → NaN.
+    SmoothL1 on unnormalised centered vectors is stable AND constrains
+    magnitude naturally (any deviation from teacher's residual is penalised).
+
 References:
-    - BYOL (Grill et al., 2020) -- projection-head pattern
-    - Barlow Twins (Zbontar et al., 2021) -- off-diagonal penalty
+    - Barlow Twins (Zbontar et al., 2021) -- centering + off-diagonal penalty
     - VICReg (Bardes et al., 2022) -- variance regularisation
     - DINO (Caron et al., 2021) -- centering for distillation stability
 """
@@ -41,15 +47,6 @@ class ProjectionHead(nn.Module):
     """
     3-layer MLP that maps the student encoder's output to a projected
     embedding aligned with the teacher's representation space.
-
-    Architecture::
-
-        Linear(in_dim, hidden_dim)
-        → LayerNorm(hidden_dim) → GELU
-        → Linear(hidden_dim, hidden_dim)
-        → LayerNorm(hidden_dim) → GELU
-        → Linear(hidden_dim, out_dim)
-        (no activation after the final linear layer)
 
     LayerNorm is used (not BatchNorm) so the module is federated-safe.
     """
@@ -84,7 +81,6 @@ def variance_loss(
 ) -> torch.Tensor:
     """
     Per-dimension variance penalty to prevent encoder collapse.
-
     Applied to the RAW encoder output (before the projection head).
     """
     s_std = encoder_embeddings.std(dim=0)
@@ -97,21 +93,16 @@ def variance_loss(
 def covariance_loss(embeddings: torch.Tensor) -> torch.Tensor:
     """
     Penalise off-diagonal elements of the feature covariance matrix.
-
-    This encourages different embedding dimensions to encode independent
-    information, preventing the common failure mode where multiple dims
-    collapse to the same signal.
-
-    From Barlow Twins (Zbontar et al., 2021) / VICReg (Bardes et al., 2022).
+    Encourages different dimensions to encode independent information.
 
     Args:
-        embeddings: ``(B, D)`` batch of embedding vectors.
+        embeddings: ``(B, D)`` batch of CENTERED embedding vectors.
 
     Returns:
         Scalar loss: mean of squared off-diagonal covariance elements.
     """
     B, D = embeddings.shape
-    # Center
+    # embeddings should already be centered, but center again for safety
     x = embeddings - embeddings.mean(dim=0, keepdim=True)
     # Covariance matrix (D, D)
     cov = (x.T @ x) / max(B - 1, 1)
@@ -121,36 +112,37 @@ def covariance_loss(embeddings: torch.Tensor) -> torch.Tensor:
 
 
 # ======================================================================
-# SALT loss function (Zero-Mean Normalized Distillation)
+# SALT loss function (Centered Smooth L1 Distillation)
 # ======================================================================
 def salt_loss(
     student_proj: torch.Tensor,
     teacher_emb: torch.Tensor,
     student_emb: torch.Tensor = None,
     lambda_var: float = 1.0,
-    lambda_mag: float = 0.01,
     lambda_cov: float = 0.04,
 ) -> tuple:
     """
-    Zero-Mean Normalized Distillation loss for FedMamba-SALT.
+    Centered Smooth L1 Distillation loss for FedMamba-SALT.
 
     Steps:
         1. Detach teacher embeddings.
         2. Subtract batch mean from both student and teacher vectors.
            This removes the dominant shared structure (99.97% of signal)
-           and exposes the discriminative residual.
-        3. L2-normalise the centered vectors.
-        4. Apply Smooth L1 on the normalised, centered vectors.
-        5. Add magnitude anchor to prevent norm divergence.
-        6. Add covariance penalty to prevent dimension collapse.
-        7. Add variance penalty on encoder output.
+           and exposes the discriminative residual AS the dominant signal.
+        3. Apply Smooth L1 on the centered vectors (NO normalisation).
+        4. Add covariance penalty to prevent dimension collapse.
+        5. Add variance penalty on encoder output.
+
+    No L2-normalisation: early in training, centered vectors can be
+    near-zero (all outputs similar).  F.normalize would divide by ~eps
+    and cause NaN.  SmoothL1 on unnormalised centered vectors is stable
+    and naturally constrains magnitude.
 
     Args:
         student_proj: ``(B, D)`` output of the projection head.
         teacher_emb:  ``(B, D)`` embedding from frozen teacher.
         student_emb:  ``(B, D)`` raw encoder output (before proj head).
         lambda_var:   Weight for the variance penalty.
-        lambda_mag:   Weight for the magnitude anchor.
         lambda_cov:   Weight for the covariance penalty.
 
     Returns:
@@ -160,32 +152,17 @@ def salt_loss(
     teacher_emb = teacher_emb.detach()
 
     # --- Batch centering (the critical step) ---
-    # Remove the dataset-wide mean that dominates 99.97% of the signal.
-    # After centering, the class-discriminative residual becomes the
-    # dominant signal (centered cosine sim = -1.0).
-    t_mean = teacher_emb.mean(dim=0, keepdim=True)
-    s_mean = student_proj.mean(dim=0, keepdim=True)
+    t_centered = teacher_emb - teacher_emb.mean(dim=0, keepdim=True)
+    s_centered = student_proj - student_proj.mean(dim=0, keepdim=True)
 
-    t_centered = teacher_emb - t_mean
-    s_centered = student_proj - s_mean
+    # --- Directional alignment on centered vectors (no normalization!) ---
+    direction_loss = F.smooth_l1_loss(s_centered, t_centered)
 
-    # --- L2-normalise centered vectors ---
-    s_norm = F.normalize(s_centered, dim=-1, p=2, eps=1e-6)
-    t_norm = F.normalize(t_centered, dim=-1, p=2, eps=1e-6)
-
-    # --- Directional alignment on centered, normalised vectors ---
-    direction_loss = F.smooth_l1_loss(s_norm, t_norm)
-
-    # --- Magnitude anchor (prevent norm divergence) ---
-    s_mag = student_proj.norm(dim=-1)
-    t_mag = teacher_emb.norm(dim=-1)
-    magnitude_loss = F.mse_loss(s_mag, t_mag)
-
-    # --- Covariance penalty (prevent dimension collapse) ---
+    # --- Covariance penalty on centered student (prevent dim collapse) ---
     cov_loss = covariance_loss(s_centered)
 
     # --- Combined alignment ---
-    align_loss = direction_loss + lambda_mag * magnitude_loss + lambda_cov * cov_loss
+    align_loss = direction_loss + lambda_cov * cov_loss
 
     # --- Variance penalty on ENCODER output ---
     if student_emb is not None:
