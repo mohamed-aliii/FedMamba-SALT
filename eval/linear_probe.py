@@ -62,7 +62,8 @@ IMAGENET_STD = [0.229, 0.224, 0.225]
 FEDMAE_BASELINE = 81.93  # % accuracy, centralized baseline, Retina
 
 # Early stopping for fine-tuning
-FINETUNE_PATIENCE = 15  # stop if val_acc doesn't improve for this many epochs
+FINETUNE_PATIENCE = 25  # stop if val_acc doesn't improve for this many epochs
+FINETUNE_WARMUP = 5     # warmup epochs for fine-tuning
 
 
 # ======================================================================
@@ -306,32 +307,35 @@ def train_finetune(
 ) -> dict:
     """End-to-end fine-tuning of encoder + classifier.
 
-    Key improvements over naive fine-tuning:
-      1. Differential LR: encoder gets lr/10, classifier gets lr.
-         This prevents catastrophic forgetting of pre-trained features.
-      2. CosineAnnealingLR: smooth LR decay to settle into a minimum.
-      3. Per-epoch validation: tracks best test accuracy and saves
-         the best checkpoint automatically.
-      4. Early stopping: halts if val_acc stagnates for FINETUNE_PATIENCE epochs.
-      5. AUC/ROC tracking: collects per-epoch AUC for visualization.
+    Key design decisions:
+      1. Encoder LR = lr/2 (NOT lr/10).  The pre-trained features have
+         only 58% linear probe (near-random for binary), so they need
+         substantial adaptation, not gentle preservation.
+      2. Warmup: 5 epochs linear warmup from lr/20 to target LR.
+      3. CosineAnnealingLR after warmup for smooth convergence.
+      4. Label smoothing (0.1) for regularization.
+      5. Per-epoch validation with early stopping.
+      6. AUC/ROC tracking per epoch.
 
     Returns:
         dict with lists of per-epoch metrics for visualization.
     """
-    # -- Differential Learning Rates --
-    # The encoder has learned the teacher's manifold geometry during
-    # pre-training. Using the full LR would destroy these features
-    # in the first few batches (catastrophic forgetting).
-    # lr/10 balances protection with enough plasticity for the encoder
-    # to adapt its features to classification.
-    encoder_lr = lr / 10.0
+    # -- Learning Rates --
+    # The pre-trained features scored 58% linear probe (barely above random
+    # for binary classification).  lr/10 was too conservative -- the encoder
+    # needs substantial reorganization to become discriminative.  lr/2
+    # provides enough plasticity while still benefiting from the structural
+    # initialization (patch embedding, position encoding, etc.).
+    encoder_lr = lr / 2.0
     param_groups = [
         {"params": encoder.parameters(), "lr": encoder_lr},
         {"params": classifier.parameters(), "lr": lr},
     ]
-    optimizer = AdamW(param_groups, weight_decay=0.01)
-    scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
-    criterion = nn.CrossEntropyLoss()
+    optimizer = AdamW(param_groups, weight_decay=0.05)
+    # Scheduler: warmup + cosine decay
+    # We'll handle warmup manually in the loop
+    scheduler = CosineAnnealingLR(optimizer, T_max=max(1, epochs - FINETUNE_WARMUP))
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
     all_params = list(encoder.parameters()) + list(classifier.parameters())
 
@@ -368,6 +372,13 @@ def train_finetune(
     for epoch in range(epochs):
         epoch_start = time.time()
 
+        # ---- Warmup (linear from lr/20 to target for first N epochs) ----
+        if epoch < FINETUNE_WARMUP:
+            warmup_factor = (epoch + 1) / FINETUNE_WARMUP
+            for pg_idx, pg in enumerate(optimizer.param_groups):
+                target_lr = encoder_lr if pg_idx == 0 else lr
+                pg["lr"] = target_lr * warmup_factor * 0.1 + target_lr * warmup_factor * 0.9
+
         # ---- Train ----
         encoder.train()
         classifier.train()
@@ -397,7 +408,9 @@ def train_finetune(
             correct += (logits.argmax(dim=1) == labels).sum().item()
             total += images.size(0)
 
-        scheduler.step()
+        # Step cosine scheduler only after warmup
+        if epoch >= FINETUNE_WARMUP:
+            scheduler.step()
         avg_loss = total_loss / total
         train_acc = 100.0 * correct / total
 

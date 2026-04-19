@@ -12,11 +12,11 @@ Usage:
 
 Expected training behavior (healthy run)
 =========================================
-  Loss = (1 - cos_sim(norm(s_proj), norm(t_emb))) + var_penalty(s_emb)
-  Epoch   1:  loss ~ 0.5-0.9  (random init, low angular alignment)
-  Epoch  10:  loss ~ 0.2-0.5  (warmup complete, student converging)
-  Epoch  50:  loss ~ 0.05-0.2
-  Epoch 100:  loss ~ 0.01-0.1  (plateau)
+  Loss = SmoothL1(norm(s_proj), norm(t_emb)) + mag_loss + var_penalty(s_emb)
+  Epoch   1:  loss ~ 0.1-0.3  (random init, normalized mismatch)
+  Epoch  10:  loss ~ 0.01-0.1  (warmup complete, student converging)
+  Epoch  50:  loss ~ 0.005-0.05
+  Epoch 100:  loss ~ 0.002-0.02  (plateau)
 
   enc_std should stay > 0.1 (healthy encoder).
   If enc_std < 0.02, the encoder is collapsing.
@@ -279,9 +279,11 @@ def build_models(args: argparse.Namespace):
         )
     teacher = FrozenViTTeacher(ckpt_path=args.teacher_ckpt).to(args.device)
 
-    # Student: Inception-Mamba encoder
+    # Student: Inception-Mamba encoder (scaled up for capacity)
+    # Original: embed_dim=256, depth=4 -> 10M params (too small for 768-d teacher)
+    # Scaled:   embed_dim=384, depth=6 -> ~29M params (sufficient capacity)
     student = InceptionMambaEncoder(
-        patch_size=16, embed_dim=256, depth=4, out_dim=768,
+        patch_size=16, embed_dim=384, depth=6, out_dim=768,
     ).to(args.device)
 
     # Projection head: BYOL-style MLP (LayerNorm, federated-safe)
