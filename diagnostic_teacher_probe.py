@@ -242,11 +242,24 @@ def main():
         print(f"  TEST 2: Student Encoder Feature Analysis")
         print(f"{'#'*60}")
         
-        encoder = InceptionMambaEncoder(
-            patch_size=16, embed_dim=256, depth=4, out_dim=768,
-        )
         ckpt = safe_torch_load(args.student_ckpt, map_location="cpu")
-        encoder.load_state_dict(ckpt["student_state_dict"])
+        state_dict = ckpt.get("student_state_dict", ckpt)
+        
+        # --- Infer architecture from checkpoint ---
+        embed_dim = state_dict["patch_embed.proj.0.weight"].shape[0]
+        block_indices = set()
+        for key in state_dict:
+            if key.startswith("blocks."):
+                idx = int(key.split(".")[1])
+                block_indices.add(idx)
+        depth = len(block_indices)
+        
+        print(f"  [Encoder] Detected architecture: embed_dim={embed_dim}, depth={depth}")
+        
+        encoder = InceptionMambaEncoder(
+            patch_size=16, embed_dim=embed_dim, depth=depth, out_dim=768,
+        )
+        encoder.load_state_dict(state_dict)
         encoder = encoder.to(device)
         encoder.eval()
         
