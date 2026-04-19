@@ -20,6 +20,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from tqdm import tqdm
 import numpy as np
 import torch
 import torch.nn as nn
@@ -62,7 +63,7 @@ def extract_all(model, loader, device):
     """Extract features and labels from a model."""
     model.eval()
     all_feats, all_labels = [], []
-    for images, labels in loader:
+    for images, labels in tqdm(loader, desc="Extracting features"):
         images = images.to(device, non_blocking=True)
         feats = model(images)
         all_feats.append(feats.cpu())
@@ -206,7 +207,7 @@ def main():
     )
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=4, pin_memory=True,
+        num_workers=0, pin_memory=True,
     )
     
     print(f"\n{'='*60}")
