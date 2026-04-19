@@ -280,8 +280,8 @@ def build_models(args: argparse.Namespace):
     teacher = FrozenViTTeacher(ckpt_path=args.teacher_ckpt).to(args.device)
 
     # Student: Inception-Mamba encoder (scaled up for capacity)
-    # Original: embed_dim=256, depth=4 -> 10M params (too small for 768-d teacher)
-    # Scaled:   embed_dim=384, depth=6 -> ~29M params (sufficient capacity)
+    # Original: embed_dim=256, depth=4 -> 10M params (256->768 bottleneck)
+    # Scaled:   embed_dim=384, depth=6 -> ~32M params (use batch_size=256)
     student = InceptionMambaEncoder(
         patch_size=16, embed_dim=384, depth=6, out_dim=768,
     ).to(args.device)
