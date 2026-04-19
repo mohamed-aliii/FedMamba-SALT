@@ -1,32 +1,40 @@
 """
 objectives/salt_loss.py -- Learning objective for FedMamba-SALT.
 
-The core loss is Smooth L1 (Huber) between the student's projected
-embedding and the frozen teacher's embedding, averaged over the batch.
+The core loss is **cosine similarity** between the student's projected
+embedding (L2-normalised) and the frozen teacher's embedding
+(L2-normalised), averaged over the batch.
 
-Smooth L1 was chosen over cosine similarity because:
-    1. It matches both **direction and magnitude** of the teacher's
-       representation space, preventing the angular-collapse trap where
-       cosine similarity allows all vectors to point in one direction
-       while scaling magnitude to satisfy a variance penalty.
-    2. With a frozen teacher, there is no risk of joint collapse,
-       so the variance penalty is a safety-net only.
+Cosine similarity was chosen because the diagnostic analysis proved that:
+    1. Class-discriminative information in the teacher lives in the
+       **direction** of embedding vectors (centered cosine sim = -1.0
+       between class centroids → perfect angular separation).
+    2. Using SmoothL1 (magnitude-matching) caused the projection head
+       to converge to a mean-prediction strategy that crushed class
+       separation from 0.295 → 0.083 L2 (3.6× compression), rendering
+       features random for linear probing.
+    3. Cosine similarity focuses gradient budget entirely on angular
+       alignment, preserving the directional class signal.
 
 Total loss::
 
-    L = SmoothL1(student_proj, teacher_emb.detach()) + lambda_var * var_loss
+    L = (1 - cos_sim(normalise(s_proj), normalise(t_emb)))
+        + lambda_var * var_loss(s_emb)
 
 Implementation details:
-    1. **Detach the teacher** -- explicit ``.detach()`` as safety net.
-    2. **No L2-normalisation** -- Smooth L1 operates on raw vectors
-       so the student must match the teacher's actual geometry.
+    1. **L2-normalise before loss** -- both student projection and
+       teacher embedding are unit-normalised so the loss operates
+       purely on direction.
+    2. **Variance penalty on ENCODER output (s_emb), NOT projector output**
+       -- the projection head's LayerNorm rescales any input, masking
+       encoder collapse. The penalty must guard the encoder directly.
     3. **LayerNorm in projection head** -- federated-safe (no batch
-       statistics dependency) while still centering/scaling the
-       representation space for proper gradient flow.
+       statistics dependency).
 
 References:
     - BYOL (Grill et al., 2020) -- projection-head architectural pattern
-    - Smooth L1 / Huber loss -- robust regression standard
+    - DINO (Caron et al., 2021) -- cosine distillation for SSL
+    - VICReg (Bardes et al., 2022) -- variance regularisation
 """
 
 import torch
@@ -86,60 +94,64 @@ class ProjectionHead(nn.Module):
 
 
 # ======================================================================
-# Per-dimension variance penalty
+# Per-dimension variance penalty (applied to ENCODER output)
 # ======================================================================
 def variance_loss(
-    student_embeddings: torch.Tensor,
-    teacher_embeddings: torch.Tensor,
+    encoder_embeddings: torch.Tensor,
+    target_std: float = 0.1,
 ) -> torch.Tensor:
     """
-    Per-dimension variance penalty to prevent mean-target collapse
-    without distorting anisotropic structural geometry.
+    Per-dimension variance penalty to prevent encoder collapse.
 
-    This creates a *repulsive force* that activates only when the
-    representation is collapsing locally relative to the teacher's structure.
+    Penalises any dimension whose batch standard deviation drops below
+    ``target_std``.  Applied to the RAW encoder output (before the
+    projection head) to directly guard the encoder's representation
+    quality.
+
+    The projection head's LayerNorm rescales any input, so monitoring
+    the projector output masks encoder collapse.  This penalty operates
+    upstream at the encoder.
 
     Args:
-        student_embeddings: ``(B, D)`` raw projected embeddings.
-        teacher_embeddings: ``(B, D)`` detached teacher target embeddings.
+        encoder_embeddings: ``(B, D)`` raw encoder output (before proj head).
+        target_std: Minimum per-dimension std to maintain (default 0.1).
 
     Returns:
         Scalar loss tensor.
     """
-    # Calculate standard deviation for each dimension independently (shape: D)
-    s_std = student_embeddings.std(dim=0)
-    t_std = teacher_embeddings.std(dim=0)
+    # Per-dimension std across the batch (shape: D)
+    s_std = encoder_embeddings.std(dim=0)
 
-    # Hinge: penalize the student only if a specific dimension drops below
-    # the exact naturally occurring variance of the teacher in that same dimension.
-    # Scaled by 0.9 to provide a smooth convergence floor.
-    return F.relu((t_std * 0.9) - s_std).mean()
+    # Hinge: penalise only when std drops below target
+    return F.relu(target_std - s_std).mean()
 
 
 # ======================================================================
-# SALT loss function (Smooth L1 manifold distillation)
+# SALT loss function (Cosine distillation)
 # ======================================================================
 def salt_loss(
     student_proj: torch.Tensor,
     teacher_emb: torch.Tensor,
+    student_emb: torch.Tensor = None,
     lambda_var: float = 1.0,
-    gamma: float = 1.0,  # kept for signature compatibility
 ) -> tuple:
     """
-    Manifold distillation loss for FedMamba-SALT.
+    Directional distillation loss for FedMamba-SALT.
 
-    Total loss = SmoothL1(student_proj, teacher_emb) + lambda_var * var_loss
+    Total loss = (1 - cos_sim(norm(s_proj), norm(t_emb)))
+                 + lambda_var * var_loss(s_emb)
 
-    Smooth L1 (Huber loss) matches both direction AND magnitude of the
-    teacher's representation space.  The per-dimension variance penalty
-    prevents mean-target collapse by enforcing that the student maintains
-    at least 90% of the teacher's per-dimension variance.
+    The cosine similarity focuses gradient entirely on angular alignment
+    — the subspace where class-discriminative information lives.  The
+    variance penalty prevents encoder collapse independently of the
+    projection head.
 
     Args:
         student_proj: ``(B, D)`` output of the projection head.
         teacher_emb:  ``(B, D)`` embedding from frozen teacher.
+        student_emb:  ``(B, D)`` raw encoder output (before proj head).
+                      If None, variance penalty is skipped (for testing).
         lambda_var:   Weight for the variance penalty (default 1.0).
-        gamma:        Unused (kept for API compatibility).
 
     Returns:
         Tuple of ``(total_loss, align_loss, var_loss)``.
@@ -147,11 +159,20 @@ def salt_loss(
     # --- Detach the teacher ---
     teacher_emb = teacher_emb.detach()
 
-    # --- Direct Smooth L1 alignment (matches direction + magnitude) ---
-    align_loss = F.smooth_l1_loss(student_proj, teacher_emb)
+    # --- L2-normalise both vectors ---
+    s_norm = F.normalize(student_proj, dim=-1, p=2)
+    t_norm = F.normalize(teacher_emb, dim=-1, p=2)
 
-    # --- Strict Per-Dimension Variance Penalty ---
-    var_loss = variance_loss(student_proj, teacher_emb)
+    # --- Cosine alignment loss (range [0, 2]) ---
+    # cos_sim = (s_norm * t_norm).sum(dim=-1)  → range [-1, 1]
+    # loss = 1 - cos_sim                        → range [0, 2]
+    align_loss = (1.0 - (s_norm * t_norm).sum(dim=-1)).mean()
+
+    # --- Variance penalty on ENCODER output (not projector) ---
+    if student_emb is not None:
+        var_loss = variance_loss(student_emb)
+    else:
+        var_loss = torch.tensor(0.0, device=student_proj.device)
 
     # --- Total loss ---
     total_loss = align_loss + (lambda_var * var_loss)

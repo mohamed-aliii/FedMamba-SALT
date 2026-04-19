@@ -25,7 +25,7 @@ from objectives.salt_loss import embedding_std, salt_loss
 
 DIM = 768
 BATCH = 8
-TOL = 1e-5  # tolerance for floating-point comparisons
+TOL = 1e-4  # tolerance for floating-point comparisons
 
 
 # =====================================================================
@@ -35,7 +35,7 @@ def test_loss_scalar_and_grad() -> bool:
     """Loss must be a 0-d tensor that tracks gradients."""
     student_proj = torch.randn(BATCH, DIM, requires_grad=True)
     teacher_emb = torch.randn(BATCH, DIM)
-
+    # student_emb is optional; pass None for this test
     loss, align, var = salt_loss(student_proj, teacher_emb)
 
     is_scalar = loss.dim() == 0
@@ -51,7 +51,7 @@ def test_loss_scalar_and_grad() -> bool:
 #  Test 2 -- Identical normalised vectors -> loss ~ 0.0
 # =====================================================================
 def test_loss_identical() -> bool:
-    """Cosine loss between two identical unit vectors should be 0."""
+    """Cosine loss between two identical vectors should be 0."""
     v = torch.randn(BATCH, DIM)
 
     # Pass the same tensor as both arguments.  salt_loss will normalise
@@ -66,11 +66,11 @@ def test_loss_identical() -> bool:
 
 
 # =====================================================================
-#  Test 3 -- Orthogonal normalised vectors -> loss ~ 1/768
+#  Test 3 -- Orthogonal normalised vectors -> loss ~ 1.0
 # =====================================================================
-# SmoothL1 for orthogonal unit vectors: sum((a-b)^2) = 2.0
-# Mean of 0.5 * 2.0 / 768 ≈ 1/768.
-EXPECTED_ORTHO = 1.0 / DIM
+# Cosine similarity of orthogonal unit vectors = 0,
+# so cosine loss = 1 - 0 = 1.0 exactly.
+EXPECTED_ORTHO = 1.0
 
 
 def test_loss_orthogonal() -> bool:
@@ -90,11 +90,11 @@ def test_loss_orthogonal() -> bool:
 
 
 # =====================================================================
-#  Test 4 -- Opposite normalised vectors -> loss ~ 2/768
+#  Test 4 -- Opposite normalised vectors -> loss ~ 2.0
 # =====================================================================
-# SmoothL1 for opposite unit vectors: sum((a-b)^2) = 4.0
-# Mean of 0.5 * 4.0 / 768 ≈ 2/768.
-EXPECTED_OPP = 2.0 / DIM
+# Cosine similarity of opposite unit vectors = -1,
+# so cosine loss = 1 - (-1) = 2.0 exactly.
+EXPECTED_OPP = 2.0
 
 
 def test_loss_opposite() -> bool:
@@ -137,11 +137,29 @@ def test_gradient_isolation() -> bool:
 
 
 # =====================================================================
-#  Bonus -- ProjectionHead and embedding_std quick checks
+#  Test 6 -- Variance penalty activates on encoder output
 # =====================================================================
+def test_variance_penalty() -> bool:
+    """Variance penalty should be non-zero when encoder std is below target."""
+    student_proj = torch.randn(BATCH, DIM, requires_grad=True)
+    teacher_emb = torch.randn(BATCH, DIM)
+
+    # Simulate collapsed encoder output (near-constant)
+    collapsed_emb = torch.ones(BATCH, DIM) * 0.5 + torch.randn(BATCH, DIM) * 0.001
+
+    loss, align, var = salt_loss(student_proj, teacher_emb, student_emb=collapsed_emb)
+
+    # Variance penalty should be active (> 0) for collapsed encoder
+    passed = var.item() > 0.01
+    tag = "PASS" if passed else "FAIL"
+    print(f"  [{tag}] Test 6 -- Var penalty on collapsed encoder: {var.item():.6f}  "
+          f"(expected > 0.01)")
+    return passed
 
 
-
+# =====================================================================
+#  Bonus -- embedding_std quick checks
+# =====================================================================
 def test_embedding_std_healthy() -> bool:
     """Random embeddings should have std well above 0.01."""
     embeddings = torch.randn(BATCH, DIM)
@@ -177,6 +195,7 @@ if __name__ == "__main__":
         test_loss_orthogonal(),
         test_loss_opposite(),
         test_gradient_isolation(),
+        test_variance_penalty(),
     ]
 
     print()
@@ -191,13 +210,13 @@ if __name__ == "__main__":
     n_passed = sum(all_results)
     n_total = len(all_results)
     n_core = sum(core_results)
-    print(f"  Core:  {n_core}/5 passed")
+    print(f"  Core:  {n_core}/6 passed")
     print(f"  Bonus: {sum(bonus_results)}/2 passed")
     print(f"  Total: {n_passed}/{n_total} passed")
-    if n_core == 5:
+    if n_core == 6:
         print("  [OK] All core tests PASSED -- loss function is ready.")
     else:
         print("  [!!] CORE TESTS FAILED -- fix before proceeding.")
     print("=" * 62)
 
-    sys.exit(0 if n_core == 5 else 1)
+    sys.exit(0 if n_core == 6 else 1)

@@ -93,7 +93,7 @@ def test_end_to_end() -> bool:
 
     # ----- SALT loss -----
     print("  [5/8] Computing SALT loss...")
-    loss, align_loss, var_loss = salt_loss(s_proj, t_emb)
+    loss, align_loss, var_loss = salt_loss(s_proj, t_emb, student_emb=s_emb)
 
     # ----- Check loss is finite -----
     loss_val = loss.item()

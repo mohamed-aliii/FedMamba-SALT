@@ -12,15 +12,14 @@ Usage:
 
 Expected training behavior (healthy run)
 =========================================
-  Loss = SmoothL1(projector(student_emb), teacher_emb)  (range [0, +inf))
-  Epoch   1:  loss ~ 0.3-0.5  (random init, large vector mismatch)
-  Epoch  10:  loss ~ 0.1-0.3  (warmup complete, student converging)
-  Epoch  50:  loss ~ 0.01-0.1
-  Epoch 100:  loss ~ 0.005-0.05  (plateau)
+  Loss = (1 - cos_sim(norm(s_proj), norm(t_emb))) + var_penalty(s_emb)
+  Epoch   1:  loss ~ 0.5-0.9  (random init, low angular alignment)
+  Epoch  10:  loss ~ 0.2-0.5  (warmup complete, student converging)
+  Epoch  50:  loss ~ 0.05-0.2
+  Epoch 100:  loss ~ 0.01-0.1  (plateau)
 
-  student_std should track towards teacher_std (~0.04-0.06).
-  If student_std diverges wildly (>10x teacher_std) or drops
-  to near zero (<0.2x teacher_std), investigate.
+  enc_std should stay > 0.1 (healthy encoder).
+  If enc_std < 0.02, the encoder is collapsing.
 =========================================
 
 """
@@ -433,7 +432,7 @@ def train_one_epoch(
 ) -> tuple:
     """
     Run one epoch of SALT training.
-    Returns (avg_loss, avg_align, avg_var, avg_student_std, avg_teacher_std).
+    Returns (avg_loss, avg_align, avg_var, avg_enc_std, avg_proj_std, avg_t_std).
     """
     student.train()
     projector.train()
@@ -442,7 +441,8 @@ def train_one_epoch(
     total_loss = 0.0
     total_align = 0.0
     total_var = 0.0
-    total_s_std = 0.0
+    total_enc_std = 0.0
+    total_proj_std = 0.0
     total_t_std = 0.0
     n_batches = 0
 
@@ -461,11 +461,12 @@ def train_one_epoch(
             s_emb = student(student_view)                # (B, 768)
             s_proj = projector(s_emb)                    # (B, 768)
 
-            # SALT loss (Smooth L1 manifold distillation)
-            loss, align_loss, var_loss = salt_loss(s_proj, t_emb)
+            # SALT loss (Cosine distillation + encoder variance guard)
+            loss, align_loss, var_loss = salt_loss(s_proj, t_emb, s_emb)
 
-        # ----- Collapse diagnostics -----
-        s_std = embedding_std(s_proj.detach())
+        # ----- Collapse diagnostics (both encoder and projector) -----
+        enc_std = embedding_std(s_emb.detach())
+        proj_std = embedding_std(s_proj.detach())
         t_std = embedding_std(t_emb.detach())
 
         # ----- Backward pass with Dynamic Loss Scaling -----
@@ -486,24 +487,25 @@ def train_one_epoch(
         total_loss += loss.item()
         total_align += align_loss.item()
         total_var += var_loss.item()
-        total_s_std += s_std
+        total_enc_std += enc_std
+        total_proj_std += proj_std
         total_t_std += t_std
         n_batches += 1
 
         pbar.set_postfix(
             loss=f"{loss.item():.4f}",
             align=f"{align_loss.item():.4f}",
-            var=f"{var_loss.item():.3f}",
-            s_std=f"{s_std:.3f}",
+            enc=f"{enc_std:.3f}",
         )
 
     avg_loss = total_loss / max(1, n_batches)
     avg_align = total_align / max(1, n_batches)
     avg_var = total_var / max(1, n_batches)
-    avg_s_std = total_s_std / max(1, n_batches)
+    avg_enc_std = total_enc_std / max(1, n_batches)
+    avg_proj_std = total_proj_std / max(1, n_batches)
     avg_t_std = total_t_std / max(1, n_batches)
 
-    return avg_loss, avg_align, avg_var, avg_s_std, avg_t_std
+    return avg_loss, avg_align, avg_var, avg_enc_std, avg_proj_std, avg_t_std
 
 
 # ======================================================================
@@ -534,17 +536,16 @@ def main() -> None:
     )
 
     # ----- Training loop -----
-    # Expected loss trajectory (healthy training, Smooth L1):
-    #   Loss = SmoothL1(student_proj, teacher_emb)
-    #   Epoch   1: ~0.3-0.5  (random init, large vector mismatch)
-    #   Epoch  10: ~0.1-0.3  (warmup complete, student converging)
-    #   Epoch  50: ~0.01-0.1
-    #   Epoch 100: ~0.005-0.05 (plateau)
+    # Expected loss trajectory (healthy training, Cosine Similarity):
+    #   Loss = (1 - cos_sim(norm(s_proj), norm(t_emb))) + var_penalty(s_emb)
+    #   Epoch   1: ~0.5-0.9  (random init, low angular alignment)
+    #   Epoch  10: ~0.2-0.5  (warmup complete, student converging)
+    #   Epoch  50: ~0.05-0.2
+    #   Epoch 100: ~0.01-0.1  (plateau)
     #
-    # Collapse detection:
-    #   student_std should track towards teacher_std (~0.04).
-    #   If student_std < teacher_std * 0.2, the student is collapsing.
-    #   If student_std > teacher_std * 10, the student is diverging.
+    # Collapse detection (on ENCODER output, not projector):
+    #   enc_std should stay > 0.1 (healthy encoder).
+    #   If enc_std < 0.02, the encoder is collapsing.
 
     # ----- Metrics logger -----
     metrics_logger = MetricsLogger(args.output_dir)
@@ -570,7 +571,7 @@ def main() -> None:
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
 
-        avg_loss, avg_align, avg_var, avg_s_std, avg_t_std = train_one_epoch(
+        avg_loss, avg_align, avg_var, avg_enc_std, avg_proj_std, avg_t_std = train_one_epoch(
             teacher, student, projector, dataloader, optimizer, scaler, args.device,
         )
 
@@ -591,7 +592,8 @@ def main() -> None:
             f"loss={avg_loss:.4f}  "
             f"align={avg_align:.4f}  "
             f"var={avg_var:.4f}  "
-            f"s_std={avg_s_std:.4f}  "
+            f"enc_std={avg_enc_std:.4f}  "
+            f"proj_std={avg_proj_std:.4f}  "
             f"t_std={avg_t_std:.4f}  "
             f"lr={current_lr:.2e}  "
             f"time={elapsed:.1f}s  "
@@ -600,17 +602,15 @@ def main() -> None:
 
         # ----- Log to CSV -----
         metrics_logger.log(
-            epoch, avg_loss, avg_s_std, avg_t_std,
+            epoch, avg_loss, avg_enc_std, avg_t_std,
             current_lr, elapsed, gpu_mem,
         )
 
-        # ----- Collapse warning (dynamic, relative to teacher) -----
-        collapse_floor = avg_t_std * COLLAPSE_RATIO
-        if avg_s_std < collapse_floor:
+        # ----- Collapse warning (on ENCODER output, not projector) -----
+        if avg_enc_std < 0.02:
             collapse_strikes += 1
             print(
-                f"  [WARNING] Student embedding_std={avg_s_std:.4f} < "
-                f"{collapse_floor:.4f} (teacher_std * {COLLAPSE_RATIO}) "
+                f"  [WARNING] Encoder embedding_std={avg_enc_std:.4f} < 0.02 "
                 f"-- possible representation collapse! "
                 f"(strike {collapse_strikes}/{COLLAPSE_STRIKES_MAX})"
             )
@@ -623,10 +623,10 @@ def main() -> None:
         else:
             collapse_strikes = 0  # reset on recovery
 
-        if avg_s_std > avg_t_std * 10:
+        if avg_enc_std > 5.0:
             print(
-                f"  [WARNING] Student embedding_std={avg_s_std:.4f} >> "
-                f"teacher_std={avg_t_std:.4f} -- student may be diverging."
+                f"  [WARNING] Encoder embedding_std={avg_enc_std:.4f} > 5.0 "
+                f"-- student may be diverging."
             )
 
         # ----- Loss plateau early stopping -----

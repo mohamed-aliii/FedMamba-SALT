@@ -108,19 +108,19 @@ def get_student_transform(dataset: str = "imagenet") -> transforms.Compose:
     mean = RETINA_MEAN if dataset == "retina" else IMAGENET_MEAN
     std = RETINA_STD if dataset == "retina" else IMAGENET_STD
     return transforms.Compose([
-        transforms.RandomResizedCrop(224, scale=(0.5, 1.0)),
+        transforms.RandomResizedCrop(224, scale=(0.6, 1.0)),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.ColorJitter(
-            brightness=0.6,
-            contrast=0.6,
-            saturation=0.3,
-            hue=0.1,
+            brightness=0.4,
+            contrast=0.4,
+            saturation=0.2,
+            hue=0.05,
         ),
-        transforms.RandomGrayscale(p=0.2),
-        transforms.GaussianBlur(kernel_size=23, sigma=(0.5, 3.0)),
+        transforms.RandomGrayscale(p=0.1),
+        transforms.GaussianBlur(kernel_size=23, sigma=(0.5, 2.0)),
         transforms.ToTensor(),
         transforms.Normalize(mean=mean, std=std),
-        AddGaussianNoise(std=0.05),
+        AddGaussianNoise(std=0.03),
     ])
 
 
