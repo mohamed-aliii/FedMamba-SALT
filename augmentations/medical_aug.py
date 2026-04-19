@@ -89,18 +89,24 @@ def get_teacher_transform(dataset: str = "imagenet") -> transforms.Compose:
 
 
 # ======================================================================
-# Student augmentation pipeline (aggressive)
+# Student augmentation pipeline (medical-safe)
 # ======================================================================
 def get_student_transform(dataset: str = "imagenet") -> transforms.Compose:
     """
-    Heavy augmentation for the student view.
+    Moderate augmentation for the student view.
 
-    Simulates real-world sources of variation in medical imaging:
-        • Aggressive random crop       → field-of-view variability
-        • ColorJitter                   → scanner protocol differences
-        • RandomGrayscale              → single-channel modalities
-        • GaussianBlur                  → motion blur / defocus
-        • AddGaussianNoise              → sensor noise
+    Medical imaging requires MUCH gentler augmentation than natural images:
+      - Retinal disease markers (microaneurysms, hemorrhages) are ~5-20 pixels
+      - Heavy blur/crop physically destroys these markers
+      - If the student can't see the disease but must predict teacher's
+        embedding, its optimal strategy is mean-prediction → collapse
+
+    Augmentation philosophy:
+      • Mild crop (0.85-1.0):  preserve diagnostic field of view
+      • Gentle jitter (0.1):   simulate scanner variation without
+                               destroying color-based diagnostic signals
+      • Mild blur (k=7):       light defocus only, preserves structures
+      • Low noise (0.02):      realistic sensor noise level
 
     Args:
         dataset: ``'imagenet'`` or ``'retina'`` to select normalization stats.
@@ -108,19 +114,19 @@ def get_student_transform(dataset: str = "imagenet") -> transforms.Compose:
     mean = RETINA_MEAN if dataset == "retina" else IMAGENET_MEAN
     std = RETINA_STD if dataset == "retina" else IMAGENET_STD
     return transforms.Compose([
-        transforms.RandomResizedCrop(224, scale=(0.6, 1.0)),
+        transforms.RandomResizedCrop(224, scale=(0.85, 1.0)),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.ColorJitter(
-            brightness=0.4,
-            contrast=0.4,
-            saturation=0.2,
-            hue=0.05,
+            brightness=0.1,
+            contrast=0.1,
+            saturation=0.05,
+            hue=0.02,
         ),
-        transforms.RandomGrayscale(p=0.1),
-        transforms.GaussianBlur(kernel_size=23, sigma=(0.5, 2.0)),
+        transforms.RandomGrayscale(p=0.02),
+        transforms.GaussianBlur(kernel_size=7, sigma=(0.1, 0.5)),
         transforms.ToTensor(),
         transforms.Normalize(mean=mean, std=std),
-        AddGaussianNoise(std=0.03),
+        AddGaussianNoise(std=0.02),
     ])
 
 
