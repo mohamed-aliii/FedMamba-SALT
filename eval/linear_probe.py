@@ -149,17 +149,36 @@ def load_encoder(ckpt_path: str, device: str, freeze: bool) -> InceptionMambaEnc
     """
     Load the student encoder from a train_centralized.py checkpoint.
 
+    Automatically infers embed_dim and depth from the checkpoint's
+    state_dict so the eval script works regardless of which encoder
+    configuration was used for pre-training.
+
     Args:
         ckpt_path: Path to the checkpoint .pth file.
         device:    Target device.
         freeze:    If True, freeze all encoder parameters (linear probe mode).
     """
-    encoder = InceptionMambaEncoder(
-        patch_size=16, embed_dim=256, depth=4, out_dim=768,
-    )
-
     ckpt = safe_torch_load(ckpt_path, map_location="cpu")
     state_dict = ckpt.get("student_state_dict", ckpt)
+
+    # --- Infer architecture from checkpoint ---
+    # embed_dim: shape of patch_embed.proj.0.weight is (embed_dim, 3, 16, 16)
+    embed_dim = state_dict["patch_embed.proj.0.weight"].shape[0]
+
+    # depth: count unique block indices (blocks.0.*, blocks.1.*, ...)
+    block_indices = set()
+    for key in state_dict:
+        if key.startswith("blocks."):
+            idx = int(key.split(".")[1])
+            block_indices.add(idx)
+    depth = len(block_indices)
+
+    print(f"[Encoder] Detected architecture: embed_dim={embed_dim}, depth={depth}")
+
+    encoder = InceptionMambaEncoder(
+        patch_size=16, embed_dim=embed_dim, depth=depth, out_dim=768,
+    )
+
     encoder.load_state_dict(state_dict)
     print(f"[Encoder] Loaded weights from: {ckpt_path}")
 
