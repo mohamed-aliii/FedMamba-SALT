@@ -140,9 +140,9 @@ def get_train_transform(dataset: str = "retina") -> transforms.Compose:
         transforms.RandomResizedCrop(224, scale=(0.7, 1.0)),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomVerticalFlip(p=0.5),
-        transforms.RandomRotation(degrees=15),
+        transforms.RandomRotation(degrees=30),
         transforms.ColorJitter(
-            brightness=0.15, contrast=0.15, saturation=0.05, hue=0.02,
+            brightness=0.2, contrast=0.3, saturation=0.1, hue=0.02,
         ),
         transforms.ToTensor(),
         transforms.Normalize(mean=mean, std=std),
@@ -349,19 +349,19 @@ def train_finetune(
     """
     # -- Learning Rates --
     # Pre-trained features score ~74% val accuracy, so they ARE useful.
-    # lr/10 preserves the learned representations while allowing gentle
+    # lr/20 preserves the learned representations while allowing gentle
     # adaptation.  The classifier head gets the full LR since it starts
     # from random init.
-    encoder_lr = lr / 10.0
+    encoder_lr = lr / 20.0
     param_groups = [
         {"params": encoder.parameters(), "lr": encoder_lr},
         {"params": classifier.parameters(), "lr": lr},
     ]
-    optimizer = AdamW(param_groups, weight_decay=0.1)
+    optimizer = AdamW(param_groups, weight_decay=0.2)
     # Scheduler: warmup + cosine decay
     # We'll handle warmup manually in the loop
     scheduler = CosineAnnealingLR(optimizer, T_max=max(1, epochs - FINETUNE_WARMUP))
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.2)
 
     all_params = list(encoder.parameters()) + list(classifier.parameters())
 
@@ -1132,7 +1132,7 @@ def run_evaluation(
 
     classifier = nn.Sequential(
         nn.LayerNorm(768),
-        nn.Dropout(0.3),
+        nn.Dropout(0.5),
         nn.Linear(768, args.num_classes),
     ).to(args.device)
     nn.init.kaiming_uniform_(classifier[2].weight)
