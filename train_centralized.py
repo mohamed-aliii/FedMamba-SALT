@@ -541,22 +541,35 @@ def main() -> None:
     if start_epoch >= args.epochs:
         extra = args.epochs  # number of additional epochs to train
         new_target = start_epoch + extra
+        resume_lr = args.lr / 10.0  # reduced LR to avoid NaN from optimizer state shock
+        resume_warmup = 5           # short warmup ramp
         print(
             f"[RESUME] Checkpoint already at epoch {start_epoch} "
             f"(>= --epochs {args.epochs}).\n"
             f"         Extending training target to {new_target} epochs "
             f"(+{extra} additional).\n"
-            f"         Fresh cosine LR schedule over the new epochs."
+            f"         Resume LR: {resume_lr:.1e} (base/10) with "
+            f"{resume_warmup}-epoch warmup + cosine decay."
         )
         args.epochs = new_target
 
-        # Reset LR to base value (cosine annealing drove it to ~0)
+        # Set LR to the reduced resume value (full base LR causes NaN
+        # because AdamW variance buffers are calibrated for near-zero LR).
         for pg in optimizer.param_groups:
-            pg["lr"] = args.lr
+            pg["lr"] = resume_lr
 
-        # Simple cosine decay over the extra epochs — no warmup needed
-        # since the model is already well-trained.
-        scheduler = CosineAnnealingLR(optimizer, T_max=extra)
+        # Short warmup (lr/5 -> lr) then cosine over remaining epochs
+        warmup = LinearLR(
+            optimizer, start_factor=0.2, total_iters=resume_warmup,
+        )
+        cosine = CosineAnnealingLR(
+            optimizer, T_max=max(1, extra - resume_warmup),
+        )
+        scheduler = SequentialLR(
+            optimizer,
+            schedulers=[warmup, cosine],
+            milestones=[resume_warmup],
+        )
 
     # ----- Training loop -----
     # Expected loss trajectory (healthy training, Cosine Similarity):
