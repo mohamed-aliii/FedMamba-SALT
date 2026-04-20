@@ -62,8 +62,12 @@ IMAGENET_STD = [0.229, 0.224, 0.225]
 FEDMAE_BASELINE = 81.93  # % accuracy, centralized baseline, Retina
 
 # Early stopping for fine-tuning
-FINETUNE_PATIENCE = 15  # stop if val_acc doesn't improve for this many epochs
+FINETUNE_PATIENCE = 20  # stop if val_acc doesn't improve for this many epochs
 FINETUNE_WARMUP = 5     # warmup epochs for fine-tuning
+
+# Mixup / CutMix
+MIXUP_ALPHA = 0.4       # Beta distribution parameter for Mixup
+TTA_AUGMENTS = 5         # Number of augmented views for Test-Time Augmentation
 
 
 # ======================================================================
@@ -140,13 +144,69 @@ def get_train_transform(dataset: str = "retina") -> transforms.Compose:
         transforms.RandomResizedCrop(224, scale=(0.7, 1.0)),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomVerticalFlip(p=0.5),
-        transforms.RandomRotation(degrees=30),
+        transforms.RandomRotation(degrees=20),
         transforms.ColorJitter(
-            brightness=0.2, contrast=0.3, saturation=0.1, hue=0.02,
+            brightness=0.15, contrast=0.2, saturation=0.1, hue=0.02,
         ),
+        transforms.RandomErasing(p=0.1, scale=(0.02, 0.1)),
         transforms.ToTensor(),
         transforms.Normalize(mean=mean, std=std),
     ])
+
+
+def get_tta_transforms(dataset: str = "retina") -> list:
+    """
+    Returns a list of transforms for Test-Time Augmentation.
+    Each transform produces a slightly different view of the same image.
+    Final prediction = average of softmax probabilities across all views.
+    """
+    mean = RETINA_MEAN if dataset == "retina" else IMAGENET_MEAN
+    std = RETINA_STD if dataset == "retina" else IMAGENET_STD
+    base = [transforms.Resize(256), transforms.CenterCrop(224)]
+    norm = [transforms.ToTensor(), transforms.Normalize(mean=mean, std=std)]
+
+    tta_list = [
+        # 1. Clean center crop (same as eval)
+        transforms.Compose(base + norm),
+        # 2. Horizontal flip
+        transforms.Compose(base + [transforms.RandomHorizontalFlip(p=1.0)] + norm),
+        # 3. Vertical flip
+        transforms.Compose(base + [transforms.RandomVerticalFlip(p=1.0)] + norm),
+        # 4. Slight rotation
+        transforms.Compose([transforms.Resize(256), transforms.CenterCrop(240),
+                            transforms.RandomRotation(degrees=10),
+                            transforms.CenterCrop(224)] + norm),
+        # 5. Slightly larger crop
+        transforms.Compose([transforms.Resize(288), transforms.CenterCrop(224)] + norm),
+    ]
+    return tta_list
+
+
+def mixup_data(x, y, alpha=MIXUP_ALPHA):
+    """
+    Mixup: creates virtual training examples by linearly interpolating
+    pairs of images and their labels.  This forces the model to learn
+    smooth decision boundaries between classes, which helps generalization
+    beyond the teacher's representation ceiling.
+
+    Reference: Zhang et al., "mixup: Beyond Empirical Risk Minimization", ICLR 2018.
+    """
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1.0
+
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size, device=x.device)
+
+    mixed_x = lam * x + (1 - lam) * x[index]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    """Compute loss for Mixup: weighted sum of losses for both targets."""
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 
 # ======================================================================
@@ -348,20 +408,20 @@ def train_finetune(
         dict with lists of per-epoch metrics for visualization.
     """
     # -- Learning Rates --
-    # Pre-trained features score ~74% val accuracy, so they ARE useful.
-    # lr/20 preserves the learned representations while allowing gentle
+    # Pre-trained features score ~76% val accuracy, so they ARE useful.
+    # lr/10 preserves the learned representations while allowing gentle
     # adaptation.  The classifier head gets the full LR since it starts
     # from random init.
-    encoder_lr = lr / 20.0
+    encoder_lr = lr / 10.0
     param_groups = [
         {"params": encoder.parameters(), "lr": encoder_lr},
         {"params": classifier.parameters(), "lr": lr},
     ]
-    optimizer = AdamW(param_groups, weight_decay=0.2)
+    optimizer = AdamW(param_groups, weight_decay=0.1)
     # Scheduler: warmup + cosine decay
     # We'll handle warmup manually in the loop
     scheduler = CosineAnnealingLR(optimizer, T_max=max(1, epochs - FINETUNE_WARMUP))
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.2)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
     all_params = list(encoder.parameters()) + list(classifier.parameters())
 
@@ -416,10 +476,13 @@ def train_finetune(
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
 
+            # --- Mixup ---
+            images, targets_a, targets_b, lam = mixup_data(images, labels, MIXUP_ALPHA)
+
             with autocast(enabled=(device == "cuda")):
                 features = encoder(images)
                 logits = classifier(features)
-                loss = criterion(logits, labels)
+                loss = mixup_criterion(criterion, logits, targets_a, targets_b, lam)
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
@@ -431,7 +494,8 @@ def train_finetune(
             scaler.update()
 
             total_loss += loss.item() * images.size(0)
-            correct += (logits.argmax(dim=1) == labels).sum().item()
+            # For accuracy tracking, use the dominant label
+            correct += (logits.argmax(dim=1) == targets_a).sum().item()
             total += images.size(0)
 
         # Step cosine scheduler only after warmup
@@ -1132,7 +1196,7 @@ def run_evaluation(
 
     classifier = nn.Sequential(
         nn.LayerNorm(768),
-        nn.Dropout(0.5),
+        nn.Dropout(0.3),
         nn.Linear(768, args.num_classes),
     ).to(args.device)
     nn.init.kaiming_uniform_(classifier[2].weight)
