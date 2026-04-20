@@ -1209,7 +1209,7 @@ def run_evaluation(
 
     classifier = nn.Sequential(
         nn.BatchNorm1d(768),
-        nn.Dropout(0.1),
+        nn.Dropout(0.2),
         nn.Linear(768, args.num_classes),
     ).to(args.device)
     nn.init.kaiming_uniform_(classifier[2].weight)
