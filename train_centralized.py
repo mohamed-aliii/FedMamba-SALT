@@ -539,21 +539,24 @@ def main() -> None:
 
     # ----- Auto-extend epochs if checkpoint already reached target -----
     if start_epoch >= args.epochs:
-        new_target = start_epoch + args.epochs
+        extra = args.epochs  # number of additional epochs to train
+        new_target = start_epoch + extra
         print(
             f"[RESUME] Checkpoint already at epoch {start_epoch} "
             f"(>= --epochs {args.epochs}).\n"
             f"         Extending training target to {new_target} epochs "
-            f"(+{args.epochs} additional)."
+            f"(+{extra} additional).\n"
+            f"         Fresh cosine LR schedule over the new epochs."
         )
         args.epochs = new_target
 
-        # Rebuild scheduler for the extended epoch range so cosine
-        # annealing covers the new remaining epochs correctly.
-        _, scheduler = build_optimizer_and_scheduler(student, projector, args)
-        # Fast-forward the scheduler to the current epoch
-        for _ in range(start_epoch):
-            scheduler.step()
+        # Reset LR to base value (cosine annealing drove it to ~0)
+        for pg in optimizer.param_groups:
+            pg["lr"] = args.lr
+
+        # Simple cosine decay over the extra epochs — no warmup needed
+        # since the model is already well-trained.
+        scheduler = CosineAnnealingLR(optimizer, T_max=extra)
 
     # ----- Training loop -----
     # Expected loss trajectory (healthy training, Cosine Similarity):
