@@ -66,7 +66,7 @@ FINETUNE_PATIENCE = 20  # stop if val_acc doesn't improve for this many epochs
 FINETUNE_WARMUP = 5     # warmup epochs for fine-tuning
 
 # Mixup / CutMix
-MIXUP_ALPHA = 0.4       # Beta distribution parameter for Mixup
+MIXUP_ALPHA = 0.2       # Beta distribution parameter for Mixup (0.4 was too aggressive for 9K images)
 TTA_AUGMENTS = 5         # Number of augmented views for Test-Time Augmentation
 
 
@@ -141,15 +141,14 @@ def get_train_transform(dataset: str = "retina") -> transforms.Compose:
     mean = RETINA_MEAN if dataset == "retina" else IMAGENET_MEAN
     std = RETINA_STD if dataset == "retina" else IMAGENET_STD
     return transforms.Compose([
-        transforms.RandomResizedCrop(224, scale=(0.7, 1.0)),
+        transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
         transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomVerticalFlip(p=0.5),
-        transforms.RandomRotation(degrees=20),
+        transforms.RandomVerticalFlip(p=0.3),
+        transforms.RandomRotation(degrees=15),
         transforms.ColorJitter(
-            brightness=0.15, contrast=0.2, saturation=0.1, hue=0.02,
+            brightness=0.1, contrast=0.15, saturation=0.08, hue=0.01,
         ),
         transforms.ToTensor(),
-        transforms.RandomErasing(p=0.1, scale=(0.02, 0.1)),
         transforms.Normalize(mean=mean, std=std),
     ])
 
@@ -317,7 +316,7 @@ def train_linear_classifier(
     """Train a single nn.Linear layer on cached features."""
     feat_dim = train_features.shape[1]
     classifier = nn.Sequential(
-        nn.LayerNorm(feat_dim),
+        nn.BatchNorm1d(feat_dim),
         nn.Linear(feat_dim, num_classes)
     ).to(device)
     
@@ -417,11 +416,11 @@ def train_finetune(
         {"params": encoder.parameters(), "lr": encoder_lr},
         {"params": classifier.parameters(), "lr": lr},
     ]
-    optimizer = AdamW(param_groups, weight_decay=0.1)
+    optimizer = AdamW(param_groups, weight_decay=0.05)
     # Scheduler: warmup + cosine decay
     # We'll handle warmup manually in the loop
     scheduler = CosineAnnealingLR(optimizer, T_max=max(1, epochs - FINETUNE_WARMUP))
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
 
     all_params = list(encoder.parameters()) + list(classifier.parameters())
 
@@ -463,10 +462,23 @@ def train_finetune(
             warmup_factor = (epoch + 1) / FINETUNE_WARMUP
             for pg_idx, pg in enumerate(optimizer.param_groups):
                 target_lr = encoder_lr if pg_idx == 0 else lr
-                pg["lr"] = target_lr * warmup_factor * 0.1 + target_lr * warmup_factor * 0.9
-
-        # ---- Train ----
-        encoder.train()
+                # Freeze encoder during warmup to protect pretrained weights
+                if pg_idx == 0:
+                    pg["lr"] = 0.0
+                else:
+                    pg["lr"] = target_lr * warmup_factor * 0.1 + target_lr * warmup_factor * 0.9
+            
+            # Keep encoder in eval mode during freeze
+            encoder.eval()
+        elif epoch == FINETUNE_WARMUP:
+            # RESTORE the target parameters so the optimizer and scheduler wake up!
+            # This is critical to actually unfreeze the encoder.
+            optimizer.param_groups[0]["lr"] = encoder_lr
+            optimizer.param_groups[1]["lr"] = lr
+            encoder.train()
+        else:
+            encoder.train()
+            
         classifier.train()
         total_loss = 0.0
         correct = 0
@@ -495,7 +507,8 @@ def train_finetune(
 
             total_loss += loss.item() * images.size(0)
             # For accuracy tracking, use the dominant label
-            correct += (logits.argmax(dim=1) == targets_a).sum().item()
+            dominant_labels = targets_a if lam >= 0.5 else targets_b
+            correct += (logits.argmax(dim=1) == dominant_labels).sum().item()
             total += images.size(0)
 
         # Step cosine scheduler only after warmup
@@ -1195,8 +1208,8 @@ def run_evaluation(
     encoder = load_encoder(args.encoder_ckpt, args.device, freeze=freeze)
 
     classifier = nn.Sequential(
-        nn.LayerNorm(768),
-        nn.Dropout(0.3),
+        nn.BatchNorm1d(768),
+        nn.Dropout(0.1),
         nn.Linear(768, args.num_classes),
     ).to(args.device)
     nn.init.kaiming_uniform_(classifier[2].weight)
