@@ -148,8 +148,8 @@ def get_train_transform(dataset: str = "retina") -> transforms.Compose:
         transforms.ColorJitter(
             brightness=0.15, contrast=0.2, saturation=0.1, hue=0.02,
         ),
-        transforms.RandomErasing(p=0.1, scale=(0.02, 0.1)),
         transforms.ToTensor(),
+        transforms.RandomErasing(p=0.1, scale=(0.02, 0.1)),
         transforms.Normalize(mean=mean, std=std),
     ])
 
@@ -453,7 +453,7 @@ def train_finetune(
     print(f"  Early stopping patience: {FINETUNE_PATIENCE} epochs")
     total_start = time.time()
     
-    scaler = GradScaler(enabled=(device == "cuda"))
+    scaler = torch.amp.GradScaler('cuda', enabled=(device == "cuda"))
 
     for epoch in range(epochs):
         epoch_start = time.time()

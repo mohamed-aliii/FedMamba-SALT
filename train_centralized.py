@@ -34,7 +34,6 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import autocast, GradScaler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
@@ -392,14 +391,14 @@ def try_resume(
     optimizer: torch.optim.Optimizer,
     scheduler,
     device: str,
-) -> int:
+) -> tuple[int, float]:
     """
     If ckpt_latest.pth exists in output_dir, resume from it.
-    Returns the epoch to start from (0 if no checkpoint found).
+    Returns (start_epoch, last_loss).
     """
     latest_path = os.path.join(output_dir, "ckpt_latest.pth")
     if not os.path.isfile(latest_path):
-        return 0
+        return 0, 0.0
 
     print(f"[RESUME] Loading checkpoint: {latest_path}")
     ckpt = safe_torch_load(latest_path, map_location=device)
@@ -407,7 +406,7 @@ def try_resume(
     # Safety: skip incompatible checkpoints from before ProjectionHead was restored
     if "projector_state_dict" not in ckpt:
         print("[RESUME] Checkpoint is from an older architecture (no projector). Starting fresh.")
-        return 0
+        return 0, 0.0
 
     student.load_state_dict(ckpt["student_state_dict"])
     projector.load_state_dict(ckpt["projector_state_dict"])
@@ -417,7 +416,7 @@ def try_resume(
     start_epoch = ckpt["epoch"] + 1  # resume from the NEXT epoch
     prev_loss = ckpt["loss"]
     print(f"[RESUME] Resuming from epoch {start_epoch} (prev loss: {prev_loss:.4f})")
-    return start_epoch
+    return start_epoch, prev_loss
 
 
 # ======================================================================
@@ -429,7 +428,7 @@ def train_one_epoch(
     projector: nn.Module,
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
-    scaler: GradScaler,
+    scaler: torch.amp.GradScaler,
     device: str,
 ) -> tuple:
     """
@@ -452,9 +451,10 @@ def train_one_epoch(
     for teacher_view, student_view in pbar:
         teacher_view = teacher_view.to(device, non_blocking=True)
         student_view = student_view.to(device, non_blocking=True)
+        device_type = "cuda" if "cuda" in str(device) else "cpu"
 
         # ----- Mixed Precision Forward Pass -----
-        with autocast(enabled=True):
+        with torch.amp.autocast(device_type=device_type, enabled=True):
             # Teacher embedding (frozen, no gradient)
             with torch.no_grad():
                 t_emb = teacher(teacher_view)            # (B, 768)
@@ -533,9 +533,27 @@ def main() -> None:
     optimizer, scheduler = build_optimizer_and_scheduler(student, projector, args)
 
     # ----- Resume from checkpoint if available -----
-    start_epoch = try_resume(
+    start_epoch, avg_loss = try_resume(
         args.output_dir, student, projector, optimizer, scheduler, args.device,
     )
+
+    # ----- Auto-extend epochs if checkpoint already reached target -----
+    if start_epoch >= args.epochs:
+        new_target = start_epoch + args.epochs
+        print(
+            f"[RESUME] Checkpoint already at epoch {start_epoch} "
+            f"(>= --epochs {args.epochs}).\n"
+            f"         Extending training target to {new_target} epochs "
+            f"(+{args.epochs} additional)."
+        )
+        args.epochs = new_target
+
+        # Rebuild scheduler for the extended epoch range so cosine
+        # annealing covers the new remaining epochs correctly.
+        _, scheduler = build_optimizer_and_scheduler(student, projector, args)
+        # Fast-forward the scheduler to the current epoch
+        for _ in range(start_epoch):
+            scheduler.step()
 
     # ----- Training loop -----
     # Expected loss trajectory (healthy training, Cosine Similarity):
@@ -559,7 +577,7 @@ def main() -> None:
     print(f"{'='*55}\n")
 
     # ----- Automated Mixed Precision -----
-    scaler = GradScaler(enabled=(args.device == "cuda"))
+    scaler = torch.amp.GradScaler("cuda", enabled=(args.device == "cuda"))
 
     # Reset peak GPU memory counter for accurate per-run tracking
     if torch.cuda.is_available():
