@@ -555,8 +555,11 @@ def main() -> None:
 
         # Set LR to the reduced resume value (full base LR causes NaN
         # because AdamW variance buffers are calibrated for near-zero LR).
+        # MUST also reset initial_lr — PyTorch schedulers use this as
+        # the base for all multiplier calculations, not the current lr.
         for pg in optimizer.param_groups:
             pg["lr"] = resume_lr
+            pg["initial_lr"] = resume_lr
 
         # Short warmup (lr/5 -> lr) then cosine over remaining epochs
         warmup = LinearLR(
