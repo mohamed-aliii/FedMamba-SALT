@@ -49,6 +49,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from augmentations.retina_dataset import RetinaDataset
 from augmentations.medical_aug import RETINA_MEAN, RETINA_STD
 from models.inception_mamba import InceptionMambaEncoder
+from objectives.salt_loss import ProjectionHead
 from utils.ckpt_compat import safe_torch_load
 
 
@@ -207,6 +208,69 @@ def mixup_criterion(criterion, pred, y_a, y_b, lam):
     """Compute loss for Mixup: weighted sum of losses for both targets."""
     return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
+
+# ======================================================================
+# Attention Pooling & Projector Models (Full Fine-tune only)
+# ======================================================================
+class AttentionPoolClassifier(nn.Module):
+    """Learnable attention pooling + classification head."""
+    def __init__(self, feat_dim=768, num_classes=2):
+        super().__init__()
+        self.attn = nn.Sequential(
+            nn.Linear(feat_dim, 128),
+            nn.Tanh(),
+            nn.Linear(128, 1),
+        )
+        self.head = nn.Sequential(
+            nn.BatchNorm1d(feat_dim),
+            nn.Dropout(0.2),
+            nn.Linear(feat_dim, num_classes),
+        )
+
+    def forward(self, patch_tokens):
+        # patch_tokens: (B, 196, 768)
+        w = F.softmax(self.attn(patch_tokens), dim=1)   # (B, 196, 1)
+        pooled = (patch_tokens * w).sum(dim=1)           # (B, 768)
+        return self.head(pooled)
+
+
+class ProjectedEncoder(nn.Module):
+    """Combines the Inception-Mamba encoder with the SALT Projection Head."""
+    def __init__(self, encoder: nn.Module, projector: nn.Module):
+        super().__init__()
+        self.encoder = encoder
+        self.projector = projector
+
+    def forward(self, x):
+        # Return 196 dense patch tokens instead of GAP
+        features = self.encoder(x, return_patches=True)  # (B, 196, 768)
+        # Apply the point-wise projector to all patches
+        return self.projector(features)                  # (B, 196, 768)
+
+
+def load_projector(ckpt_path: str, device: str, freeze: bool = False) -> nn.Module:
+    """Load the SALT projection head from the pre-training checkpoint."""
+    ckpt = safe_torch_load(ckpt_path, map_location="cpu")
+    projector = ProjectionHead(in_dim=768, hidden_dim=2048, out_dim=768)
+    
+    if "projector_state_dict" in ckpt:
+        projector.load_state_dict(ckpt["projector_state_dict"])
+        print(f"[Projector] Loaded weights from: {ckpt_path}")
+    else:
+        print("[Projector] WARNING: No projector_state_dict found in checkpoint.")
+        
+    projector = projector.to(device)
+    
+    if freeze:
+        for param in projector.parameters():
+            param.requires_grad = False
+        projector.eval()
+        print("[Projector] Frozen -- 0 trainable parameters")
+    else:
+        trainable = sum(p.numel() for p in projector.parameters() if p.requires_grad)
+        print(f"[Projector] Unfrozen -- {trainable / 1e6:.2f}M trainable parameters")
+        
+    return projector
 
 # ======================================================================
 # Encoder loading
@@ -1205,15 +1269,24 @@ def run_evaluation(
 
     # --- Fresh encoder + classifier for each run ---
     freeze = (args.mode == "linear_probe")
-    encoder = load_encoder(args.encoder_ckpt, args.device, freeze=freeze)
+    base_encoder = load_encoder(args.encoder_ckpt, args.device, freeze=freeze)
 
-    classifier = nn.Sequential(
-        nn.BatchNorm1d(768),
-        nn.Dropout(0.2),
-        nn.Linear(768, args.num_classes),
-    ).to(args.device)
-    nn.init.kaiming_uniform_(classifier[2].weight)
-    nn.init.zeros_(classifier[2].bias)
+    if args.mode == "full_finetune":
+        projector = load_projector(args.encoder_ckpt, args.device, freeze=False)
+        encoder = ProjectedEncoder(base_encoder, projector)
+        
+        classifier = AttentionPoolClassifier(feat_dim=768, num_classes=args.num_classes).to(args.device)
+        nn.init.kaiming_uniform_(classifier.head[2].weight)
+        nn.init.zeros_(classifier.head[2].bias)
+    else:
+        encoder = base_encoder
+        classifier = nn.Sequential(
+            nn.BatchNorm1d(768),
+            nn.Dropout(0.2),
+            nn.Linear(768, args.num_classes),
+        ).to(args.device)
+        nn.init.kaiming_uniform_(classifier[2].weight)
+        nn.init.zeros_(classifier[2].bias)
 
     # --- Suffix for filenames ---
     frac_tag = f"_{label_fraction*100:.0f}pct" if label_fraction < 1.0 else ""
