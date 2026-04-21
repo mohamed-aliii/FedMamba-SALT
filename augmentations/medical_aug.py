@@ -93,20 +93,20 @@ def get_teacher_transform(dataset: str = "imagenet") -> transforms.Compose:
 # ======================================================================
 def get_student_transform(dataset: str = "imagenet") -> transforms.Compose:
     """
-    Moderate augmentation for the student view.
+    Aggressive (but medical-safe) augmentation for the student view.
 
-    Medical imaging requires MUCH gentler augmentation than natural images:
-      - Retinal disease markers (microaneurysms, hemorrhages) are ~5-20 pixels
-      - Heavy blur/crop physically destroys these markers
-      - If the student can't see the disease but must predict teacher's
-        embedding, its optimal strategy is mean-prediction → collapse
+    Medical imaging requires care but the PREVIOUS settings were too gentle:
+      - Crop scale 0.85-1.0 and jitter 0.1 made the teacher-student gap
+        too small → weak learning signal → plateau at 0.16 loss.
 
-    Augmentation philosophy:
-      • Mild crop (0.85-1.0):  preserve diagnostic field of view
-      • Gentle jitter (0.1):   simulate scanner variation without
-                               destroying color-based diagnostic signals
-      • Mild blur (k=7):       light defocus only, preserves structures
-      • Low noise (0.02):      realistic sensor noise level
+    Updated philosophy (wider gap):
+      • Wider crop (0.6-1.0):   forces spatial invariance while still
+                                 preserving 5-20px disease markers at 224px
+      • Stronger jitter (0.3):  simulates real scanner protocol differences
+      • Vertical flip:          retinal fundus images are rotation-invariant
+      • Solarization (p=0.1):   proven effective in BYOL/DINO for SSL
+      • Stronger blur:          sigma up to 1.0 for defocus simulation
+      • Slightly more noise:    realistic sensor noise
 
     Args:
         dataset: ``'imagenet'`` or ``'retina'`` to select normalization stats.
@@ -114,19 +114,21 @@ def get_student_transform(dataset: str = "imagenet") -> transforms.Compose:
     mean = RETINA_MEAN if dataset == "retina" else IMAGENET_MEAN
     std = RETINA_STD if dataset == "retina" else IMAGENET_STD
     return transforms.Compose([
-        transforms.RandomResizedCrop(224, scale=(0.85, 1.0)),
+        transforms.RandomResizedCrop(224, scale=(0.6, 1.0)),
         transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomVerticalFlip(p=0.5),
         transforms.ColorJitter(
-            brightness=0.1,
-            contrast=0.1,
-            saturation=0.05,
-            hue=0.02,
+            brightness=0.3,
+            contrast=0.3,
+            saturation=0.1,
+            hue=0.03,
         ),
-        transforms.RandomGrayscale(p=0.02),
-        transforms.GaussianBlur(kernel_size=7, sigma=(0.1, 0.5)),
+        transforms.RandomGrayscale(p=0.05),
+        transforms.RandomSolarize(threshold=128, p=0.1),
+        transforms.GaussianBlur(kernel_size=7, sigma=(0.1, 1.0)),
         transforms.ToTensor(),
         transforms.Normalize(mean=mean, std=std),
-        AddGaussianNoise(std=0.02),
+        AddGaussianNoise(std=0.03),
     ])
 
 
