@@ -457,11 +457,11 @@ def train_one_epoch(
         with torch.amp.autocast(device_type=device_type, enabled=True):
             # Teacher embedding (frozen, no gradient)
             with torch.no_grad():
-                t_emb = teacher(teacher_view)            # (B, 768)
+                t_emb = teacher(teacher_view, return_patches=True)            # (B, 196, 768)
 
             # Student embedding + projection
-            s_emb = student(student_view)                # (B, 768)
-            s_proj = projector(s_emb)                    # (B, 768)
+            s_emb = student(student_view, return_patches=True)                # (B, 196, 768)
+            s_proj = projector(s_emb)                                         # (B, 196, 768)
 
             # SALT loss (Cosine distillation + encoder variance guard)
             loss, align_loss, var_loss = salt_loss(s_proj, t_emb, s_emb)

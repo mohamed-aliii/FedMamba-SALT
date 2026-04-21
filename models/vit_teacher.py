@@ -174,15 +174,18 @@ class FrozenViTTeacher(nn.Module):
     # Forward pass -- always eval, always no_grad
     # ------------------------------------------------------------------
     @torch.no_grad()
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_patches: bool = False) -> torch.Tensor:
         """
-        Extract the Global Average Pooling (GAP) of patch features.
+        Extract features from the frozen teacher.
 
         Args:
             x: Image batch of shape ``(B, 3, 224, 224)``.
+            return_patches: If True, returns all 196 patch tokens.
+                            If False, returns the Global Average Pooled (GAP) token.
 
         Returns:
-            GAP patch embeddings of shape ``(B, 768)``.
+            If return_patches=False: GAP patch embeddings of shape ``(B, 768)``.
+            If return_patches=True: Dense patch embeddings of shape ``(B, 196, 768)``.
         """
         # Defensive: re-assert eval mode
         self.eval()
@@ -200,5 +203,11 @@ class FrozenViTTeacher(nn.Module):
 
         x = self.encoder.norm(x)
 
-        # Drop the CLS token (index 0) and average pool the 196 patch tokens
-        return x[:, 1:].mean(dim=1)  # (B, 768)
+        # Drop the CLS token (index 0)
+        patches = x[:, 1:]  # (B, 196, 768)
+        
+        if return_patches:
+            return patches
+            
+        # Default: average pool the 196 patch tokens
+        return patches.mean(dim=1)  # (B, 768)

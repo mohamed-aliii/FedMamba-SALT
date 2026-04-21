@@ -330,12 +330,15 @@ class InceptionMambaEncoder(nn.Module):
         self.norm = nn.LayerNorm(embed_dim)
         self.proj = nn.Linear(embed_dim, out_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_patches: bool = False) -> torch.Tensor:
         """
         Args:
             x: (B, 3, 224, 224) image batch.
+            return_patches: If True, returns all 196 patch tokens.
+                            If False, returns the Global Average Pooled (GAP) token.
         Returns:
-            (B, out_dim) embedding vector per image.
+            If return_patches=False: (B, out_dim) embedding vector per image.
+            If return_patches=True: (B, 196, out_dim) patch embeddings per image.
         """
         # Stage 1: (B, 3, 224, 224) -> (B, 196, embed_dim)
         x = self.patch_embed(x)
@@ -344,9 +347,14 @@ class InceptionMambaEncoder(nn.Module):
         for blk in self.blocks:
             x = blk(x)                              # (B, 196, embed_dim)
 
-        # Stage 3: norm -> project -> global mean pool
+        # Stage 3: norm -> project
         x = self.norm(x)                             # (B, 196, embed_dim)
         x = self.proj(x)                             # (B, 196, out_dim)
+        
+        if return_patches:
+            return x
+
+        # Default: global mean pool
         x = x.mean(dim=1)                            # (B, out_dim)
 
         return x

@@ -137,15 +137,22 @@ def salt_loss(
     the teacher's standardised residuals.
 
     Args:
-        student_proj: ``(B, D)`` output of the projection head.
-        teacher_emb:  ``(B, D)`` embedding from frozen teacher.
-        student_emb:  ``(B, D)`` raw encoder output (before proj head).
+        student_proj: ``(B, D)`` or ``(B, N, D)`` output of the projection head.
+        teacher_emb:  ``(B, D)`` or ``(B, N, D)`` embedding from frozen teacher.
+        student_emb:  ``(B, D)`` or ``(B, N, D)`` raw encoder output (before proj head).
         lambda_var:   Weight for the variance penalty.
         lambda_cov:   Weight for the covariance penalty.
 
     Returns:
         Tuple of ``(total_loss, align_loss, var_loss)``.
     """
+    # --- Flatten spatial dimensions if using dense patch distillation ---
+    if student_proj.dim() == 3:
+        student_proj = student_proj.flatten(0, 1)  # (B*N, D)
+        teacher_emb = teacher_emb.flatten(0, 1)
+        if student_emb is not None:
+            student_emb = student_emb.flatten(0, 1)
+
     # --- Detach the teacher ---
     teacher_emb = teacher_emb.detach()
 
@@ -196,9 +203,12 @@ def embedding_std(embeddings: torch.Tensor) -> float:
         • Collapsed: < 0.01
 
     Args:
-        embeddings: ``(B, D)`` batch of embedding vectors.
+        embeddings: ``(B, D)`` or ``(B, N, D)`` batch of embedding vectors.
 
     Returns:
         Average per-dimension standard deviation (scalar float).
     """
+    if embeddings.dim() == 3:
+        embeddings = embeddings.flatten(0, 1)
     return embeddings.std(dim=0).mean().item()
+
