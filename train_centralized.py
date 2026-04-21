@@ -375,6 +375,7 @@ def save_checkpoint(
         {
             "epoch": epoch,
             "loss": loss,
+            "dense_distillation": True,
             "student_state_dict": student.state_dict(),
             "projector_state_dict": projector.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
@@ -406,6 +407,13 @@ def try_resume(
     # Safety: skip incompatible checkpoints from before ProjectionHead was restored
     if "projector_state_dict" not in ckpt:
         print("[RESUME] Checkpoint is from an older architecture (no projector). Starting fresh.")
+        return 0, 0.0
+
+    # Safety: skip checkpoints from old GAP-level distillation
+    # (projector was trained on (B, 768) GAP vectors; dense distillation
+    # needs projector trained on (B, 196, 768) patch tokens)
+    if not ckpt.get("dense_distillation", False):
+        print("[RESUME] Checkpoint is from GAP-level distillation (not dense). Starting fresh.")
         return 0, 0.0
 
     student.load_state_dict(ckpt["student_state_dict"])

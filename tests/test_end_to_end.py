@@ -80,16 +80,16 @@ def test_end_to_end() -> bool:
     teacher_view = torch.randn(BATCH, 3, 224, 224, device=DEVICE)
     student_view = torch.randn(BATCH, 3, 224, 224, device=DEVICE)
 
-    # ----- Forward pass -----
-    print("  [3/8] Teacher forward (frozen)...")
+    # ----- Forward pass (Dense Patch-Level Distillation) -----
+    print("  [3/8] Teacher forward (frozen, dense patches)...")
     with torch.no_grad():
-        t_emb = teacher(teacher_view)            # (B, 768)
+        t_emb = teacher(teacher_view, return_patches=True)  # (B, 196, 768)
 
-    print("  [4/8] Student + projector forward...")
+    print("  [4/8] Student + projector forward (dense patches)...")
     student.train()
     projector.train()
-    s_emb = student(student_view)                 # (B, 768)
-    s_proj = projector(s_emb)                     # (B, 768)
+    s_emb = student(student_view, return_patches=True)       # (B, 196, 768)
+    s_proj = projector(s_emb)                                # (B, 196, 768)
 
     # ----- SALT loss -----
     print("  [5/8] Computing SALT loss...")

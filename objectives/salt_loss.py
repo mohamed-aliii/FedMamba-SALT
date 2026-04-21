@@ -91,10 +91,17 @@ def variance_loss(
 # ======================================================================
 # Covariance regularisation (off-diagonal penalty)
 # ======================================================================
+_COV_MAX_SAMPLES = 1024  # subsample if batch is larger (for dense distillation)
+
 def covariance_loss(embeddings: torch.Tensor) -> torch.Tensor:
     """
     Penalise off-diagonal elements of the feature covariance matrix.
     Encourages different dimensions to encode independent information.
+
+    When using dense patch distillation the effective batch can be
+    B*196 = 50 000+.  Computing a full (D, D) covariance matrix from
+    50 000 samples is both slow and unnecessary — 1024 random samples
+    provide a reliable covariance estimate.
 
     Args:
         embeddings: ``(B, D)`` batch of embedding vectors (will be centered).
@@ -103,6 +110,11 @@ def covariance_loss(embeddings: torch.Tensor) -> torch.Tensor:
         Scalar loss: mean of squared off-diagonal covariance elements.
     """
     B, D = embeddings.shape
+    # Subsample to keep the covariance computation tractable
+    if B > _COV_MAX_SAMPLES:
+        idx = torch.randperm(B, device=embeddings.device)[:_COV_MAX_SAMPLES]
+        embeddings = embeddings[idx]
+        B = _COV_MAX_SAMPLES
     x = embeddings - embeddings.mean(dim=0, keepdim=True)
     cov = (x.T @ x) / max(B - 1, 1)
     off_diag = cov.pow(2).sum() - cov.diagonal().pow(2).sum()
@@ -146,12 +158,16 @@ def salt_loss(
     Returns:
         Tuple of ``(total_loss, align_loss, var_loss)``.
     """
-    # --- Flatten spatial dimensions if using dense patch distillation ---
+    # --- Handle dense patch distillation (B, N, D) -> (B*N, D) ---
+    # For variance_loss we need image-level features (GAP of patches)
+    # to maintain meaningful collapse detection, so save them separately.
+    student_emb_for_var = student_emb
     if student_proj.dim() == 3:
+        if student_emb is not None:
+            # Collapse detection: use per-image GAP, not per-patch
+            student_emb_for_var = student_emb.mean(dim=1)  # (B, D)
         student_proj = student_proj.flatten(0, 1)  # (B*N, D)
         teacher_emb = teacher_emb.flatten(0, 1)
-        if student_emb is not None:
-            student_emb = student_emb.flatten(0, 1)
 
     # --- Detach the teacher ---
     teacher_emb = teacher_emb.detach()
@@ -179,8 +195,8 @@ def salt_loss(
     total_align = align_loss + lambda_cov * cov_loss
 
     # --- Variance penalty on ENCODER output ---
-    if student_emb is not None:
-        var_loss_val = variance_loss(student_emb)
+    if student_emb_for_var is not None:
+        var_loss_val = variance_loss(student_emb_for_var)
     else:
         var_loss_val = torch.tensor(0.0, device=student_proj.device)
 
