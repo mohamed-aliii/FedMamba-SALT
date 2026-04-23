@@ -97,6 +97,11 @@ def covariance_loss(embeddings: torch.Tensor) -> torch.Tensor:
     """
     Penalise off-diagonal elements of the feature covariance matrix.
     Encourages different dimensions to encode independent information.
+    
+    Must be computed in float32 to prevent FP16 overflow during large sums.
+    """
+    # Force float32 to prevent FP16 overflow in .pow(2).sum()
+    embeddings = embeddings.float()
 
     When using dense patch distillation the effective batch can be
     B*196 = 50 000+.  Computing a full (D, D) covariance matrix from
@@ -183,20 +188,24 @@ def salt_loss(
     t_std = t_centered.std() + 1e-6  # scalar std across all elements
     t_target = t_centered / t_std
 
+    # Force float32 for loss computation to prevent FP16 overflow
+    s_centered_f32 = s_centered.float()
+    t_target_f32 = t_target.float()
+
     # --- MSE alignment on standardised targets ---
     # Loss is now O(1) with healthy gradients.
     # MSE (not SmoothL1) because the targets are well-scaled.
-    align_loss = F.mse_loss(s_centered, t_target)
+    align_loss = F.mse_loss(s_centered_f32, t_target_f32)
 
     # --- Covariance penalty on centered student ---
-    cov_loss = covariance_loss(s_centered)
+    cov_loss = covariance_loss(s_centered_f32)
 
     # --- Combined alignment ---
     total_align = align_loss + lambda_cov * cov_loss
 
     # --- Variance penalty on ENCODER output ---
     if student_emb_for_var is not None:
-        var_loss_val = variance_loss(student_emb_for_var)
+        var_loss_val = variance_loss(student_emb_for_var.float())
     else:
         var_loss_val = torch.tensor(0.0, device=student_proj.device)
 
