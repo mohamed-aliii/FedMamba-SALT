@@ -321,6 +321,10 @@ class InceptionMambaEncoder(nn.Module):
             patch_size=patch_size, embed_dim=embed_dim, img_size=224,
         )
 
+        # Internal mask token for Latent Masking
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        nn.init.normal_(self.mask_token, std=0.02)
+
         # Stage 2: InceptionMamba blocks
         self.blocks = nn.ModuleList([
             InceptionMambaBlock(embed_dim) for _ in range(depth)
@@ -330,18 +334,28 @@ class InceptionMambaEncoder(nn.Module):
         self.norm = nn.LayerNorm(embed_dim)
         self.proj = nn.Linear(embed_dim, out_dim)
 
-    def forward(self, x: torch.Tensor, return_patches: bool = False) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_patches: bool = False, mask_ratio: float = 0.0) -> torch.Tensor:
         """
         Args:
             x: (B, 3, 224, 224) image batch.
             return_patches: If True, returns all 196 patch tokens.
                             If False, returns the Global Average Pooled (GAP) token.
+            mask_ratio: Fraction of tokens to mask internally before Mamba blocks.
         Returns:
             If return_patches=False: (B, out_dim) embedding vector per image.
             If return_patches=True: (B, 196, out_dim) patch embeddings per image.
         """
         # Stage 1: (B, 3, 224, 224) -> (B, 196, embed_dim)
         x = self.patch_embed(x)
+
+        # Internal Latent Masking (only during training if mask_ratio > 0)
+        if mask_ratio > 0.0 and self.training:
+            B, L, D = x.shape
+            noise = torch.rand(B, L, device=x.device)
+            mask = noise < mask_ratio
+            expanded_mask_token = self.mask_token.expand(B, L, D)
+            mask_expanded = mask.unsqueeze(-1)
+            x = torch.where(mask_expanded, expanded_mask_token, x)
 
         # Stage 2: repeated InceptionMambaBlocks
         for blk in self.blocks:
@@ -360,57 +374,3 @@ class InceptionMambaEncoder(nn.Module):
         return x
 
 
-# ===========================================================================
-# Predictor Mamba (for Latent Feature Masking)
-# ===========================================================================
-class PredictorMamba(nn.Module):
-    """
-    Lightweight predictor for Latent Feature Masking (LFM).
-    Takes a dense sequence, randomly masks out a percentage of tokens,
-    and uses a Mamba block to predict the full unmasked sequence.
-    """
-    def __init__(self, embed_dim: int = 768, depth: int = 1):
-        super().__init__()
-        # Learnable mask token to replace dropped features
-        self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        
-        # Mamba blocks for prediction
-        self.blocks = nn.ModuleList([
-            Mamba(d_model=embed_dim, d_state=16, d_conv=4, expand=2)
-            if MAMBA_AVAILABLE else MockMamba(d_model=embed_dim)
-            for _ in range(depth)
-        ])
-        self.norm = nn.LayerNorm(embed_dim)
-
-    def forward(self, x: torch.Tensor, mask_ratio: float = 0.6) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            x: (B, L, D) sequence
-            mask_ratio: fraction of tokens to replace with mask_token
-            
-        Returns:
-            out: (B, L, D) predicted sequence
-            mask: (B, L) boolean mask indicating which tokens were dropped
-        """
-        B, L, D = x.shape
-        
-        # 1. Generate random mask
-        noise = torch.rand(B, L, device=x.device)
-        # mask is True for tokens that should be DROPPED
-        mask = noise < mask_ratio
-        
-        # 2. Replace masked tokens with the learnable mask token
-        x_masked = x.clone()
-        expanded_mask_token = self.mask_token.expand(B, L, D)
-        mask_expanded = mask.unsqueeze(-1)  # (B, L, 1)
-        
-        # If mask is True, use mask_token, else use original feature
-        x_masked = torch.where(mask_expanded, expanded_mask_token, x_masked)
-        
-        # 3. Pass through predictor
-        out = x_masked
-        for blk in self.blocks:
-            out = blk(out)
-            
-        out = self.norm(out)
-        return out, mask
