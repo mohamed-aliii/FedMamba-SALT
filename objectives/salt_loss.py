@@ -98,15 +98,12 @@ def covariance_loss(embeddings: torch.Tensor) -> torch.Tensor:
     Penalise off-diagonal elements of the feature covariance matrix.
     Encourages different dimensions to encode independent information.
     
-    Must be computed in float32 to prevent FP16 overflow during large sums.
-    """
-    # Force float32 to prevent FP16 overflow in .pow(2).sum()
-    embeddings = embeddings.float()
-
     When using dense patch distillation the effective batch can be
     B*196 = 50 000+.  Computing a full (D, D) covariance matrix from
     50 000 samples is both slow and unnecessary — 1024 random samples
     provide a reliable covariance estimate.
+
+    Must be computed in float32 to prevent FP16 overflow during large sums.
 
     Args:
         embeddings: ``(B, D)`` batch of embedding vectors (will be centered).
@@ -114,6 +111,9 @@ def covariance_loss(embeddings: torch.Tensor) -> torch.Tensor:
     Returns:
         Scalar loss: mean of squared off-diagonal covariance elements.
     """
+    # Force float32 to prevent FP16 overflow in .pow(2).sum()
+    embeddings = embeddings.float()
+
     B, D = embeddings.shape
     # Subsample to keep the covariance computation tractable
     if B > _COV_MAX_SAMPLES:

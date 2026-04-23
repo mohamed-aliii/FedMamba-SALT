@@ -27,7 +27,7 @@ output_dir: "outputs/retina_centralized"
 # -- Training --
 epochs: 100
 batch_size: 128
-lr: 1.0e-3
+lr: 5.0e-4
 weight_decay: 0.05
 
 # -- Infrastructure --
