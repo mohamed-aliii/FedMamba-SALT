@@ -358,3 +358,59 @@ class InceptionMambaEncoder(nn.Module):
         x = x.mean(dim=1)                            # (B, out_dim)
 
         return x
+
+
+# ===========================================================================
+# Predictor Mamba (for Latent Feature Masking)
+# ===========================================================================
+class PredictorMamba(nn.Module):
+    """
+    Lightweight predictor for Latent Feature Masking (LFM).
+    Takes a dense sequence, randomly masks out a percentage of tokens,
+    and uses a Mamba block to predict the full unmasked sequence.
+    """
+    def __init__(self, embed_dim: int = 768, depth: int = 1):
+        super().__init__()
+        # Learnable mask token to replace dropped features
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        
+        # Mamba blocks for prediction
+        self.blocks = nn.ModuleList([
+            Mamba(d_model=embed_dim, d_state=16, d_conv=4, expand=2)
+            if MAMBA_AVAILABLE else MockMamba(d_model=embed_dim)
+            for _ in range(depth)
+        ])
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x: torch.Tensor, mask_ratio: float = 0.6) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: (B, L, D) sequence
+            mask_ratio: fraction of tokens to replace with mask_token
+            
+        Returns:
+            out: (B, L, D) predicted sequence
+            mask: (B, L) boolean mask indicating which tokens were dropped
+        """
+        B, L, D = x.shape
+        
+        # 1. Generate random mask
+        noise = torch.rand(B, L, device=x.device)
+        # mask is True for tokens that should be DROPPED
+        mask = noise < mask_ratio
+        
+        # 2. Replace masked tokens with the learnable mask token
+        x_masked = x.clone()
+        expanded_mask_token = self.mask_token.expand(B, L, D)
+        mask_expanded = mask.unsqueeze(-1)  # (B, L, 1)
+        
+        # If mask is True, use mask_token, else use original feature
+        x_masked = torch.where(mask_expanded, expanded_mask_token, x_masked)
+        
+        # 3. Pass through predictor
+        out = x_masked
+        for blk in self.blocks:
+            out = blk(out)
+            
+        out = self.norm(out)
+        return out, mask
