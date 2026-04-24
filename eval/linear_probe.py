@@ -40,6 +40,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, TensorDataset, Subset
 from torch.cuda.amp import autocast, GradScaler
 from torchvision import transforms
+import torchvision.transforms.functional as TF
 from tqdm import tqdm
 
 # Ensure project root is on sys.path
@@ -980,7 +981,7 @@ def evaluate_finetune(
         # --- Hardware Test-Time Augmentation (TTA) ---
         # Evaluate multiple spatial views and average the softmax probabilities.
         # Vertical flips are medically invalid for retinal fundus images (destroys spatial priors).
-        # We use Original + Horizontal Flip + 5% Center Zoom.
+        # We use a robust 5-Crop Ensemble: Original + H-Flip + 5% Zoom + Rot(+10) + Rot(-10)
         
         # 1. Original
         probs_orig = torch.softmax(classifier(encoder(images)), dim=1)
@@ -996,9 +997,17 @@ def evaluate_finetune(
         img_zoom = images[:, :, start_y:start_y+crop_h, start_x:start_x+crop_w]
         img_zoom = F.interpolate(img_zoom, size=(H, W), mode='bilinear', align_corners=False)
         probs_zoom = torch.softmax(classifier(encoder(img_zoom)), dim=1)
+
+        # 4. Rotate +10 degrees
+        img_rot_pos = TF.rotate(images, angle=10)
+        probs_rot_pos = torch.softmax(classifier(encoder(img_rot_pos)), dim=1)
+
+        # 5. Rotate -10 degrees
+        img_rot_neg = TF.rotate(images, angle=-10)
+        probs_rot_neg = torch.softmax(classifier(encoder(img_rot_neg)), dim=1)
         
-        # Average probabilities across all 3 views
-        probs = (probs_orig + probs_hflip + probs_zoom) / 3.0
+        # Average probabilities across all 5 views
+        probs = (probs_orig + probs_hflip + probs_zoom + probs_rot_pos + probs_rot_neg) / 5.0
         
         all_preds.append(probs.argmax(dim=1).cpu())
         all_labels.append(labels)
