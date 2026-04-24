@@ -484,7 +484,12 @@ def train_finetune(
     # Scheduler: warmup + cosine decay
     # We'll handle warmup manually in the loop
     scheduler = CosineAnnealingLR(optimizer, T_max=max(1, epochs - FINETUNE_WARMUP))
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
+    
+    # Apply class weights to aggressively prioritize harder disease classes.
+    # We heavily weight non-zero classes to overcome the recall imbalance.
+    weights = [1.0] + [1.5] * (num_classes - 1)
+    class_weights = torch.tensor(weights, dtype=torch.float32, device=device)
+    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.05)
 
     all_params = list(encoder.parameters()) + list(classifier.parameters())
 
@@ -963,10 +968,22 @@ def evaluate_finetune(
 
     for images, labels in tqdm(dataloader, desc="  Evaluating", leave=False):
         images = images.to(device, non_blocking=True)
-        features = encoder(images)
-        logits = classifier(features)
-        probs = torch.softmax(logits, dim=1)
-        all_preds.append(logits.argmax(dim=1).cpu())
+        
+        # --- Hardware Test-Time Augmentation (TTA) ---
+        # Evaluate multiple spatial views and average the softmax probabilities.
+        # 1. Original
+        probs_orig = torch.softmax(classifier(encoder(images)), dim=1)
+        # 2. Horizontal Flip
+        img_hflip = torch.flip(images, dims=[3])
+        probs_hflip = torch.softmax(classifier(encoder(img_hflip)), dim=1)
+        # 3. Vertical Flip
+        img_vflip = torch.flip(images, dims=[2])
+        probs_vflip = torch.softmax(classifier(encoder(img_vflip)), dim=1)
+        
+        # Average probabilities across all 3 views
+        probs = (probs_orig + probs_hflip + probs_vflip) / 3.0
+        
+        all_preds.append(probs.argmax(dim=1).cpu())
         all_labels.append(labels)
         all_probs.append(probs.cpu())
 
