@@ -223,7 +223,7 @@ class AttentionPoolClassifier(nn.Module):
         )
         self.head = nn.Sequential(
             nn.BatchNorm1d(feat_dim),
-            nn.Dropout(0.2),
+            nn.Dropout(0.5),
             nn.Linear(feat_dim, num_classes),
         )
 
@@ -234,18 +234,14 @@ class AttentionPoolClassifier(nn.Module):
         return self.head(pooled)
 
 
-class ProjectedEncoder(nn.Module):
-    """Combines the Inception-Mamba encoder with the SALT Projection Head."""
-    def __init__(self, encoder: nn.Module, projector: nn.Module):
+class PatchEncoderWrapper(nn.Module):
+    """Wraps the Inception-Mamba encoder to return dense patch tokens."""
+    def __init__(self, encoder: nn.Module):
         super().__init__()
         self.encoder = encoder
-        self.projector = projector
 
     def forward(self, x):
-        # Return 196 dense patch tokens instead of GAP
-        features = self.encoder(x, return_patches=True)  # (B, 196, 768)
-        # Apply the point-wise projector to all patches
-        return self.projector(features)                  # (B, 196, 768)
+        return self.encoder(x, return_patches=True)  # (B, 196, 768)
 
 
 def load_projector(ckpt_path: str, device: str, freeze: bool = False) -> nn.Module:
@@ -1289,8 +1285,7 @@ def run_evaluation(
     base_encoder = load_encoder(args.encoder_ckpt, args.device, freeze=freeze)
 
     if args.mode == "full_finetune":
-        projector = load_projector(args.encoder_ckpt, args.device, freeze=False)
-        encoder = ProjectedEncoder(base_encoder, projector)
+        encoder = PatchEncoderWrapper(base_encoder)
         
         classifier = AttentionPoolClassifier(feat_dim=768, num_classes=args.num_classes).to(args.device)
         nn.init.kaiming_uniform_(classifier.head[2].weight)
