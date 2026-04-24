@@ -289,7 +289,15 @@ def load_encoder(ckpt_path: str, device: str, freeze: bool) -> InceptionMambaEnc
         freeze:    If True, freeze all encoder parameters (linear probe mode).
     """
     ckpt = safe_torch_load(ckpt_path, map_location="cpu")
-    state_dict = ckpt.get("student_state_dict", ckpt)
+    
+    if "encoder_state_dict" in ckpt:
+        # Fine-tuned checkpoint from this script
+        state_dict = ckpt["encoder_state_dict"]
+        # Strip the 'encoder.' prefix if it was wrapped in PatchEncoderWrapper
+        state_dict = {k.replace("encoder.", ""): v for k, v in state_dict.items()}
+    else:
+        # Pre-trained checkpoint from train_centralized.py
+        state_dict = ckpt.get("student_state_dict", ckpt)
 
     # --- Infer architecture from checkpoint ---
     # embed_dim: shape of patch_embed.proj.0.weight is (embed_dim, 3, 16, 16)
