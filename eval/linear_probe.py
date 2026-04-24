@@ -110,6 +110,10 @@ def parse_args() -> argparse.Namespace:
              "at 30%%, 60%%, and 100%% label fractions and produces "
              "a comparison report.",
     )
+    p.add_argument(
+        "--eval_only", action="store_true",
+        help="Skip training and directly evaluate the provided checkpoint (must contain encoder and classifier state_dicts)",
+    )
     return p.parse_args()
 
 
@@ -967,17 +971,26 @@ def evaluate_finetune(
         
         # --- Hardware Test-Time Augmentation (TTA) ---
         # Evaluate multiple spatial views and average the softmax probabilities.
+        # Vertical flips are medically invalid for retinal fundus images (destroys spatial priors).
+        # We use Original + Horizontal Flip + 5% Center Zoom.
+        
         # 1. Original
         probs_orig = torch.softmax(classifier(encoder(images)), dim=1)
+        
         # 2. Horizontal Flip
         img_hflip = torch.flip(images, dims=[3])
         probs_hflip = torch.softmax(classifier(encoder(img_hflip)), dim=1)
-        # 3. Vertical Flip
-        img_vflip = torch.flip(images, dims=[2])
-        probs_vflip = torch.softmax(classifier(encoder(img_vflip)), dim=1)
+        
+        # 3. Zoom (Crop 95% of center and resize back)
+        B, C, H, W = images.shape
+        crop_h, crop_w = int(H * 0.95), int(W * 0.95)
+        start_y, start_x = (H - crop_h) // 2, (W - crop_w) // 2
+        img_zoom = images[:, :, start_y:start_y+crop_h, start_x:start_x+crop_w]
+        img_zoom = F.interpolate(img_zoom, size=(H, W), mode='bilinear', align_corners=False)
+        probs_zoom = torch.softmax(classifier(encoder(img_zoom)), dim=1)
         
         # Average probabilities across all 3 views
-        probs = (probs_orig + probs_hflip + probs_vflip) / 3.0
+        probs = (probs_orig + probs_hflip + probs_zoom) / 3.0
         
         all_preds.append(probs.argmax(dim=1).cpu())
         all_labels.append(labels)
@@ -1333,14 +1346,23 @@ def run_evaluation(
         sub_output = os.path.join(args.output_dir, f"finetune{frac_tag}")
         os.makedirs(sub_output, exist_ok=True)
 
-        history = train_finetune(
-            encoder, classifier, train_loader, test_loader,
-            epochs=args.epochs, lr=args.lr, device=args.device,
-            num_classes=args.num_classes, class_names=class_names,
-            output_dir=sub_output,
-        )
-
-        save_training_curves(history, sub_output, mode_tag)
+        if args.eval_only:
+            print(f"\n  [EVAL ONLY] Loading fine-tuned weights from {args.encoder_ckpt}")
+            ckpt = safe_torch_load(args.encoder_ckpt, map_location="cpu")
+            if "encoder_state_dict" in ckpt:
+                encoder.load_state_dict(ckpt["encoder_state_dict"])
+            if "classifier_state_dict" in ckpt:
+                classifier.load_state_dict(ckpt["classifier_state_dict"])
+            encoder = encoder.to(args.device)
+            classifier = classifier.to(args.device)
+        else:
+            history = train_finetune(
+                encoder, classifier, train_loader, test_loader,
+                epochs=args.epochs, lr=args.lr, device=args.device,
+                num_classes=args.num_classes, class_names=class_names,
+                output_dir=sub_output,
+            )
+            save_training_curves(history, sub_output, mode_tag)
 
         top1, per_class, cm, all_probs, all_labels = evaluate_finetune(
             encoder, classifier, test_loader,
