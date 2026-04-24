@@ -549,14 +549,29 @@ def main() -> None:
     )
 
     # ----- Auto-extend epochs if checkpoint already reached target -----
-    if start_epoch >= args.epochs:
-        extra = args.epochs  # number of additional epochs to train
-        new_target = start_epoch + extra
+    # Determine the originally planned epochs from the loaded scheduler
+    try:
+        old_warmup = scheduler.schedulers[0].total_iters
+        old_t_max = scheduler.schedulers[1].T_max
+        old_target_epochs = old_warmup + old_t_max
+    except AttributeError:
+        # Fallback if scheduler structure unexpectedly changes
+        old_target_epochs = args.epochs
+
+    if start_epoch >= old_target_epochs:
+        if args.epochs <= start_epoch:
+            # User ran with default epochs, auto-extend by original length
+            extra = old_target_epochs
+            new_target = start_epoch + extra
+        else:
+            # User explicitly provided a larger --epochs target
+            extra = args.epochs - start_epoch
+            new_target = args.epochs
+
         resume_lr = args.lr / 10.0  # reduced LR to avoid NaN from optimizer state shock
         resume_warmup = 5           # short warmup ramp
         print(
-            f"[RESUME] Checkpoint already at epoch {start_epoch} "
-            f"(>= --epochs {args.epochs}).\n"
+            f"[RESUME] Checkpoint reached end of previous {old_target_epochs}-epoch schedule.\n"
             f"         Extending training target to {new_target} epochs "
             f"(+{extra} additional).\n"
             f"         Resume LR: {resume_lr:.1e} (base/10) with "
