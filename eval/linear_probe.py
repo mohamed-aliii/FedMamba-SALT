@@ -214,6 +214,30 @@ def mixup_criterion(criterion, pred, y_a, y_b, lam):
     return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 
+class FocalLoss(nn.Module):
+    """
+    Focal Loss: Down-weights well-classified "easy" examples to focus 100% of 
+    the gradient on hard, borderline examples. Extremely useful for class imbalance.
+    """
+    def __init__(self, weight=None, gamma=2.0, label_smoothing=0.0):
+        super().__init__()
+        self.weight = weight
+        self.gamma = gamma
+        self.label_smoothing = label_smoothing
+
+    def forward(self, inputs, targets):
+        # Calculate standard cross entropy (with label smoothing and class weights)
+        ce_loss = F.cross_entropy(
+            inputs, targets, weight=self.weight, 
+            label_smoothing=self.label_smoothing, reduction='none'
+        )
+        # pt is the probability of the target class
+        pt = torch.exp(-ce_loss)
+        # Apply the focal modulating factor (1 - pt)^gamma
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        return focal_loss.mean()
+
+
 # ======================================================================
 # Attention Pooling & Projector Models (Full Fine-tune only)
 # ======================================================================
@@ -498,7 +522,14 @@ def train_finetune(
     # We heavily weight non-zero classes to overcome the recall imbalance.
     weights = [1.0] + [1.5] * (num_classes - 1)
     class_weights = torch.tensor(weights, dtype=torch.float32, device=device)
+    
+    # [CURRENT SETTING]: Weighted Cross Entropy
     criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.05)
+    
+    # [ALTERNATIVE]: Focal Loss
+    # To test Focal Loss, comment out the line above and uncomment the line below.
+    # Gamma=2.0 forces the model to ignore easy healthy images and focus on hard disease cases.
+    # criterion = FocalLoss(weight=class_weights, gamma=2.0, label_smoothing=0.05)
 
     all_params = list(encoder.parameters()) + list(classifier.parameters())
 
