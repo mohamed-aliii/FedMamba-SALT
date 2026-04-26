@@ -16,41 +16,39 @@
 ---
 
 > [!NOTE]
-> **Repository Scope**: This documentation exclusively covers the **`fedmamba_salt`** system folder, which contains the standalone code, models, and evaluation pipelines for the FedMamba-SALT architecture. It does not cover external federated learning baselines (e.g., `fed_mae`, `SSL-FL-main`) that may exist alongside it in the wider workspace.
+> **Repository Scope**: This documentation exclusively covers the **`fedmamba_salt`** system folder, detailing its standalone architecture, models, training scripts, and evaluation pipelines.
 
-## 🎯 Primary Objective: Surpassing Centralized Baselines
+## 🎯 Primary Objective
 
-The primary objective of **FedMamba-SALT** is to achieve and exceed the **81.93% centralized MAE baseline** on clinical diagnostic tasks (such as Retina imaging) while maintaining strict federated learning privacy constraints. 
+The primary objective of **FedMamba-SALT** is to enable hospitals and clinical institutions to collaboratively train a high-quality medical image encoder **without sharing any patient data**. 
 
-We achieve this by optimizing a federated representation learning pipeline that employs a compact, state-space **Inception-Mamba** student model distilling knowledge from a frozen **MAE-pretrained ViT-B/16** teacher. To break past inherent representation ceilings, the framework implements cutting-edge techniques including **Centered & Standardised MSE Distillation**, **Dense Patch-Level Distillation**, and **EMA Self-Distillation**.
+We achieve this by optimizing a federated representation learning pipeline that employs a compact, state-space **Inception-Mamba** student model distilling knowledge from a frozen **MAE-pretrained ViT-B/16** teacher. The system is specifically engineered to overcome the representation collapse often seen in medical distillation, providing a highly efficient, CPU-deployable backbone for downstream clinical diagnostic tasks.
 
 ---
 
 ## 🚀 Key Innovations & Architectural Highlights
 
 ### 1. Centered & Standardised Distillation (SALT Loss)
-Medical imaging pathologies (e.g., microaneurysms) often constitute a microscopic fraction of the image, leading to a cosine similarity of >0.9996 between healthy and diseased embeddings. Standard distillation losses fail by merely learning the dominant shared structure. 
-**Our Solution:**
+Medical imaging pathologies (e.g., microaneurysms) often constitute a microscopic fraction of the image, leading to a cosine similarity of >0.9996 between healthy and diseased embeddings. Standard distillation losses fail by merely learning the dominant shared structural mean.
+**Our Solution (`objectives/salt_loss.py`):**
 - **Batch-center** embeddings to isolate the class-discriminative residual.
 - **Standardise** teacher residuals to amplify subtle disease signals by ~18×.
 - Align using **MSE** on standardised targets to ensure stable, $O(1)$ gradients without dimension collapse.
+- Incorporates **Covariance Regularisation** and **Variance Penalties** to guarantee robust representations.
 
 ### 2. Dense Patch-Level Distillation & Attention Pooling
-Traditional Global Average Pooling (GAP) destroys spatial variance, capping performance. FedMamba-SALT transitions to **Dense Spatial Distillation**, where the student predicts the teacher's dense spatial feature map (196 patches). During fine-tuning, **Attention-Pooling** adaptively weighs diagnostically relevant patches (e.g., lesions) to maximize clinical accuracy.
+Traditional Global Average Pooling (GAP) destroys spatial variance, capping performance. FedMamba-SALT transitions to **Dense Spatial Distillation**, where the student predicts the teacher's dense spatial feature map (196 individual patches) rather than a single global vector. During full fine-tuning, a custom **Attention-Pooling** classifier adaptively weighs diagnostically relevant patches to maximize clinical accuracy.
 
-### 3. EMA Self-Distillation (The Ceiling Breaker)
-To surpass the generic ImageNet-pretrained teacher's inherent performance ceiling (~78.96% on Retina), we introduce an Exponential Moving Average (EMA) self-distillation branch. 
-- The **frozen ViT teacher** provides a stable structural anchor.
-- The **EMA student** dynamically evolves, adapting to domain-specific retinal features, enabling the student to learn localized pathological markers that the ImageNet teacher misses.
-
-### 4. Asymmetric Knowledge Distillation
+### 3. Asymmetric Knowledge Distillation
+To force hard visual inference rather than trivial mimicry, we decouple the student and teacher views (`augmentations/medical_aug.py`):
 - **Teacher View (Minimal):** Processes clean images to extract pristine representations.
-- **Student View (Medical-Safe Augmentation):** Processes heavily corrupted views (blur, noise, color jitter). The student must reconstruct the pristine teacher features, forcing hard visual inference rather than trivial mimicry.
+- **Student View (Medical-Safe Augmentation):** Processes heavily corrupted views (blur, noise, color jitter) combined with **Latent Masking** (dropping 50% of tokens internally). The student must reconstruct the pristine teacher features from degraded inputs.
 
-### 5. Inception-Mamba Backbone
-- **Mamba State-Space Models (SSM):** Scales linearly $O(N)$ with sequence length, employing 4-directional cross-scanning (LR, RL, TB, BT) for global context.
-- **Inception Multi-Scale Convolutions:** Captures pathological features at multiple scales ($3\times3, 5\times5, 7\times7$ kernels).
-- **Efficiency:** 31.8M parameters (2.7× smaller than ViT-B) allowing rapid CPU inference (~90ms/image).
+### 4. Inception-Mamba Backbone
+The student encoder (`models/inception_mamba.py`) replaces standard self-attention with a highly efficient hybrid architecture:
+- **Mamba State-Space Models (SSM):** Scales linearly $O(N)$ with sequence length, employing 4-directional cross-scanning (Left-to-Right, Right-to-Left, Top-to-Bottom, Bottom-to-Top) for global context.
+- **Inception Multi-Scale Convolutions:** Captures pathological features at multiple scales ($3\times3, 5\times5, 7\times7$ spatial depthwise convolutions).
+- **Efficiency:** Only 31.8M parameters allowing rapid CPU inference (~90ms/image), significantly outperforming larger ViT alternatives.
 
 ---
 
@@ -68,9 +66,9 @@ fedmamba_salt/
 │   └── salt_loss.py            # Centered & Standardised MSE + Variance Guards
 ├── augmentations/
 │   ├── medical_aug.py          # Asymmetric dual-view augmentations
-│   └── retina_dataset.py       # SSL-FL format data loaders
+│   └── retina_dataset.py       # Retina dataset loader with splits
 ├── eval/
-│   └── linear_probe.py         # Linear probing & Full fine-tuning 
+│   └── linear_probe.py         # Linear probing & Full fine-tuning evaluation
 ├── configs/
 │   └── retina_centralized.yaml # Experiment configurations
 ├── tests/
@@ -79,7 +77,7 @@ fedmamba_salt/
 ├── scripts/
 │   └── run_centralized_retina.sh # End-to-end launch script
 ├── train_centralized.py        # Main centralized pre-training script
-└── requirements.txt            # Environment dependencies
+└── requirements.txt            # Pinned environment dependencies
 ```
 
 ---
@@ -104,6 +102,7 @@ pip install -r requirements.txt
 
 ### 2. Verify Installation
 
+Run the test suite to ensure the environment and custom loss functions are functioning properly:
 ```bash
 python -m tests.test_loss
 python -m tests.test_end_to_end
@@ -111,11 +110,12 @@ python -m tests.test_end_to_end
 
 ### 3. Data & Checkpoint Preparation
 
-- **Dataset**: Place your Retina dataset in `data/Retina/` with `train/`, `test/`, and `labels.csv`.
+- **Dataset**: Place your dataset in `data/Retina/` containing `train/`, `test/`, and a `labels.csv`.
 - **Teacher Model**: Download the MAE ViT-B/16 pretrained checkpoint to `data/ckpts/mae_vit_base.pth`.
 
 ### 4. Training (Centralized Pre-training)
 
+Start the representation learning process:
 ```bash
 python train_centralized.py \
     --config configs/retina_centralized.yaml \
@@ -126,6 +126,8 @@ python train_centralized.py \
 *Note: Training will automatically resume from `ckpt_latest.pth` if interrupted.*
 
 ### 5. Evaluation
+
+Evaluate the learned representations using either a linear probe or full end-to-end fine-tuning.
 
 **Linear Probe (Representation Quality):**
 ```bash
@@ -147,7 +149,7 @@ python -m eval.linear_probe \
 
 ---
 
-## 📊 Training Diagnostics & Success Criteria
+## 📊 Training Diagnostics & Health Indicators
 
 Monitor the following indicators during pre-training to ensure convergence and prevent representation collapse:
 
@@ -158,16 +160,14 @@ Monitor the following indicators during pre-training to ensure convergence and p
 | **Projector Std (`proj_std`)** | $> 0.01$ | $< 0.01$ | $0.0$ (Dead projector) |
 | **Teacher Std (`t_std`)** | $\sim 0.054$ (Stable) | Fluctuates | Ensure teacher is frozen |
 
-**Objective Success:** Fine-tuning accuracy must surpass the 81.93% centralized Fed-MAE baseline on the diagnostic test set.
-
 ---
 
-## 🛡️ Federated Learning Readiness & Hardware
+## 🛡️ Federated Learning Readiness
 
-FedMamba-SALT is strictly privacy-preserving. Only model weights are shared during federated rounds; patient data never leaves the hospital.
-
+FedMamba-SALT is specifically engineered for strict privacy-preserving environments:
+- **No Data Sharing:** Patient data never leaves the hospital. Only the lightweight student model weights are transmitted during federated rounds.
 - **Communication Efficiency:** $\sim 157$ MB per upload round (Student only).
-- **Client Requirements:** 4GB VRAM GPU (Batch size 64) for training; CPU-only for inference ($\sim 90$ms/image).
+- **Client Hardware:** 4GB VRAM GPU (Batch size 64) for training; CPU-only for downstream inference ($\sim 90$ms/image).
 
 ---
 
@@ -183,7 +183,3 @@ If this framework aids your research, please cite:
   url     = {https://github.com/mohamed-aliii/FedMamba-SALT}
 }
 ```
-
-<p align="center">
-  <em>Built for privacy-preserving, state-of-the-art medical AI research.</em>
-</p>
