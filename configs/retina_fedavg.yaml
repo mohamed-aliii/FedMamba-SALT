@@ -1,0 +1,52 @@
+# =============================================================================
+# FedMamba-SALT -- Retina Federated Experiment Configuration
+# =============================================================================
+#
+# Load this file with:
+#   python train_fedavg.py --config configs/retina_fedavg.yaml
+#
+# Algorithm toggle:
+#   mu: 0.0   → FedAvg (default)
+#   mu: 0.01  → FedProx
+#
+# CLI flags override YAML values.  For example:
+#   python train_fedavg.py --config configs/retina_fedavg.yaml --mu 0.01
+# =============================================================================
+
+# -- Data --
+data_path: "/path/to/retina"          # Change to actual dataset root
+teacher_ckpt: "data/ckpts/mae_vit_base.pth"
+
+# -- Output --
+output_dir: "outputs/fedavg"
+
+# -- Federated settings --
+n_clients: 5
+split_type: "split_1"                  # split_1, split_2, or split_3
+max_rounds: 200
+E_epoch: 1                            # Local epochs per round
+mu: 0.0                               # 0 = FedAvg, >0 = FedProx
+
+# -- Per-client training --
+batch_size: 128
+lr: 5.0e-4
+weight_decay: 0.05
+mask_ratio: 0.5                        # Internal latent masking
+
+# -- Infrastructure --
+num_workers: 4
+save_every: 10
+device: "cuda"
+
+# =============================================================================
+# Expected federated behavior
+# =============================================================================
+# Round   1:   loss ~ 0.5-1.0  (random init, each client sees partial data)
+# Round  50:   loss ~ 0.2-0.5  (clients converging)
+# Round 200:   loss ~ 0.05-0.2 (plateau)
+#
+# enc_std should stay > 0.1 across all clients.
+# Client loss variance should decrease over rounds (model alignment).
+#
+# Typical federated degradation: 1-3% vs centralized accuracy.
+# =============================================================================

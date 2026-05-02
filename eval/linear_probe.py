@@ -38,7 +38,7 @@ import torch.nn.functional as F
 from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, TensorDataset, Subset
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from torchvision import transforms
 import torchvision.transforms.functional as TF
 from tqdm import tqdm
@@ -600,7 +600,7 @@ def train_finetune(
             # --- Mixup ---
             images, targets_a, targets_b, lam = mixup_data(images, labels, MIXUP_ALPHA)
 
-            with autocast(enabled=(device == "cuda")):
+            with autocast(device_type="cuda", enabled=(device == "cuda")):
                 features = encoder(images)
                 logits = classifier(features)
                 loss = mixup_criterion(criterion, logits, targets_a, targets_b, lam)

@@ -184,6 +184,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs",       type=int,   default=100)
     parser.add_argument("--batch_size",   type=int,   default=128)
     parser.add_argument("--lr",           type=float, default=5e-4)
+    parser.add_argument("--mask_ratio",   type=float, default=0.5)
     parser.add_argument("--weight_decay", type=float, default=0.05)
     parser.add_argument("--num_workers",  type=int,   default=4)
     parser.add_argument("--save_every",   type=int,   default=10)
@@ -439,9 +440,19 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     scaler: torch.amp.GradScaler,
     device: str,
+    global_params: dict = None,
+    mu: float = 0.0,
+    mask_ratio: float = 0.5,
 ) -> tuple:
     """
     Run one epoch of SALT training.
+
+    Args:
+        global_params: If provided (FedProx mode), dict mapping param names
+                       to global parameter tensors. Used to compute the
+                       proximal penalty: (mu/2) * ||w - w_global||^2.
+        mu:            Proximal penalty strength. 0 = FedAvg (no penalty).
+
     Returns (avg_loss, avg_align, avg_var, avg_enc_std, avg_proj_std, avg_t_std).
     """
     student.train()
@@ -469,13 +480,24 @@ def train_one_epoch(
                 t_emb = teacher(teacher_view, return_patches=True)            # (B, 196, 768)
 
             # Student embedding with Internal Latent Masking (50% tokens dropped)
-            s_emb = student(student_view, return_patches=True, mask_ratio=0.5)                # (B, 196, 768)
+            s_emb = student(student_view, return_patches=True, mask_ratio=mask_ratio)                # (B, 196, 768)
             
             # Projection head
             s_proj = projector(s_emb)                                        # (B, 196, 768)
 
             # SALT loss (Cosine distillation + encoder variance guard)
             loss, align_loss, var_loss = salt_loss(s_proj, t_emb, s_emb)
+
+            # FedProx proximal term (only when mu > 0)
+            if mu > 0 and global_params is not None:
+                prox = torch.tensor(0.0, device=device)
+                for name, param in student.named_parameters():
+                    if param.requires_grad and name in global_params:
+                        prox = prox + (param - global_params[name].detach()).pow(2).sum()
+                for name, param in projector.named_parameters():
+                    if param.requires_grad and f"proj.{name}" in global_params:
+                        prox = prox + (param - global_params[f"proj.{name}"].detach()).pow(2).sum()
+                loss = loss + (mu / 2.0) * prox
 
         # ----- Collapse diagnostics (both encoder and projector) -----
         enc_std = embedding_std(s_emb.detach())
@@ -638,6 +660,7 @@ def main() -> None:
 
         avg_loss, avg_align, avg_var, avg_enc_std, avg_proj_std, avg_t_std = train_one_epoch(
             teacher, student, projector, dataloader, optimizer, scaler, args.device,
+            mask_ratio=args.mask_ratio,
         )
 
         # --- NaN safety ---
