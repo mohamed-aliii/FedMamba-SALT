@@ -55,6 +55,8 @@ from utils.fedavg import (
 # Constants
 # ======================================================================
 METRICS_FILENAME = "federated_metrics.csv"
+LOSS_PATIENCE = 25       # stop if loss doesn't improve for this many rounds
+LOSS_MIN_DELTA = 1e-5    # minimum improvement to count as progress
 
 
 # ======================================================================
@@ -345,9 +347,13 @@ def main():
 
     print(f"\n[4/4] Starting federated training from round {start_round}...")
     print(f"  Algorithm: {algo_name}")
-    print(f"  Early stopping: not applied (FL uses fixed rounds)")
+    print(f"  Early stopping: loss patience={LOSS_PATIENCE}")
     print("=" * 55)
     print()
+
+    # ----- Early stopping state -----
+    best_loss = float("inf")
+    rounds_no_improve = 0
 
     # ================================================================
     # Federated Training Loop
@@ -417,6 +423,19 @@ def main():
         if math.isnan(round_loss):
             print(f"\n  [ABORT] Round {comm_round + 1}: Loss is NaN. Stopping.")
             break
+
+        # Loss plateau early stopping
+        if round_loss < best_loss - LOSS_MIN_DELTA:
+            best_loss = round_loss
+            rounds_no_improve = 0
+        else:
+            rounds_no_improve += 1
+            if rounds_no_improve >= LOSS_PATIENCE:
+                print(
+                    f"\n  [EARLY STOP] Loss has not improved for {LOSS_PATIENCE} "
+                    f"rounds (best={best_loss:.6f}). Stopping training."
+                )
+                break
 
         # Collapse check
         if round_enc_std < 0.02:
