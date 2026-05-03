@@ -340,7 +340,9 @@ def main():
     logger = FedMetricsLogger(args.output_dir, args.n_clients)
 
     # ----- AMP Scaler -----
-    scaler = torch.amp.GradScaler("cuda", enabled=(args.device == "cuda"))
+    # REMOVE this from line 343:
+    # scaler = torch.amp.GradScaler("cuda", enabled=(args.device == "cuda"))
+    
 
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
@@ -385,6 +387,9 @@ def main():
             optimizer = AdamW(
                 client_params, lr=args.lr, weight_decay=args.weight_decay,
             )
+            
+            #Fresh scaler per client — fixes shared-state corruption
+            scaler = torch.amp.GradScaler("cuda", enabled=(args.device == "cuda"))
 
             # Local E epochs
             for local_epoch in range(args.E_epoch):
