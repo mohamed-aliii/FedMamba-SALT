@@ -33,6 +33,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR   # ← ADD THIS
 from torch.utils.data import DataLoader
 
 from augmentations.medical_aug import (
@@ -387,6 +388,14 @@ def main():
             optimizer = AdamW(
                 client_params, lr=args.lr, weight_decay=args.weight_decay,
             )
+
+            # Cosine decay: lr → eta_min over remaining rounds
+            scheduler = CosineAnnealingLR(
+                optimizer,
+                T_max=args.max_rounds - start_round,
+                eta_min=5e-5,
+                last_epoch=comm_round - start_round - 1,
+            )
             
             #Fresh scaler per client — fixes shared-state corruption
             scaler = torch.amp.GradScaler("cuda", enabled=(args.device == "cuda"))
@@ -413,6 +422,8 @@ def main():
         # ----- Broadcast back to clients -----
         broadcast_global_to_clients(global_student, client_students)
         broadcast_global_to_clients(global_projector, client_projectors)
+
+        scheduler.step()
 
         # ----- Round metrics -----
         round_loss = sum(
@@ -463,7 +474,8 @@ def main():
         )
 
         logger.log(
-            comm_round, round_loss, round_enc_std, args.lr,
+            comm_round, round_loss, round_enc_std,
+            scheduler.get_last_lr()[0], # logs actual decayed LR, not static args.lr
             round_time, gpu["gpu_mem_allocated_mb"], client_losses,
         )
 
