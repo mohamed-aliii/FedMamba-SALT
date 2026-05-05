@@ -508,7 +508,7 @@ def train_finetune(
     # lr/10 preserves the learned representations while allowing gentle
     # adaptation.  The classifier head gets the full LR since it starts
     # from random init.
-    encoder_lr = lr / 3.0
+    encoder_lr = lr / 10.0
     param_groups = [
         {"params": encoder.parameters(), "lr": encoder_lr},
         {"params": classifier.parameters(), "lr": lr},
