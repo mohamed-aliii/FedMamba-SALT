@@ -64,8 +64,8 @@ IMAGENET_STD = [0.229, 0.224, 0.225]
 FEDMAE_BASELINE = 81.93  # % accuracy, centralized baseline, Retina
 
 # Early stopping for fine-tuning
-FINETUNE_PATIENCE = 20  # stop if val_acc doesn't improve for this many epochs
-FINETUNE_WARMUP = 5     # warmup epochs for fine-tuning
+FINETUNE_PATIENCE = 30  # stop if val_acc doesn't improve for this many epochs
+FINETUNE_WARMUP = 1     # warmup epochs for fine-tuning
 
 # Mixup / CutMix
 MIXUP_ALPHA = 0.2       # Beta distribution parameter for Mixup (0.4 was too aggressive for 9K images)
@@ -508,23 +508,23 @@ def train_finetune(
     # lr/10 preserves the learned representations while allowing gentle
     # adaptation.  The classifier head gets the full LR since it starts
     # from random init.
-    encoder_lr = lr / 10.0
+    encoder_lr = lr / 3.0
     param_groups = [
         {"params": encoder.parameters(), "lr": encoder_lr},
         {"params": classifier.parameters(), "lr": lr},
     ]
-    optimizer = AdamW(param_groups, weight_decay=0.05)
+    optimizer = AdamW(param_groups, weight_decay=0.1)
     # Scheduler: warmup + cosine decay
     # We'll handle warmup manually in the loop
     scheduler = CosineAnnealingLR(optimizer, T_max=max(1, epochs - FINETUNE_WARMUP))
     
     # Apply class weights to aggressively prioritize harder disease classes.
     # We heavily weight non-zero classes to overcome the recall imbalance.
-    weights = [1.0] + [1.5] * (num_classes - 1)
+    weights = [1.0] + [2.0] * (num_classes - 1)
     class_weights = torch.tensor(weights, dtype=torch.float32, device=device)
     
     # [CURRENT SETTING]: Weighted Cross Entropy
-    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.05)
+    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
     
     # [ALTERNATIVE]: Focal Loss
     # To test Focal Loss, comment out the line above and uncomment the line below.
@@ -566,22 +566,18 @@ def train_finetune(
     for epoch in range(epochs):
         epoch_start = time.time()
 
-        # ---- Warmup (linear from lr/20 to target for first N epochs) ----
+        # ---- Warmup (1 epoch: classifier only, then unfreeze encoder) ----
         if epoch < FINETUNE_WARMUP:
             warmup_factor = (epoch + 1) / FINETUNE_WARMUP
             for pg_idx, pg in enumerate(optimizer.param_groups):
                 target_lr = encoder_lr if pg_idx == 0 else lr
-                # Freeze encoder during warmup to protect pretrained weights
                 if pg_idx == 0:
-                    pg["lr"] = 0.0
+                    pg["lr"] = 0.0   # freeze encoder for 1 epoch only
                 else:
-                    pg["lr"] = target_lr * warmup_factor * 0.1 + target_lr * warmup_factor * 0.9
-            
-            # Keep encoder in eval mode during freeze
+                    pg["lr"] = target_lr * warmup_factor
             encoder.eval()
         elif epoch == FINETUNE_WARMUP:
-            # RESTORE the target parameters so the optimizer and scheduler wake up!
-            # This is critical to actually unfreeze the encoder.
+            # Unfreeze encoder — restore target LRs
             optimizer.param_groups[0]["lr"] = encoder_lr
             optimizer.param_groups[1]["lr"] = lr
             encoder.train()
@@ -1579,4 +1575,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
