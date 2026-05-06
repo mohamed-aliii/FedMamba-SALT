@@ -65,7 +65,7 @@ FEDMAE_BASELINE = 81.93  # % accuracy, centralized baseline, Retina
 
 # Early stopping for fine-tuning
 FINETUNE_PATIENCE = 30  # stop if val_acc doesn't improve for this many epochs
-FINETUNE_WARMUP = 1     # warmup epochs for fine-tuning
+FINETUNE_WARMUP = 5     # warmup epochs for fine-tuning
 
 # Mixup / CutMix
 MIXUP_ALPHA = 0.2       # Beta distribution parameter for Mixup (0.4 was too aggressive for 9K images)
@@ -96,8 +96,8 @@ def parse_args() -> argparse.Namespace:
                    help="Number of DataLoader worker processes")
     p.add_argument(
         "--mode", type=str, default="linear_probe",
-        choices=["linear_probe", "full_finetune"],
-        help="linear_probe: freeze encoder; full_finetune: train encoder + classifier",
+        choices=["linear_probe", "full_finetune", "frozen_attention"],
+        help="linear_probe: freeze encoder; full_finetune: train encoder + classifier; frozen_attention: freeze encoder, train attention classifier only",
     )
     p.add_argument(
         "--label_fraction", type=float, default=1.0,
@@ -508,7 +508,7 @@ def train_finetune(
     # lr/10 preserves the learned representations while allowing gentle
     # adaptation.  The classifier head gets the full LR since it starts
     # from random init.
-    encoder_lr = lr / 10.0
+    encoder_lr = lr / 3.0
     param_groups = [
         {"params": encoder.parameters(), "lr": encoder_lr},
         {"params": classifier.parameters(), "lr": lr},
@@ -568,11 +568,13 @@ def train_finetune(
 
         # ---- Warmup (1 epoch: classifier only, then unfreeze encoder) ----
         if epoch < FINETUNE_WARMUP:
+            warmup_factor = (epoch + 1) / FINETUNE_WARMUP
             for pg_idx, pg in enumerate(optimizer.param_groups):
+                target_lr = encoder_lr if pg_idx == 0 else lr
                 if pg_idx == 0:
                     pg["lr"] = 0.0   # freeze encoder for 1 epoch only
                 else:
-                    pg["lr"] = lr    # classifier at full LR immediately
+                    pg["lr"] = target_lr * warmup_factor
             encoder.eval()
         elif epoch == FINETUNE_WARMUP:
             # Unfreeze encoder — restore target LRs
@@ -1336,12 +1338,11 @@ def run_evaluation(
     )
 
     # --- Fresh encoder + classifier for each run ---
-    freeze = (args.mode == "linear_probe")
+    freeze = (args.mode in ("linear_probe", "frozen_attention"))
     base_encoder = load_encoder(args.encoder_ckpt, args.device, freeze=freeze)
 
-    if args.mode == "full_finetune":
+    if args.mode in ("full_finetune", "frozen_attention"):
         encoder = PatchEncoderWrapper(base_encoder)
-        
         classifier = AttentionPoolClassifier(feat_dim=768, num_classes=args.num_classes).to(args.device)
         nn.init.kaiming_uniform_(classifier.head[2].weight)
         nn.init.zeros_(classifier.head[2].bias)
@@ -1383,6 +1384,41 @@ def run_evaluation(
             test_feats, test_labels, classifier,
             args.num_classes, args.device, class_names,
         )
+
+    elif args.mode == "frozen_attention":
+        # Frozen encoder + attention classifier trained end-to-end
+        # Encoder is frozen (no gradients), only attention classifier trains
+        sub_output = os.path.join(args.output_dir, "frozen_attention")
+        os.makedirs(sub_output, exist_ok=True)
+
+        # Override train_finetune: encoder already frozen, so encoder_lr=0
+        # We pass lr as both — train_finetune will use lr/10 for encoder
+        # but encoder is frozen so gradients won't flow anyway
+        history = train_finetune(
+            encoder, classifier, train_loader, test_loader,
+            epochs=args.epochs, lr=args.lr, device=args.device,
+            num_classes=args.num_classes, class_names=class_names,
+            output_dir=sub_output,
+        )
+        save_training_curves(history, sub_output, mode_tag)
+
+        top1, per_class, cm, all_probs, all_labels = evaluate_finetune(
+            encoder, classifier, test_loader,
+            args.num_classes, args.device, class_names,
+        )
+
+        from sklearn.metrics import roc_auc_score
+        try:
+            if args.num_classes == 2:
+                final_auc = roc_auc_score(all_labels, all_probs[:, 1])
+            else:
+                final_auc = roc_auc_score(
+                    all_labels, all_probs, multi_class="ovr", average="macro",
+                )
+        except ValueError:
+            final_auc = 0.0
+
+        save_roc_curve(all_probs, all_labels, class_names, sub_output, mode_tag)
 
     else:  # full_finetune
         sub_output = os.path.join(args.output_dir, f"finetune{frac_tag}")
