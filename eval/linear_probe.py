@@ -65,7 +65,7 @@ FEDMAE_BASELINE = 81.93  # % accuracy, centralized baseline, Retina
 
 # Early stopping for fine-tuning
 FINETUNE_PATIENCE = 30  # stop if val_acc doesn't improve for this many epochs
-FINETUNE_WARMUP = 5     # warmup epochs for fine-tuning
+FINETUNE_WARMUP = 35     # warmup epochs for fine-tuning
 
 # Mixup / CutMix
 MIXUP_ALPHA = 0.2       # Beta distribution parameter for Mixup (0.4 was too aggressive for 9K images)
