@@ -65,7 +65,7 @@ FEDMAE_BASELINE = 81.93  # % accuracy, centralized baseline, Retina
 
 # Early stopping for fine-tuning
 FINETUNE_PATIENCE = 30  # stop if val_acc doesn't improve for this many epochs
-FINETUNE_WARMUP = 35     # warmup epochs for fine-tuning
+FINETUNE_WARMUP = 1     # warmup epochs for fine-tuning
 
 # Mixup / CutMix
 MIXUP_ALPHA = 0.2       # Beta distribution parameter for Mixup (0.4 was too aggressive for 9K images)
@@ -508,7 +508,7 @@ def train_finetune(
     # lr/10 preserves the learned representations while allowing gentle
     # adaptation.  The classifier head gets the full LR since it starts
     # from random init.
-    encoder_lr = lr / 3.0
+    encoder_lr = lr / 10.0
     param_groups = [
         {"params": encoder.parameters(), "lr": encoder_lr},
         {"params": classifier.parameters(), "lr": lr},
