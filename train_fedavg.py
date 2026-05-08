@@ -181,7 +181,7 @@ def build_models(args):
     teacher = FrozenViTTeacher(ckpt_path=args.teacher_ckpt).to(args.device)
 
     student = InceptionMambaEncoder(
-        patch_size=16, embed_dim=384, depth=6, out_dim=768,
+        patch_size=16, embed_dim=448, depth=6, out_dim=768,
     ).to(args.device)
 
     projector = ProjectionHead(
