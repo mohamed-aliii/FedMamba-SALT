@@ -443,7 +443,7 @@ def train_one_epoch(
     global_params: dict = None,
     mu: float = 0.0,
     mask_ratio: float = 0.5,
-    grad_clip: float = 1.0,
+    grad_clip: float = 0.5,
 ) -> tuple:
     """
     Run one epoch of SALT training.
@@ -489,23 +489,24 @@ def train_one_epoch(
             # SALT loss (Cosine distillation + encoder variance guard)
             loss, align_loss, var_loss = salt_loss(s_proj, t_emb, s_emb)
 
-            # FedProx proximal term — computed in fp32 OUTSIDE autocast
-            # to prevent fp16 overflow from large parameter norm accumulation
-            # over 45M params: squared diffs can exceed fp16 max (65504)
+            # FedProx proximal term (only when mu > 0)
+            # CRITICAL: computed OUTSIDE autocast in fp32 to prevent fp16
+            # overflow. With 45M params, squared diffs accumulate to values
+            # that exceed fp16 max (65504), causing NaN at round 3-10.
             if mu > 0 and global_params is not None:
-                with torch.amp.autocast(device_type=device_type, enabled=False):
-                    prox = torch.tensor(0.0, device=device, dtype=torch.float32)
+                prox = torch.tensor(0.0, device=device, dtype=torch.float32)
+                with torch.amp.autocast('cuda', enabled=False):
                     for name, param in student.named_parameters():
                         if param.requires_grad and name in global_params:
-                            p = param.float()
-                            g = global_params[name].detach().float()
-                            prox = prox + (p - g).pow(2).sum()
+                            prox = prox + (
+                                param.float() - global_params[name].detach().float()
+                            ).pow(2).sum()
                     for name, param in projector.named_parameters():
                         if param.requires_grad and f"proj.{name}" in global_params:
-                            p = param.float()
-                            g = global_params[f"proj.{name}"].detach().float()
-                            prox = prox + (p - g).pow(2).sum()
-                loss = loss + (mu / 2.0) * prox
+                            prox = prox + (
+                                param.float() - global_params[f"proj.{name}"].detach().float()
+                            ).pow(2).sum()
+                loss = loss.float() + (mu / 2.0) * prox
 
         # ----- Collapse diagnostics (both encoder and projector) -----
         enc_std = embedding_std(s_emb.detach())
