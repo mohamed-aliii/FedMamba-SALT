@@ -1,30 +1,39 @@
 #!/usr/bin/env python
 """
-train_centralized.py -- Centralized SALT pre-training for FedMamba-SALT.
+train_fedavg.py -- Federated SALT pre-training for FedMamba-SALT.
 
-Trains a lightweight Inception-Mamba student encoder to match the embedding
-space of a frozen MAE-pretrained ViT-B/16 teacher.  The learning signal comes
-from asymmetric augmentation: the teacher sees a clean view while the student
-sees a heavily corrupted view of the same image.
+Orchestrates FedAvg / FedProx across N clients using sequential simulation.
+Each communication round:
+    1. For each client: load client data, train locally for E epochs
+    2. Weighted-average all client models into a global model
+    3. Broadcast global model back to all clients
+
+Supports both FedAvg (mu=0) and FedProx (mu>0) via the --mu flag.
+
+Learning rate schedule (per-round, applied to persistent per-client optimizers):
+    Phase 1 — Warmup  (rounds 0  → 4):         lr/5 → lr  (linear, 5 rounds)
+    Phase 2 — Flat    (rounds 5  → FLAT_ROUNDS): lr         (constant)
+    Phase 3 — Cosine  (rounds FLAT_ROUNDS → max_rounds): lr → lr*0.02
+
+    FLAT_ROUNDS = 5 + int(max_rounds * 0.25)  [FedAvg]
+    FLAT_ROUNDS = 5 + int(max_rounds * 0.15)  [FedProx]
+
+    e.g. max_rounds=200, FedAvg:  warmup=5, flat=55, cosine=145 rounds
+    e.g. max_rounds=200, FedProx: warmup=5, flat=35, cosine=165 rounds
 
 Usage:
-    python train_centralized.py --data_path /path/to/imagefolder --epochs 100
+    # FedAvg on split_1
+    python train_fedavg.py --config configs/retina_fedavg.yaml --split_type split_1
 
-Expected training behavior (healthy run)
-=========================================
-  Loss = SmoothL1(norm(s_proj), norm(t_emb)) + mag_loss + var_penalty(s_emb)
-  Epoch   1:  loss ~ 0.1-0.3  (random init, normalized mismatch)
-  Epoch  10:  loss ~ 0.01-0.1  (warmup complete, student converging)
-  Epoch  50:  loss ~ 0.005-0.05
-  Epoch 100:  loss ~ 0.002-0.02  (plateau)
+    # FedProx on split_1
+    python train_fedavg.py --config configs/retina_fedavg.yaml --split_type split_1 --mu 0.01
 
-  enc_std should stay > 0.1 (healthy encoder).
-  If enc_std < 0.02, the encoder is collapsing.
-=========================================
-
+Reference:
+    - SSL-FL (Yan et al.) run_mae_pretrain_FedAvg.py
 """
 
 import argparse
+import copy
 import csv
 import math
 import os
@@ -35,9 +44,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 
 from augmentations.medical_aug import (
     DualViewDataset, get_teacher_transform, get_student_transform,
@@ -45,107 +52,22 @@ from augmentations.medical_aug import (
 from augmentations.retina_dataset import RetinaDataset
 from models.inception_mamba import InceptionMambaEncoder
 from models.vit_teacher import FrozenViTTeacher
-from objectives.salt_loss import ProjectionHead, embedding_std, salt_loss
+from objectives.salt_loss import ProjectionHead, embedding_std
+from train_centralized import (
+    train_one_epoch, load_yaml_config, get_gpu_memory_mb,
+)
 from utils.ckpt_compat import safe_torch_load
+from utils.fedavg import (
+    average_models, broadcast_global_to_clients, compute_client_weights,
+)
+
 
 # ======================================================================
 # Constants
 # ======================================================================
-WARMUP_EPOCHS = 10
-COLLAPSE_RATIO = 0.2  # warn if student_std < teacher_std * this ratio
-METRICS_FILENAME = "training_metrics.csv"
-
-# Early stopping
-LOSS_PATIENCE = 25       # stop if loss doesn't improve for this many epochs
-COLLAPSE_STRIKES_MAX = 5 # abort if collapsed for this many consecutive epochs
+METRICS_FILENAME = "federated_metrics.csv"
+LOSS_PATIENCE = 35       # increased: warm-up phase can look flat for ~20 rounds
 LOSS_MIN_DELTA = 1e-4    # raised: 1e-5 was too tight, noise triggered false plateaus
-
-
-# ======================================================================
-# GPU memory tracking
-# ======================================================================
-def get_gpu_memory_mb() -> dict:
-    """
-    Return current and peak GPU memory usage in MB.
-    Returns zeros if CUDA is unavailable.
-    """
-    if not torch.cuda.is_available():
-        return {"gpu_mem_allocated_mb": 0.0, "gpu_mem_reserved_mb": 0.0, "gpu_mem_peak_mb": 0.0}
-    return {
-        "gpu_mem_allocated_mb": torch.cuda.memory_allocated() / (1024 ** 2),
-        "gpu_mem_reserved_mb": torch.cuda.memory_reserved() / (1024 ** 2),
-        "gpu_mem_peak_mb": torch.cuda.max_memory_allocated() / (1024 ** 2),
-    }
-
-
-# ======================================================================
-# CSV Metrics Logger
-# ======================================================================
-class MetricsLogger:
-    """
-    Append-mode CSV logger that writes one row per epoch.
-
-    Columns: epoch, loss, student_std, teacher_std, lr, epoch_time_s,
-             gpu_mem_allocated_mb, gpu_mem_reserved_mb, gpu_mem_peak_mb
-    """
-
-    COLUMNS = [
-        "epoch", "loss", "student_std", "teacher_std", "lr",
-        "epoch_time_s", "gpu_mem_allocated_mb", "gpu_mem_reserved_mb",
-        "gpu_mem_peak_mb",
-    ]
-
-    def __init__(self, output_dir: str):
-        self.path = os.path.join(output_dir, METRICS_FILENAME)
-        # Write header only if file doesn't exist (supports resume)
-        if not os.path.exists(self.path):
-            with open(self.path, "w", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(self.COLUMNS)
-
-    def log(self, epoch: int, loss: float, student_std: float,
-            teacher_std: float, lr: float, epoch_time: float,
-            gpu_mem: dict) -> None:
-        with open(self.path, "a", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                epoch + 1,
-                f"{loss:.6f}",
-                f"{student_std:.6f}",
-                f"{teacher_std:.6f}",
-                f"{lr:.2e}",
-                f"{epoch_time:.1f}",
-                f"{gpu_mem['gpu_mem_allocated_mb']:.1f}",
-                f"{gpu_mem['gpu_mem_reserved_mb']:.1f}",
-                f"{gpu_mem['gpu_mem_peak_mb']:.1f}",
-            ])
-
-
-# ======================================================================
-# YAML config loading
-# ======================================================================
-def load_yaml_config(path: str) -> dict:
-    """
-    Load a YAML config file and return a dict of key-value pairs.
-
-    Only keys that are valid argparse argument names are returned.
-    Unknown keys are silently skipped (they may be eval-only settings).
-    """
-    import yaml
-
-    try:
-        with open(path, "r") as f:
-            raw = yaml.safe_load(f)
-    except FileNotFoundError:
-        print(f"[ERROR] Config file not found: {path}")
-        raise
-
-    if not isinstance(raw, dict):
-        raise ValueError(
-            f"Expected YAML config to be a mapping (dict), got {type(raw).__name__}"
-        )
-
-    return raw
 
 
 # ======================================================================
@@ -153,637 +75,541 @@ def load_yaml_config(path: str) -> dict:
 # ======================================================================
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="FedMamba-SALT: Centralized self-supervised pre-training",
+        description="FedMamba-SALT: Federated SALT pre-training (FedAvg / FedProx)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # Config file (parsed first via two-pass approach)
-    parser.add_argument(
-        "--config", type=str, default=None,
-        help="Path to a YAML config file. Values from the file are used as "
-             "defaults; any CLI flags override them.",
-    )
+    # Config file
+    parser.add_argument("--config", type=str, default=None)
 
     # Data
-    parser.add_argument(
-        "--data_path", type=str, default=None,
-        help="Root of an ImageFolder dataset (must contain a train/ subdirectory)",
-    )
-    parser.add_argument(
-        "--teacher_ckpt", type=str, default="data/ckpts/mae_vit_base.pth",
-        help="Path to the MAE ViT-B/16 teacher checkpoint",
-    )
+    parser.add_argument("--data_path", type=str, default=None,
+                        help="Root of the dataset (e.g. data/Retina)")
+    parser.add_argument("--teacher_ckpt", type=str,
+                        default="data/ckpts/mae_vit_base.pth")
 
     # Output
-    parser.add_argument(
-        "--output_dir", type=str, default="outputs",
-        help="Directory to save training checkpoints",
-    )
+    parser.add_argument("--output_dir", type=str, default="outputs/fedavg")
 
-    # Training hyper-parameters
-    parser.add_argument("--epochs",       type=int,   default=100)
-    parser.add_argument("--batch_size",   type=int,   default=128)
-    parser.add_argument("--lr",           type=float, default=5e-4)
-    parser.add_argument("--mask_ratio",   type=float, default=0.5)
+    # Federated settings
+    parser.add_argument("--n_clients", type=int, default=5,
+                        help="Number of clients per split")
+    parser.add_argument("--split_type", type=str, default="split_1",
+                        help="Data split: split_1, split_2, split_3")
+    parser.add_argument("--max_rounds", type=int, default=200,
+                        help="Total communication rounds")
+    parser.add_argument("--E_epoch", type=int, default=2,
+                        help="Local training epochs per round per client")
+    parser.add_argument("--mu", type=float, default=0.0,
+                        help="FedProx proximal penalty. 0 = FedAvg, >0 = FedProx")
+
+    # Training hyper-parameters (per-client)
+    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--weight_decay", type=float, default=0.05)
-    parser.add_argument("--num_workers",  type=int,   default=4)
-    parser.add_argument("--save_every",   type=int,   default=10)
-    parser.add_argument("--device",       type=str,   default="cuda")
+    parser.add_argument("--grad_clip", type=float, default=1.0,
+                        help="Max gradient norm for clipping. 0 = disabled.")
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--save_every", type=int, default=10)
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--mask_ratio", type=float, default=0.5,
+                        help="Internal latent masking ratio for student")
 
-    # ------------------------------------------------------------------
-    # Two-pass parsing: extract --config first, load YAML, set defaults
-    # ------------------------------------------------------------------
+    # Two-pass config loading (same pattern as train_centralized.py)
     known, _ = parser.parse_known_args()
-
     if known.config is not None:
         yaml_dict = load_yaml_config(known.config)
-
-        # Filter to only keys that match valid argparse destinations
         valid_keys = {a.dest for a in parser._actions}
         filtered = {k: v for k, v in yaml_dict.items() if k in valid_keys}
-        skipped = {k for k in yaml_dict if k not in valid_keys}
-
         parser.set_defaults(**filtered)
 
-        if skipped:
-            print(f"[Config] Skipped non-training keys: {sorted(skipped)}")
-
-    # Full parse (CLI flags override YAML defaults)
     args = parser.parse_args()
-
-    # Validate that data_path was provided (either via CLI or YAML)
     if args.data_path is None:
         parser.error("--data_path is required (via CLI or YAML config)")
-
-    # Log loaded config
-    if args.config is not None:
-        print(f"[Config] Loaded from: {args.config}")
-        yaml_dict = load_yaml_config(args.config)
-        valid_keys = {a.dest for a in parser._actions}
-        for k, v in sorted(yaml_dict.items()):
-            if k in valid_keys:
-                actual = getattr(args, k, v)
-                override = " (overridden by CLI)" if actual != v else ""
-                print(f"  {k}: {v}{override}")
-
     return args
 
 
 # ======================================================================
-# Data
+# Build per-client DataLoaders
 # ======================================================================
-def build_dataloader(args: argparse.Namespace) -> DataLoader:
-    """Build the DualViewDataset + DataLoader from a RetinaDataset (SSL-FL format)."""
-    # Load the Retina dataset in SSL-FL format
-    base_ds = RetinaDataset(
-        data_path=args.data_path,
-        phase="train",
-        split_type="central",
-        split_csv="train.csv",
-    )
+def build_client_dataloaders(args) -> list:
+    """
+    Build one DataLoader per client using the split CSVs.
 
-    # Wrap with dual-view transforms using Retina normalization
-    dual_ds = DualViewDataset(
-        base_ds,
-        teacher_transform=get_teacher_transform(dataset="retina"),
-        student_transform=get_student_transform(dataset="retina"),
-    )
+    Path convention (matches SSL-FL):
+        data_path/5_clients/split_1/client_1.csv
+        data_path/5_clients/split_1/client_2.csv
+        ...
+    """
+    loaders = []
+    dataset_sizes = []
 
-    loader = DataLoader(
-        dual_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=True,
-        persistent_workers=args.num_workers > 0,
-    )
+    for client_id in range(1, args.n_clients + 1):
+        # Construct the CSV path relative to data_path
+        split_csv = os.path.join(
+            f"{args.n_clients}_clients", args.split_type,
+            f"client_{client_id}.csv",
+        )
 
-    print(f"Dataset: {len(base_ds)} images from {args.data_path}")
-    print(f"DataLoader: {len(loader)} batches of {args.batch_size}")
-    return loader
+        base_ds = RetinaDataset(
+            data_path=args.data_path,
+            phase="train",
+            split_type="federated",  # anything non-"central" triggers raw path
+            split_csv=split_csv,
+        )
+
+        dual_ds = DualViewDataset(
+            base_ds,
+            teacher_transform=get_teacher_transform(dataset="retina"),
+            student_transform=get_student_transform(dataset="retina"),
+        )
+
+        loader = DataLoader(
+            dual_ds,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=True,
+            persistent_workers=args.num_workers > 0,
+        )
+
+        loaders.append(loader)
+        dataset_sizes.append(len(base_ds))
+        print(f"  Client {client_id}: {len(base_ds)} images, "
+              f"{len(loader)} batches")
+
+    return loaders, dataset_sizes
 
 
 # ======================================================================
-# Models
+# Build models (reuses the same architecture as centralized)
 # ======================================================================
-def build_models(args: argparse.Namespace):
-    """Instantiate teacher, student, and projection head."""
-
-    # Teacher: frozen ViT-B/16 (checkpoint is required)
+def build_models(args):
+    """Instantiate teacher, global student, global projector."""
     if not os.path.isfile(args.teacher_ckpt):
         raise FileNotFoundError(
-            f"Teacher checkpoint not found: {args.teacher_ckpt}\n"
-            f"Download the MAE ViT-B/16 checkpoint and place it at this path.\n"
-            f"Training with random teacher weights produces meaningless results."
+            f"Teacher checkpoint not found: {args.teacher_ckpt}"
         )
     teacher = FrozenViTTeacher(ckpt_path=args.teacher_ckpt).to(args.device)
 
-    # Student: Inception-Mamba encoder (scaled up for capacity)
-    # Original: embed_dim=256, depth=4 -> 10M params (256->768 bottleneck)
-    # Scaled:   embed_dim=384, depth=6 -> ~32M params (use batch_size=256)
+    # FIX BUG 3: embed_dim corrected from 448 to 384 to match train_centralized.py.
+    # Mismatched embed_dim makes centralized and federated checkpoints incompatible
+    # and prevents meaningful comparison between the two training regimes.
     student = InceptionMambaEncoder(
-        patch_size=16, embed_dim=448, depth=6, out_dim=768,
+        patch_size=16, embed_dim=384, depth=6, out_dim=768,
     ).to(args.device)
 
-
-    # Projection head: BYOL-style MLP (LayerNorm, federated-safe)
     projector = ProjectionHead(
         in_dim=768, hidden_dim=2048, out_dim=768,
     ).to(args.device)
 
-    # -------------------------------------------------------------------
-    # Verify teacher is fully frozen
-    # -------------------------------------------------------------------
-    teacher_trainable = sum(
-        p.numel() for p in teacher.parameters() if p.requires_grad
-    )
-    assert teacher_trainable == 0, (
-        f"Teacher has {teacher_trainable} trainable params -- should be 0!"
-    )
-
-    # -------------------------------------------------------------------
-    # Print trainable parameter counts
-    # -------------------------------------------------------------------
-    student_params = sum(p.numel() for p in student.parameters() if p.requires_grad)
-    proj_params = sum(p.numel() for p in projector.parameters() if p.requires_grad)
-    total_params = student_params + proj_params
-
+    student_params = sum(p.numel() for p in student.parameters())
+    proj_params = sum(p.numel() for p in projector.parameters())
     print(f"\n{'='*55}")
-    print(f"  Teacher (frozen): {sum(p.numel() for p in teacher.parameters()) / 1e6:.2f}M params")
+    print(f"  Teacher (frozen): "
+          f"{sum(p.numel() for p in teacher.parameters()) / 1e6:.2f}M params")
     print(f"  Student encoder:  {student_params / 1e6:.2f}M trainable params")
     print(f"  Projection head:  {proj_params / 1e6:.2f}M trainable params")
-    print(f"  Total trainable:  {total_params / 1e6:.2f}M params")
     print(f"{'='*55}\n")
 
     return teacher, student, projector
 
 
 # ======================================================================
-# Optimizer & Scheduler
+# Snapshot global params for FedProx
 # ======================================================================
-def build_optimizer_and_scheduler(
-    student: nn.Module,
-    projector: nn.Module,
-    args: argparse.Namespace,
-):
+def snapshot_global_params(student, projector):
     """
-    AdamW on student + projector params only (teacher excluded).
-    LR schedule: 10-epoch linear warmup (lr/10 -> lr) followed by
-    cosine annealing over the remaining epochs.
+    Create a detached copy of global model params for FedProx proximal term.
+    Keys are prefixed so student and projector params don't collide.
     """
-    params = list(student.parameters()) + list(projector.parameters())
-
-    optimizer = AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
-
-    # Linear warmup: start_factor=0.1 means lr starts at lr*0.1
-    warmup = LinearLR(
-        optimizer,
-        start_factor=1.0 / 10.0,
-        total_iters=WARMUP_EPOCHS,
-    )
-    # Cosine annealing over the remaining epochs
-    cosine = CosineAnnealingLR(
-        optimizer,
-        T_max=max(1, args.epochs - WARMUP_EPOCHS),
-    )
-    # Compose: warmup for first WARMUP_EPOCHS, then cosine
-    scheduler = SequentialLR(
-        optimizer,
-        schedulers=[warmup, cosine],
-        milestones=[WARMUP_EPOCHS],
-    )
-
-    return optimizer, scheduler
+    params = {}
+    for name, param in student.named_parameters():
+        if param.requires_grad:
+            params[name] = param.detach().clone()
+    for name, param in projector.named_parameters():
+        if param.requires_grad:
+            params[f"proj.{name}"] = param.detach().clone()
+    return params
 
 
 # ======================================================================
 # Checkpointing
 # ======================================================================
-def save_checkpoint(
-    student: nn.Module,
-    projector: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scheduler,
-    epoch: int,
-    loss: float,
-    output_dir: str,
-    name: str,
-) -> None:
-    """Save a training checkpoint."""
+def save_fed_checkpoint(
+    global_student, global_projector,
+    comm_round, loss, output_dir, name,
+):
+    """Save a federated training checkpoint."""
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, name)
-    torch.save(
-        {
-            "epoch": epoch,
-            "loss": loss,
-            "dense_distillation": True,
-            "student_state_dict": student.state_dict(),
-            "projector_state_dict": projector.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-        },
-        path,
-    )
+    torch.save({
+        "comm_round": comm_round,
+        "loss": loss,
+        "dense_distillation": True,
+        "student_state_dict": global_student.state_dict(),
+        "projector_state_dict": global_projector.state_dict(),
+    }, path)
 
 
-def try_resume(
-    output_dir: str,
-    student: nn.Module,
-    projector: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scheduler,
-    device: str,
-) -> tuple[int, float]:
-    """
-    If ckpt_latest.pth exists in output_dir, resume from it.
-    Returns (start_epoch, last_loss).
-    """
-    latest_path = os.path.join(output_dir, "ckpt_latest.pth")
-    if not os.path.isfile(latest_path):
-        return 0, 0.0
+def try_resume_fed(output_dir, global_student, global_projector, device):
+    """Resume from ckpt_latest.pth if it exists. Returns start_round."""
+    latest = os.path.join(output_dir, "ckpt_latest.pth")
+    if not os.path.isfile(latest):
+        return 0
 
-    print(f"[RESUME] Loading checkpoint: {latest_path}")
-    ckpt = safe_torch_load(latest_path, map_location=device)
+    print(f"[RESUME] Loading: {latest}")
+    ckpt = safe_torch_load(latest, map_location=device)
+    if "student_state_dict" not in ckpt:
+        return 0
 
-    # Safety: skip incompatible checkpoints from before ProjectionHead was restored
-    if "projector_state_dict" not in ckpt:
-        print("[RESUME] Checkpoint is from an older architecture (no projector). Starting fresh.")
-        return 0, 0.0
+    global_student.load_state_dict(ckpt["student_state_dict"])
+    global_projector.load_state_dict(ckpt["projector_state_dict"])
 
-    # Safety: skip checkpoints from old GAP-level distillation
-    # (projector was trained on (B, 768) GAP vectors; dense distillation
-    # needs projector trained on (B, 196, 768) patch tokens)
-    if not ckpt.get("dense_distillation", False):
-        print("[RESUME] Checkpoint is from GAP-level distillation (not dense). Starting fresh.")
-        return 0, 0.0
-
-    student.load_state_dict(ckpt["student_state_dict"])
-    projector.load_state_dict(ckpt["projector_state_dict"])
-    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-    scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-
-    start_epoch = ckpt["epoch"] + 1  # resume from the NEXT epoch
-    prev_loss = ckpt["loss"]
-    print(f"[RESUME] Resuming from epoch {start_epoch} (prev loss: {prev_loss:.4f})")
-    return start_epoch, prev_loss
+    start_round = ckpt["comm_round"] + 1
+    print(f"[RESUME] Resuming from round {start_round}")
+    return start_round
 
 
 # ======================================================================
-# Training loop (one epoch)
+# Federated Metrics Logger
 # ======================================================================
-def train_one_epoch(
-    teacher: nn.Module,
-    student: nn.Module,
-    projector: nn.Module,
-    dataloader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    scaler: torch.amp.GradScaler,
-    device: str,
-    global_params: dict = None,
-    mu: float = 0.0,
-    mask_ratio: float = 0.5,
-    grad_clip: float = 0.5,
-) -> tuple:
-    """
-    Run one epoch of SALT training.
+class FedMetricsLogger:
+    # FIX BUG 6: Removed the hardcoded `[f"client_{i}_loss" for i in range(1, 6)]`
+    # suffix from the class-level COLUMNS list. It always emitted exactly 5 client
+    # columns regardless of n_clients, causing mismatches for any other client count.
+    # The per-instance __init__ now builds the full column list dynamically.
+    BASE_COLUMNS = [
+        "round", "avg_loss", "avg_enc_std", "lr",
+        "round_time_s", "gpu_mb",
+    ]
 
-    Args:
-        global_params: If provided (FedProx mode), dict mapping param names
-                       to global parameter tensors. Used to compute the
-                       proximal penalty: (mu/2) * ||w - w_global||^2.
-        mu:            Proximal penalty strength. 0 = FedAvg (no penalty).
+    def __init__(self, output_dir, n_clients):
+        self.path = os.path.join(output_dir, METRICS_FILENAME)
+        self.n_clients = n_clients
+        # Build full column list dynamically based on actual n_clients
+        cols = self.BASE_COLUMNS + [
+            f"client_{i}_loss" for i in range(1, n_clients + 1)
+        ]
+        if not os.path.exists(self.path):
+            with open(self.path, "w", newline="") as f:
+                csv.writer(f).writerow(cols)
 
-    Returns (avg_loss, avg_align, avg_var, avg_enc_std, avg_proj_std, avg_t_std).
-    """
-    student.train()
-    projector.train()
-    # teacher stays in eval() permanently (enforced inside its forward())
-
-    total_loss = 0.0
-    total_align = 0.0
-    total_var = 0.0
-    total_enc_std = 0.0
-    total_proj_std = 0.0
-    total_t_std = 0.0
-    n_batches = 0
-
-    pbar = tqdm(dataloader, desc="  Batches", leave=False, ncols=90)
-    for teacher_view, student_view in pbar:
-        teacher_view = teacher_view.to(device, non_blocking=True)
-        student_view = student_view.to(device, non_blocking=True)
-        device_type = "cuda" if "cuda" in str(device) else "cpu"
-
-        # ----- Mixed Precision Forward Pass -----
-        with torch.amp.autocast(device_type=device_type, enabled=True):
-            # Teacher embedding (frozen, no gradient)
-            with torch.no_grad():
-                t_emb = teacher(teacher_view, return_patches=True)            # (B, 196, 768)
-
-            # Student embedding with Internal Latent Masking (50% tokens dropped)
-            s_emb = student(student_view, return_patches=True, mask_ratio=mask_ratio)                # (B, 196, 768)
-            
-            # Projection head
-            s_proj = projector(s_emb)                                        # (B, 196, 768)
-
-            # SALT loss (Cosine distillation + encoder variance guard)
-            loss, align_loss, var_loss = salt_loss(s_proj, t_emb, s_emb)
-
-            # FedProx proximal term (only when mu > 0)
-            # CRITICAL: computed OUTSIDE autocast in fp32 to prevent fp16
-            # overflow. With 45M params, squared diffs accumulate to values
-            # that exceed fp16 max (65504), causing NaN at round 3-10.
-            # FIX BUG 4: Use `device_type` variable (not hardcoded 'cuda') so
-            # this branch works correctly on CPU as well as CUDA.
-            if mu > 0 and global_params is not None:
-                prox = torch.tensor(0.0, device=device, dtype=torch.float32)
-                with torch.amp.autocast(device_type, enabled=False):
-                    for name, param in student.named_parameters():
-                        if param.requires_grad and name in global_params:
-                            prox = prox + (
-                                param.float() - global_params[name].detach().float()
-                            ).pow(2).sum()
-                    for name, param in projector.named_parameters():
-                        if param.requires_grad and f"proj.{name}" in global_params:
-                            prox = prox + (
-                                param.float() - global_params[f"proj.{name}"].detach().float()
-                            ).pow(2).sum()
-                loss = loss.float() + (mu / 2.0) * prox
-
-        # ----- Collapse diagnostics (both encoder and projector) -----
-        enc_std = embedding_std(s_emb.detach())
-        proj_std = embedding_std(s_proj.detach())
-        t_std = embedding_std(t_emb.detach())
-
-        # ----- Backward pass with Dynamic Loss Scaling -----
-        optimizer.zero_grad()
-        scaler.scale(loss).backward()
-        
-        # Unscale before clipping
-        scaler.unscale_(optimizer)
-        if grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(
-                list(student.parameters()) + list(projector.parameters()),
-                max_norm=grad_clip,
-            )
-
-        # FIX BUG 5: Capture grad norm AFTER unscale but BEFORE zero_grad,
-        # so gradients are actually present. This replaces the stale post-loop
-        # debug block in train_fedavg.py that always printed 0.0.
-        total_norm = 0.0
-        for p in list(student.parameters()) + list(projector.parameters()):
-            if p.grad is not None:
-                total_norm += p.grad.data.norm(2).item() ** 2
-        total_norm = total_norm ** 0.5
-        
-        scaler.step(optimizer)
-        scaler.update()
-
-        # ----- Accumulate metrics -----
-        total_loss += loss.item()
-        total_align += align_loss.item()
-        total_var += var_loss.item()
-        total_enc_std += enc_std
-        total_proj_std += proj_std
-        total_t_std += t_std
-        n_batches += 1
-
-        pbar.set_postfix(
-            loss=f"{loss.item():.4f}",
-            align=f"{align_loss.item():.4f}",
-            enc=f"{enc_std:.3f}",
-            grad=f"{total_norm:.3f}",
-        )
-
-    avg_loss = total_loss / max(1, n_batches)
-    avg_align = total_align / max(1, n_batches)
-    avg_var = total_var / max(1, n_batches)
-    avg_enc_std = total_enc_std / max(1, n_batches)
-    avg_proj_std = total_proj_std / max(1, n_batches)
-    avg_t_std = total_t_std / max(1, n_batches)
-
-    return avg_loss, avg_align, avg_var, avg_enc_std, avg_proj_std, avg_t_std
+    def log(self, round_num, avg_loss, avg_enc_std, lr,
+            round_time, gpu_mb, client_losses):
+        with open(self.path, "a", newline="") as f:
+            row = [
+                round_num + 1, f"{avg_loss:.6f}", f"{avg_enc_std:.4f}",
+                f"{lr:.2e}", f"{round_time:.1f}", f"{gpu_mb:.0f}",
+            ] + [f"{cl:.6f}" for cl in client_losses]
+            csv.writer(f).writerow(row)
 
 
 # ======================================================================
 # Main
 # ======================================================================
-def main() -> None:
+def main():
     args = parse_args()
+    algo_name = "FedProx" if args.mu > 0 else "FedAvg"
 
     print("=" * 55)
-    print("  FedMamba-SALT: Centralized Pre-training")
+    print(f"  FedMamba-SALT: Federated Pre-training ({algo_name})")
     print("=" * 55)
-    print(f"  Device:     {args.device}")
-    print(f"  Epochs:     {args.epochs}")
+    print(f"  Split:      {args.split_type}")
+    print(f"  Clients:    {args.n_clients}")
+    print(f"  Rounds:     {args.max_rounds}")
+    print(f"  E_epoch:    {args.E_epoch}")
+    print(f"  mu:         {args.mu}")
     print(f"  Batch size: {args.batch_size}")
     print(f"  LR:         {args.lr}")
-    print(f"  Warmup:     {WARMUP_EPOCHS} epochs (lr/{10} -> lr)")
+    print(f"  Grad clip:  {args.grad_clip}")
+    print(f"  Device:     {args.device}")
     print(f"  Output:     {args.output_dir}")
     print()
 
-    # ----- Build components -----
-    dataloader = build_dataloader(args)
-    teacher, student, projector = build_models(args)
-    optimizer, scheduler = build_optimizer_and_scheduler(student, projector, args)
+    os.makedirs(args.output_dir, exist_ok=True)
 
-    # ----- Resume from checkpoint if available -----
-    start_epoch, avg_loss = try_resume(
-        args.output_dir, student, projector, optimizer, scheduler, args.device,
+    # ----- Build components -----
+    print("[1/4] Building client dataloaders...")
+    client_loaders, dataset_sizes = build_client_dataloaders(args)
+    client_weights = compute_client_weights(dataset_sizes)
+    print(f"  Client weights: {[f'{w:.3f}' for w in client_weights]}")
+    print()
+
+    print("[2/4] Building models...")
+    teacher, global_student, global_projector = build_models(args)
+
+    # ----- Resume -----
+    start_round = try_resume_fed(
+        args.output_dir, global_student, global_projector, args.device,
     )
 
-    # ----- Auto-extend epochs if checkpoint already reached target -----
-    # Determine the originally planned epochs from the loaded scheduler
-    try:
-        old_warmup = scheduler.schedulers[0].total_iters
-        old_t_max = scheduler.schedulers[1].T_max
-        old_target_epochs = old_warmup + old_t_max
-    except AttributeError:
-        # Fallback if scheduler structure unexpectedly changes
-        old_target_epochs = args.epochs
+    # ----- Create per-client model copies -----
+    print("[3/4] Creating client model copies...")
+    client_students = [
+        copy.deepcopy(global_student) for _ in range(args.n_clients)
+    ]
+    client_projectors = [
+        copy.deepcopy(global_projector) for _ in range(args.n_clients)
+    ]
 
-    if start_epoch >= old_target_epochs:
-        if args.epochs <= start_epoch:
-            # User ran with default epochs, auto-extend by original length
-            extra = old_target_epochs
-            new_target = start_epoch + extra
-        else:
-            # User explicitly provided a larger --epochs target
-            extra = args.epochs - start_epoch
-            new_target = args.epochs
+    # Broadcast global params to all clients
+    broadcast_global_to_clients(global_student, client_students)
+    broadcast_global_to_clients(global_projector, client_projectors)
 
-        resume_lr = args.lr / 10.0  # reduced LR to avoid NaN from optimizer state shock
-        resume_warmup = 5           # short warmup ramp
-        print(
-            f"[RESUME] Checkpoint reached end of previous {old_target_epochs}-epoch schedule.\n"
-            f"         Extending training target to {new_target} epochs "
-            f"(+{extra} additional).\n"
-            f"         Resume LR: {resume_lr:.1e} (base/10) with "
-            f"{resume_warmup}-epoch warmup + cosine decay."
+    # ------------------------------------------------------------------
+    # SCHEDULER FIX A: Create one persistent optimizer + scaler per client.
+    # Previously these were re-created every round, discarding AdamW's m/v
+    # momentum buffers. A fresh optimizer at low LR (late cosine phase)
+    # spends most of the E_epoch local steps rebuilding momentum from zero,
+    # making the cosine decay largely ineffective. Persisting the optimizer
+    # lets momentum accumulate across rounds so late-round LR reductions
+    # actually produce the precision fine-tuning they are supposed to.
+    # ------------------------------------------------------------------
+    client_optimizers = [
+        AdamW(
+            list(client_students[i].parameters())
+            + list(client_projectors[i].parameters()),
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            betas=(0.9, 0.999),
         )
-        args.epochs = new_target
-
-        # Set LR to the reduced resume value (full base LR causes NaN
-        # because AdamW variance buffers are calibrated for near-zero LR).
-        # MUST also reset initial_lr — PyTorch schedulers use this as
-        # the base for all multiplier calculations, not the current lr.
-        for pg in optimizer.param_groups:
-            pg["lr"] = resume_lr
-            pg["initial_lr"] = resume_lr
-
-        # Short warmup (lr/5 -> lr) then cosine over remaining epochs
-        warmup = LinearLR(
-            optimizer, start_factor=0.2, total_iters=resume_warmup,
-        )
-        cosine = CosineAnnealingLR(
-            optimizer, T_max=max(1, extra - resume_warmup),
-        )
-        scheduler = SequentialLR(
-            optimizer,
-            schedulers=[warmup, cosine],
-            milestones=[resume_warmup],
-        )
-
-    # ----- Training loop -----
-    # Expected loss trajectory (healthy training, Cosine Similarity):
-    #   Loss = (1 - cos_sim(norm(s_proj), norm(t_emb))) + var_penalty(s_emb)
-    #   Epoch   1: ~0.5-0.9  (random init, low angular alignment)
-    #   Epoch  10: ~0.2-0.5  (warmup complete, student converging)
-    #   Epoch  50: ~0.05-0.2
-    #   Epoch 100: ~0.01-0.1  (plateau)
-    #
-    # Collapse detection (on ENCODER output, not projector):
-    #   enc_std should stay > 0.1 (healthy encoder).
-    #   If enc_std < 0.02, the encoder is collapsing.
+        for i in range(args.n_clients)
+    ]
+    # One scaler per client — AMP state (scale factor, growth tracker) is
+    # now also preserved across rounds, avoiding scale resets every round.
+    client_scalers = [
+        torch.amp.GradScaler("cuda", enabled=(args.device == "cuda"))
+        for _ in range(args.n_clients)
+    ]
 
     # ----- Metrics logger -----
-    metrics_logger = MetricsLogger(args.output_dir)
+    logger = FedMetricsLogger(args.output_dir, args.n_clients)
 
-    print(f"\n{'='*55}")
-    print(f"  Starting training from epoch {start_epoch}")
-    print(f"  Early stopping: loss patience={LOSS_PATIENCE}, "
-          f"collapse strikes={COLLAPSE_STRIKES_MAX}")
-    print(f"{'='*55}\n")
-
-    # ----- Automated Mixed Precision -----
-    scaler = torch.amp.GradScaler("cuda", enabled=(args.device == "cuda"))
-
-    # Reset peak GPU memory counter for accurate per-run tracking
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
 
+    print(f"\n[4/4] Starting federated training from round {start_round}...")
+    print(f"  Algorithm: {algo_name}")
+    print(f"  Early stopping: loss patience={LOSS_PATIENCE}")
+    # Print schedule summary so it's visible in Colab logs
+    _warmup_r = 5
+    _flat_r   = _warmup_r + int(args.max_rounds * (0.15 if args.mu > 0 else 0.25))
+    print(f"  LR schedule:  warmup={_warmup_r}r | flat={_flat_r - _warmup_r}r "
+          f"| cosine={args.max_rounds - _flat_r}r | eta_min={args.lr * 0.02:.1e}")
+    print("=" * 55)
+    print()
+
     # ----- Early stopping state -----
     best_loss = float("inf")
-    epochs_no_improve = 0
-    collapse_strikes = 0
+    best_round = 0
+    rounds_no_improve = 0
 
-    # FIX BUG 2: Initialize avg_loss before the loop so the final summary
-    # print never raises NameError when the loop body is skipped entirely
-    # (e.g. start_epoch >= args.epochs on entry).
-    avg_loss = 0.0
+    # FIX BUG 7: Use a local list instead of attaching state to `args`.
+    # Mutating args is fragile: if main() is called more than once (tests,
+    # notebooks), the history carries over from the prior run, corrupting the
+    # starvation detector. A local variable is reset correctly on every call.
+    loss_history: list = []
 
-    for epoch in range(start_epoch, args.epochs):
-        t0 = time.time()
+    # ================================================================
+    # Federated Training Loop
+    # ================================================================
+    for comm_round in range(start_round, args.max_rounds):
+        round_start = time.time()
+        client_losses = []
+        client_enc_stds = []
 
-        avg_loss, avg_align, avg_var, avg_enc_std, avg_proj_std, avg_t_std = train_one_epoch(
-            teacher, student, projector, dataloader, optimizer, scaler, args.device,
-            mask_ratio=args.mask_ratio,
+        # Snapshot global params for FedProx (before any client trains)
+        if args.mu > 0:
+            global_params = snapshot_global_params(
+                global_student, global_projector,
+            )
+        else:
+            global_params = None
+
+
+        # ------------------------------------------------------------------
+        # SCHEDULER FIX B: Scale flat phase proportionally to max_rounds.
+        # Previously hardcoded to 30/50 regardless of max_rounds — a 100-round
+        # run wasted 50% of training at full LR; a 300-round run barely decayed.
+        # Now: FedAvg=25%, FedProx=15% of max_rounds (same relative budget).
+        #
+        # SCHEDULER FIX C: Add a 5-round linear warmup before the flat phase.
+        # Round 1 with random init + full LR is the most unstable moment.
+        # A short ramp (lr/5 → lr) prevents early divergence without
+        # meaningfully delaying convergence.
+        #
+        # SCHEDULER FIX D: Lower eta_min from lr×0.1 to lr×0.02 so the model
+        # can fully converge in late rounds instead of plateauing at 5e-5.
+        # Persistent optimizer (Fix A) makes low LR effective now.
+        # ------------------------------------------------------------------
+        WARMUP_ROUNDS = 5
+        FLAT_RATIO    = 0.15 if args.mu > 0 else 0.25
+        FLAT_ROUNDS   = WARMUP_ROUNDS + int(args.max_rounds * FLAT_RATIO)
+        eta_min       = args.lr * 0.02   # was 0.1; lower floor for full convergence
+
+        if comm_round < WARMUP_ROUNDS:
+            # Linear warmup: lr/5 → lr over first 5 rounds
+            current_lr = args.lr * (comm_round + 1) / WARMUP_ROUNDS
+        elif comm_round < FLAT_ROUNDS:
+            # Flat phase at full LR
+            current_lr = args.lr
+        else:
+            # Cosine decay from lr → eta_min over remaining rounds
+            t_cur   = comm_round - FLAT_ROUNDS
+            T_decay = max(1, args.max_rounds - FLAT_ROUNDS)
+            current_lr = eta_min + 0.5 * (args.lr - eta_min) * (
+                1 + math.cos(math.pi * t_cur / T_decay)
+            )
+        
+        # ----- Local training for each client -----
+        for client_id in range(args.n_clients):
+            client_student   = client_students[client_id]
+            client_projector = client_projectors[client_id]
+            client_loader    = client_loaders[client_id]
+            optimizer        = client_optimizers[client_id]
+            scaler           = client_scalers[client_id]
+
+            # SCHEDULER FIX A (continued): Update LR in-place on the
+            # persistent optimizer rather than creating a new one.
+            # This is the standard PyTorch pattern used by all LR schedulers
+            # internally — momentum buffers are untouched, only lr changes.
+            for pg in optimizer.param_groups:
+                pg["lr"] = current_lr
+
+            # Local E epochs
+            for local_epoch in range(args.E_epoch):
+                metrics = train_one_epoch(
+                    teacher, client_student, client_projector,
+                    client_loader, optimizer, scaler, args.device,
+                    global_params=global_params,
+                    mu=args.mu,
+                    mask_ratio=args.mask_ratio,
+                    grad_clip=args.grad_clip,
+                )
+                avg_loss = metrics[0]
+                avg_enc_std = metrics[3]
+
+            client_losses.append(avg_loss)
+            client_enc_stds.append(avg_enc_std)
+
+        # ----- FedAvg aggregation -----
+        average_models(global_student, client_students, client_weights)
+        average_models(global_projector, client_projectors, client_weights)
+
+        # ----- Broadcast back to clients -----
+        broadcast_global_to_clients(global_student, client_students)
+        broadcast_global_to_clients(global_projector, client_projectors)
+
+
+        # ----- Round metrics -----
+        round_loss = sum(
+            w * l for w, l in zip(client_weights, client_losses)
         )
+        round_enc_std = sum(
+            w * s for w, s in zip(client_weights, client_enc_stds)
+        )
+        round_time = time.time() - round_start
+        gpu = get_gpu_memory_mb()
 
-        # --- NaN safety ---
-        if math.isnan(avg_loss):
-            print("\n  [ABORT] Loss is NaN -- training diverged. Stopping.")
+        # ----- Gradient starvation detection -----
+        loss_history.append(round_loss)
+        if len(loss_history) >= 5 and comm_round > 20:
+            recent_drop = loss_history[-5] - loss_history[-1]
+            drop_per_round = recent_drop / 5
+            if drop_per_round < 0.001:
+                print(
+                    f"  [STARVATION] Round {comm_round + 1}: "
+                    f"avg drop={drop_per_round:.5f}/round over last 5 rounds. "
+                    f"Consider reducing mu from {args.mu} to {args.mu * 0.2:.3f}"
+                )
+
+        # FIX BUG 5: The grad norm debug block was here but ran AFTER
+        # train_one_epoch() which already called optimizer.zero_grad() internally.
+        # All .grad attributes were None, so it always printed 0.0000.
+        # Grad norm is now captured inside train_one_epoch() (before zero_grad)
+        # and surfaced via the tqdm postfix when comm_round < 15.
+
+        # NaN check
+        if math.isnan(round_loss):
+            print(f"\n  [ABORT] Round {comm_round + 1}: Loss is NaN. Stopping.")
             break
 
-        # Step the LR scheduler (once per epoch)
-        scheduler.step()
-        current_lr = optimizer.param_groups[0]["lr"]
-        elapsed = time.time() - t0
-        gpu_mem = get_gpu_memory_mb()
+        # Loss plateau early stopping
+        if round_loss < best_loss - LOSS_MIN_DELTA:
+            best_loss = round_loss
+            best_round = comm_round + 1
+            rounds_no_improve = 0
+            # Save best checkpoint separately
+            save_fed_checkpoint(
+                global_student, global_projector,
+                comm_round, round_loss, args.output_dir, "ckpt_best.pth",
+            )
+        else:
+            rounds_no_improve += 1
+            if rounds_no_improve >= LOSS_PATIENCE:
+                print(
+                    f"\n  [EARLY STOP] No improvement for {LOSS_PATIENCE} rounds. "
+                    f"Best loss={best_loss:.6f} at round {best_round}. Stopping."
+                )
+                break
+
+        # Collapse check — only fire after warmup, use realistic threshold
+        if comm_round > 10 and round_enc_std < 0.30:
+            print(
+                f"  [WARNING] Round {comm_round + 1}: "
+                f"enc_std={round_enc_std:.4f} < 0.30 — representation collapsing!"
+            )
 
         # ----- Logging -----
+        client_loss_str = "  ".join(
+            f"c{i+1}={client_losses[i]:.4f}"
+            for i in range(args.n_clients)
+        )
+        no_improve_str = f"  no_improve={rounds_no_improve}" if rounds_no_improve > 10 else ""
         print(
-            f"  Epoch [{epoch + 1:3d}/{args.epochs}]  "
-            f"loss={avg_loss:.4f}  "
-            f"align={avg_align:.4f}  "
-            f"var={avg_var:.4f}  "
-            f"enc_std={avg_enc_std:.4f}  "
-            f"proj_std={avg_proj_std:.4f}  "
-            f"t_std={avg_t_std:.4f}  "
+            f"  Round [{comm_round + 1:3d}/{args.max_rounds}]  "
+            f"loss={round_loss:.4f}  "
+            f"enc_std={round_enc_std:.4f}  "
             f"lr={current_lr:.2e}  "
-            f"time={elapsed:.1f}s  "
-            f"gpu={gpu_mem['gpu_mem_allocated_mb']:.0f}MB"
+            f"time={round_time:.1f}s  "
+            f"{client_loss_str}"
+            f"{no_improve_str}"
         )
 
-        # ----- Log to CSV -----
-        metrics_logger.log(
-            epoch, avg_loss, avg_enc_std, avg_t_std,
-            current_lr, elapsed, gpu_mem,
+        logger.log(
+            comm_round, round_loss, round_enc_std,
+            current_lr,
+            round_time, gpu["gpu_mem_allocated_mb"], client_losses,
         )
 
-        # ----- Collapse warning (on ENCODER output, not projector) -----
-        # FIX BUG 1: Threshold corrected from 0.58 to 0.02 to match the
-        # documented collapse criterion (enc_std < 0.02 = collapsing).
-        # 0.58 was far above healthy values and caused constant false aborts.
-        if avg_enc_std < 0.02:
-            collapse_strikes += 1
-            print(
-                f"  [WARNING] Encoder embedding_std={avg_enc_std:.4f} < 0.02 "
-                f"-- representation collapsing! "
-                f"(strike {collapse_strikes}/{COLLAPSE_STRIKES_MAX})"
-            )
-            if collapse_strikes >= COLLAPSE_STRIKES_MAX:
-                print(
-                    f"\n  [ABORT] Representation collapsed for {COLLAPSE_STRIKES_MAX} "
-                    f"consecutive epochs. Stopping training."
-                )
-                break
-        else:
-            collapse_strikes = 0  # reset on recovery
-
-        if avg_enc_std > 5.0:
-            print(
-                f"  [WARNING] Encoder embedding_std={avg_enc_std:.4f} > 5.0 "
-                f"-- student may be diverging."
-            )
-
-        # ----- Loss plateau early stopping -----
-        if avg_loss < best_loss - LOSS_MIN_DELTA:
-            best_loss = avg_loss
-            epochs_no_improve = 0
-        else:
-            epochs_no_improve += 1
-            if epochs_no_improve >= LOSS_PATIENCE:
-                print(
-                    f"\n  [EARLY STOP] Loss has not improved for {LOSS_PATIENCE} "
-                    f"epochs (best={best_loss:.6f}). Stopping training."
-                )
-                break
-
-        # ----- Save ckpt_latest.pth every epoch (resume point) -----
-        save_checkpoint(
-            student, projector, optimizer, scheduler,
-            epoch, avg_loss, args.output_dir, "ckpt_latest.pth",
+        # ----- Save checkpoint -----
+        save_fed_checkpoint(
+            global_student, global_projector,
+            comm_round, round_loss, args.output_dir, "ckpt_latest.pth",
         )
 
-        # ----- Save periodic checkpoint -----
-        if (epoch + 1) % args.save_every == 0:
-            name = f"ckpt_epoch_{epoch + 1:04d}.pth"
-            save_checkpoint(
-                student, projector, optimizer, scheduler,
-                epoch, avg_loss, args.output_dir, name,
+        if (comm_round + 1) % args.save_every == 0:
+            name = f"ckpt_round_{comm_round + 1:04d}.pth"
+            save_fed_checkpoint(
+                global_student, global_projector,
+                comm_round, round_loss, args.output_dir, name,
             )
             print(f"    -> Saved {name}")
 
-    # ----- Final GPU summary -----
+    # ----- Summary -----
     if torch.cuda.is_available():
         peak = torch.cuda.max_memory_allocated() / (1024 ** 2)
         print(f"\n  Peak GPU memory: {peak:.0f} MB")
 
     print(f"\n{'='*55}")
-    print(f"  Training complete.  Final loss: {avg_loss:.4f}")
-    print(f"  Metrics saved to:  {os.path.join(args.output_dir, METRICS_FILENAME)}")
-    print(f"  Checkpoints saved: {args.output_dir}")
+    print(f"  Federated training complete ({algo_name})")
+    print(f"  Split:       {args.split_type}")
+    print(f"  Rounds:      {args.max_rounds}")
+    print(f"  Best loss:   {best_loss:.6f} at round {best_round}")
+    print(f"  Checkpoints: {args.output_dir}")
+    print(f"  Metrics CSV: {os.path.join(args.output_dir, METRICS_FILENAME)}")
     print(f"{'='*55}")
 
 
