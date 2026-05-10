@@ -378,7 +378,7 @@ def main():
         rounds_done  = comm_round          # NOT comm_round - start_round
         rounds_total = args.max_rounds     # 150
         eta_min      = args.lr * 0.1
-        cosine_decay = 0.5 * (1 + math.cos(math.pi * rounds_done / rounds_total))
+        cosine_decay = 0.3 * (1 + math.cos(math.pi * rounds_done / rounds_total))
         current_lr   = eta_min + (args.lr - eta_min) * cosine_decay
         
         # ----- Local training for each client -----
