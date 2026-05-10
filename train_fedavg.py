@@ -197,7 +197,7 @@ def build_models(args):
     # Mismatched embed_dim makes centralized and federated checkpoints incompatible
     # and prevents meaningful comparison between the two training regimes.
     student = InceptionMambaEncoder(
-        patch_size=16, embed_dim=384, depth=6, out_dim=768,
+        patch_size=16, embed_dim=448, depth=6, out_dim=768,
     ).to(args.device)
 
     projector = ProjectionHead(
