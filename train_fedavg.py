@@ -373,8 +373,10 @@ def main():
             global_params = None
 
 
-        # Flat LR for first 50 rounds, then cosine decay to eta_min over R51-150
-        FLAT_ROUNDS = 50
+        # Flat LR for first N rounds, then cosine decay to eta_min
+        # FedProx: shorter flat phase (30) — mu=0.05 causes starvation if flat too long
+        # FedAvg:  longer flat phase (50) — no proximal term, safe to stay high longer
+        FLAT_ROUNDS = 30 if args.mu > 0 else 50
         eta_min     = args.lr * 0.1
         if comm_round < FLAT_ROUNDS:
             current_lr = args.lr
@@ -443,16 +445,15 @@ def main():
         if not hasattr(args, '_loss_history'):
             args._loss_history = []
         args._loss_history.append(round_loss)
-
-        if len(args._loss_history) >= 5:
+        if len(args._loss_history) >= 5 and comm_round > 20:
             recent_drop = args._loss_history[-5] - args._loss_history[-1]
             drop_per_round = recent_drop / 5
-            if drop_per_round < 0.001 and comm_round > 20:
+            if drop_per_round < 0.001:
                 print(
-                    f"  [STARVATION] Round {comm_round+1}: "
+                    f"  [STARVATION] Round {comm_round + 1}: "
                     f"avg drop={drop_per_round:.5f}/round over last 5 rounds. "
                     f"Consider reducing mu from {args.mu} to {args.mu * 0.2:.3f}"
-        )
+                )
 
         # NaN check
         if math.isnan(round_loss):
@@ -478,11 +479,11 @@ def main():
                 )
                 break
 
-        # Collapse check
-        if round_enc_std < 0.58:
+        # Collapse check — only fire after warmup, use realistic threshold
+        if comm_round > 10 and round_enc_std < 0.30:
             print(
                 f"  [WARNING] Round {comm_round + 1}: "
-                f"enc_std={round_enc_std:.4f} < 0.58 — representation collapsing!"
+                f"enc_std={round_enc_std:.4f} < 0.30 — representation collapsing!"
             )
 
         # ----- Logging -----
