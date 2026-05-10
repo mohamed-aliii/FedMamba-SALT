@@ -58,7 +58,7 @@ METRICS_FILENAME = "training_metrics.csv"
 # Early stopping
 LOSS_PATIENCE = 25       # stop if loss doesn't improve for this many epochs
 COLLAPSE_STRIKES_MAX = 5 # abort if collapsed for this many consecutive epochs
-LOSS_MIN_DELTA = 1e-5    # minimum improvement to count as progress
+LOSS_MIN_DELTA = 1e-4    # raised: 1e-5 was too tight, noise triggered false plateaus
 
 
 # ======================================================================
@@ -443,6 +443,7 @@ def train_one_epoch(
     global_params: dict = None,
     mu: float = 0.0,
     mask_ratio: float = 0.5,
+    grad_clip: float = 1.0,
 ) -> tuple:
     """
     Run one epoch of SALT training.
@@ -510,10 +511,11 @@ def train_one_epoch(
         
         # Unscale before clipping
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(
-            list(student.parameters()) + list(projector.parameters()),
-            max_norm=1.0,
-        )
+        if grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(
+                list(student.parameters()) + list(projector.parameters()),
+                max_norm=grad_clip,
+            )
         
         scaler.step(optimizer)
         scaler.update()
@@ -695,11 +697,11 @@ def main() -> None:
         )
 
         # ----- Collapse warning (on ENCODER output, not projector) -----
-        if avg_enc_std < 0.02:
+        if avg_enc_std < 0.58:
             collapse_strikes += 1
             print(
-                f"  [WARNING] Encoder embedding_std={avg_enc_std:.4f} < 0.02 "
-                f"-- possible representation collapse! "
+                f"  [WARNING] Encoder embedding_std={avg_enc_std:.4f} < 0.58 "
+                f"-- representation collapsing! "
                 f"(strike {collapse_strikes}/{COLLAPSE_STRIKES_MAX})"
             )
             if collapse_strikes >= COLLAPSE_STRIKES_MAX:

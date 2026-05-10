@@ -55,8 +55,8 @@ from utils.fedavg import (
 # Constants
 # ======================================================================
 METRICS_FILENAME = "federated_metrics.csv"
-LOSS_PATIENCE = 25       # stop if loss doesn't improve for this many rounds
-LOSS_MIN_DELTA = 1e-5    # minimum improvement to count as progress
+LOSS_PATIENCE = 35       # increased: warm-up phase can look flat for ~20 rounds
+LOSS_MIN_DELTA = 1e-4    # raised: 1e-5 was too tight, noise triggered false plateaus
 
 
 # ======================================================================
@@ -87,7 +87,7 @@ def parse_args() -> argparse.Namespace:
                         help="Data split: split_1, split_2, split_3")
     parser.add_argument("--max_rounds", type=int, default=200,
                         help="Total communication rounds")
-    parser.add_argument("--E_epoch", type=int, default=1,
+    parser.add_argument("--E_epoch", type=int, default=2,
                         help="Local training epochs per round per client")
     parser.add_argument("--mu", type=float, default=0.0,
                         help="FedProx proximal penalty. 0 = FedAvg, >0 = FedProx")
@@ -96,6 +96,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--weight_decay", type=float, default=0.05)
+    parser.add_argument("--grad_clip", type=float, default=1.0,
+                        help="Max gradient norm for clipping. 0 = disabled.")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--save_every", type=int, default=10)
     parser.add_argument("--device", type=str, default="cuda")
@@ -302,6 +304,7 @@ def main():
     print(f"  mu:         {args.mu}")
     print(f"  Batch size: {args.batch_size}")
     print(f"  LR:         {args.lr}")
+    print(f"  Grad clip:  {args.grad_clip}")
     print(f"  Device:     {args.device}")
     print(f"  Output:     {args.output_dir}")
     print()
@@ -339,11 +342,6 @@ def main():
     # ----- Metrics logger -----
     logger = FedMetricsLogger(args.output_dir, args.n_clients)
 
-    # ----- AMP Scaler -----
-    # REMOVE this from line 343:
-    # scaler = torch.amp.GradScaler("cuda", enabled=(args.device == "cuda"))
-    
-
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
 
@@ -355,6 +353,7 @@ def main():
 
     # ----- Early stopping state -----
     best_loss = float("inf")
+    best_round = 0
     rounds_no_improve = 0
 
     # ================================================================
@@ -374,12 +373,17 @@ def main():
             global_params = None
 
 
-        # In train_fedavg.py — use absolute round number:
-        rounds_done  = comm_round          # NOT comm_round - start_round
-        rounds_total = args.max_rounds     # 150
-        eta_min      = args.lr * 0.1
-        cosine_decay = 0.3 * (1 + math.cos(math.pi * rounds_done / rounds_total))
-        current_lr   = eta_min + (args.lr - eta_min) * cosine_decay
+        # Flat LR for first 50 rounds, then cosine decay to eta_min over R51-150
+        FLAT_ROUNDS = 50
+        eta_min     = args.lr * 0.1
+        if comm_round < FLAT_ROUNDS:
+            current_lr = args.lr
+        else:
+            t_cur      = comm_round - FLAT_ROUNDS
+            T_decay    = args.max_rounds - FLAT_ROUNDS
+            current_lr = eta_min + 0.5 * (args.lr - eta_min) * (
+                1 + math.cos(math.pi * t_cur / T_decay)
+            )
         
         # ----- Local training for each client -----
         for client_id in range(args.n_clients):
@@ -394,6 +398,7 @@ def main():
             )
             optimizer = AdamW(
                 client_params, lr=current_lr, weight_decay=args.weight_decay,
+                betas=(0.9, 0.999),   # explicit — AdamW default but documented
             )
 
             #Fresh scaler per client — fixes shared-state corruption
@@ -407,6 +412,7 @@ def main():
                     global_params=global_params,
                     mu=args.mu,
                     mask_ratio=args.mask_ratio,
+                    grad_clip=args.grad_clip,
                 )
                 avg_loss = metrics[0]
                 avg_enc_std = metrics[3]
@@ -433,6 +439,21 @@ def main():
         round_time = time.time() - round_start
         gpu = get_gpu_memory_mb()
 
+        # ----- Gradient starvation detection -----
+        if not hasattr(args, '_loss_history'):
+            args._loss_history = []
+        args._loss_history.append(round_loss)
+
+        if len(args._loss_history) >= 5:
+            recent_drop = args._loss_history[-5] - args._loss_history[-1]
+            drop_per_round = recent_drop / 5
+            if drop_per_round < 0.001 and comm_round > 20:
+                print(
+                    f"  [STARVATION] Round {comm_round+1}: "
+                    f"avg drop={drop_per_round:.5f}/round over last 5 rounds. "
+                    f"Consider reducing mu from {args.mu} to {args.mu * 0.2:.3f}"
+        )
+
         # NaN check
         if math.isnan(round_loss):
             print(f"\n  [ABORT] Round {comm_round + 1}: Loss is NaN. Stopping.")
@@ -441,21 +462,27 @@ def main():
         # Loss plateau early stopping
         if round_loss < best_loss - LOSS_MIN_DELTA:
             best_loss = round_loss
+            best_round = comm_round + 1
             rounds_no_improve = 0
+            # Save best checkpoint separately
+            save_fed_checkpoint(
+                global_student, global_projector,
+                comm_round, round_loss, args.output_dir, "ckpt_best.pth",
+            )
         else:
             rounds_no_improve += 1
             if rounds_no_improve >= LOSS_PATIENCE:
                 print(
-                    f"\n  [EARLY STOP] Loss has not improved for {LOSS_PATIENCE} "
-                    f"rounds (best={best_loss:.6f}). Stopping training."
+                    f"\n  [EARLY STOP] No improvement for {LOSS_PATIENCE} rounds. "
+                    f"Best loss={best_loss:.6f} at round {best_round}. Stopping."
                 )
                 break
 
         # Collapse check
-        if round_enc_std < 0.02:
+        if round_enc_std < 0.58:
             print(
                 f"  [WARNING] Round {comm_round + 1}: "
-                f"enc_std={round_enc_std:.4f} < 0.02 — possible collapse!"
+                f"enc_std={round_enc_std:.4f} < 0.58 — representation collapsing!"
             )
 
         # ----- Logging -----
@@ -463,12 +490,15 @@ def main():
             f"c{i+1}={client_losses[i]:.4f}"
             for i in range(args.n_clients)
         )
+        no_improve_str = f"  no_improve={rounds_no_improve}" if rounds_no_improve > 10 else ""
         print(
             f"  Round [{comm_round + 1:3d}/{args.max_rounds}]  "
             f"loss={round_loss:.4f}  "
             f"enc_std={round_enc_std:.4f}  "
+            f"lr={current_lr:.2e}  "
             f"time={round_time:.1f}s  "
             f"{client_loss_str}"
+            f"{no_improve_str}"
         )
 
         logger.log(
@@ -500,6 +530,7 @@ def main():
     print(f"  Federated training complete ({algo_name})")
     print(f"  Split:       {args.split_type}")
     print(f"  Rounds:      {args.max_rounds}")
+    print(f"  Best loss:   {best_loss:.6f} at round {best_round}")
     print(f"  Checkpoints: {args.output_dir}")
     print(f"  Metrics CSV: {os.path.join(args.output_dir, METRICS_FILENAME)}")
     print(f"{'='*55}")
