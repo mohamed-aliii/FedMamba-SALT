@@ -443,7 +443,7 @@ def train_one_epoch(
     global_params: dict = None,
     mu: float = 0.0,
     mask_ratio: float = 0.5,
-    grad_clip: float = 1.0,
+    grad_clip: float = 0.5,
 ) -> tuple:
     """
     Run one epoch of SALT training.
