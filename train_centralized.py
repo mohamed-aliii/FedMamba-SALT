@@ -493,9 +493,11 @@ def train_one_epoch(
             # CRITICAL: computed OUTSIDE autocast in fp32 to prevent fp16
             # overflow. With 45M params, squared diffs accumulate to values
             # that exceed fp16 max (65504), causing NaN at round 3-10.
+            # FIX BUG 4: Use `device_type` variable (not hardcoded 'cuda') so
+            # this branch works correctly on CPU as well as CUDA.
             if mu > 0 and global_params is not None:
                 prox = torch.tensor(0.0, device=device, dtype=torch.float32)
-                with torch.amp.autocast('cuda', enabled=False):
+                with torch.amp.autocast(device_type, enabled=False):
                     for name, param in student.named_parameters():
                         if param.requires_grad and name in global_params:
                             prox = prox + (
@@ -524,6 +526,15 @@ def train_one_epoch(
                 list(student.parameters()) + list(projector.parameters()),
                 max_norm=grad_clip,
             )
+
+        # FIX BUG 5: Capture grad norm AFTER unscale but BEFORE zero_grad,
+        # so gradients are actually present. This replaces the stale post-loop
+        # debug block in train_fedavg.py that always printed 0.0.
+        total_norm = 0.0
+        for p in list(student.parameters()) + list(projector.parameters()):
+            if p.grad is not None:
+                total_norm += p.grad.data.norm(2).item() ** 2
+        total_norm = total_norm ** 0.5
         
         scaler.step(optimizer)
         scaler.update()
@@ -541,6 +552,7 @@ def train_one_epoch(
             loss=f"{loss.item():.4f}",
             align=f"{align_loss.item():.4f}",
             enc=f"{enc_std:.3f}",
+            grad=f"{total_norm:.3f}",
         )
 
     avg_loss = total_loss / max(1, n_batches)
@@ -665,6 +677,11 @@ def main() -> None:
     epochs_no_improve = 0
     collapse_strikes = 0
 
+    # FIX BUG 2: Initialize avg_loss before the loop so the final summary
+    # print never raises NameError when the loop body is skipped entirely
+    # (e.g. start_epoch >= args.epochs on entry).
+    avg_loss = 0.0
+
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
 
@@ -705,10 +722,13 @@ def main() -> None:
         )
 
         # ----- Collapse warning (on ENCODER output, not projector) -----
-        if avg_enc_std < 0.58:
+        # FIX BUG 1: Threshold corrected from 0.58 to 0.02 to match the
+        # documented collapse criterion (enc_std < 0.02 = collapsing).
+        # 0.58 was far above healthy values and caused constant false aborts.
+        if avg_enc_std < 0.02:
             collapse_strikes += 1
             print(
-                f"  [WARNING] Encoder embedding_std={avg_enc_std:.4f} < 0.58 "
+                f"  [WARNING] Encoder embedding_std={avg_enc_std:.4f} < 0.02 "
                 f"-- representation collapsing! "
                 f"(strike {collapse_strikes}/{COLLAPSE_STRIKES_MAX})"
             )
