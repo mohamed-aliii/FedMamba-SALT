@@ -489,15 +489,22 @@ def train_one_epoch(
             # SALT loss (Cosine distillation + encoder variance guard)
             loss, align_loss, var_loss = salt_loss(s_proj, t_emb, s_emb)
 
-            # FedProx proximal term (only when mu > 0)
+            # FedProx proximal term — computed in fp32 OUTSIDE autocast
+            # to prevent fp16 overflow from large parameter norm accumulation
+            # over 45M params: squared diffs can exceed fp16 max (65504)
             if mu > 0 and global_params is not None:
-                prox = torch.tensor(0.0, device=device)
-                for name, param in student.named_parameters():
-                    if param.requires_grad and name in global_params:
-                        prox = prox + (param - global_params[name].detach()).pow(2).sum()
-                for name, param in projector.named_parameters():
-                    if param.requires_grad and f"proj.{name}" in global_params:
-                        prox = prox + (param - global_params[f"proj.{name}"].detach()).pow(2).sum()
+                with torch.amp.autocast(device_type=device_type, enabled=False):
+                    prox = torch.tensor(0.0, device=device, dtype=torch.float32)
+                    for name, param in student.named_parameters():
+                        if param.requires_grad and name in global_params:
+                            p = param.float()
+                            g = global_params[name].detach().float()
+                            prox = prox + (p - g).pow(2).sum()
+                    for name, param in projector.named_parameters():
+                        if param.requires_grad and f"proj.{name}" in global_params:
+                            p = param.float()
+                            g = global_params[f"proj.{name}"].detach().float()
+                            prox = prox + (p - g).pow(2).sum()
                 loss = loss + (mu / 2.0) * prox
 
         # ----- Collapse diagnostics (both encoder and projector) -----
