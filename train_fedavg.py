@@ -455,6 +455,16 @@ def main():
                     f"Consider reducing mu from {args.mu} to {args.mu * 0.2:.3f}"
                 )
 
+        # Log max gradient norm for debugging
+        if comm_round < 15:
+            for client_student in client_students:
+                total_norm = 0
+                for p in client_student.parameters():
+                    if p.grad is not None:
+                        total_norm += p.grad.data.norm(2).item() ** 2
+                total_norm = total_norm ** 0.5
+                print(f"  [DEBUG] client grad norm: {total_norm:.4f}")
+
         # NaN check
         if math.isnan(round_loss):
             print(f"\n  [ABORT] Round {comm_round + 1}: Loss is NaN. Stopping.")
