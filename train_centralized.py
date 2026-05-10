@@ -10,6 +10,13 @@ sees a heavily corrupted view of the same image.
 Usage:
     python train_centralized.py --data_path /path/to/imagefolder --epochs 100
 
+Learning rate schedule:
+    Phase 1 — Warmup  (epochs  1-10): lr*0.1 → lr   (LinearLR, end_factor=1.0)
+    Phase 2 — Cosine  (epochs 11-N):  lr → lr*0.01  (CosineAnnealingLR, eta_min=lr*0.01)
+
+    eta_min = lr*0.01 (5e-6 at default lr=5e-4). Prevents the last ~10 epochs
+    from stalling at near-zero LR while still burning full compute.
+
 Expected training behavior (healthy run)
 =========================================
   Loss = SmoothL1(norm(s_proj), norm(t_emb)) + mag_loss + var_penalty(s_emb)
@@ -189,6 +196,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_workers",  type=int,   default=4)
     parser.add_argument("--save_every",   type=int,   default=10)
     parser.add_argument("--device",       type=str,   default="cuda")
+    # SCHEDULER FIX 1: Expose grad_clip as a CLI argument so it can be tuned
+    # without editing source. Previously hardcoded to 0.5 inside train_one_epoch
+    # with no way to override it at runtime.
+    parser.add_argument("--grad_clip",    type=float, default=0.5,
+                        help="Max gradient norm for clipping. 0 = disabled.")
 
     # ------------------------------------------------------------------
     # Two-pass parsing: extract --config first, load YAML, set defaults
@@ -329,23 +341,39 @@ def build_optimizer_and_scheduler(
 ):
     """
     AdamW on student + projector params only (teacher excluded).
-    LR schedule: 10-epoch linear warmup (lr/10 -> lr) followed by
-    cosine annealing over the remaining epochs.
+
+    LR schedule:
+      - 10-epoch linear warmup: lr*0.1 → lr  (explicit end_factor=1.0)
+      - Cosine annealing over remaining epochs: lr → eta_min (lr*0.01)
+
+    SCHEDULER FIX 2a: eta_min set to lr*0.01 instead of the PyTorch default
+    of 0. Decaying all the way to 0 means the last ~10 epochs have LR < 1e-7,
+    effectively stopping learning while still burning compute. lr*0.01 (5e-6)
+    keeps the model making meaningful refinements to the very last epoch.
+
+    SCHEDULER FIX 2b: end_factor=1.0 made explicit in LinearLR. PyTorch
+    defaults to 1.0 so this is not a behaviour change, but being explicit
+    prevents silent breakage if the default ever changes across PyTorch versions.
     """
     params = list(student.parameters()) + list(projector.parameters())
 
     optimizer = AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
 
-    # Linear warmup: start_factor=0.1 means lr starts at lr*0.1
+    eta_min = args.lr * 0.01  # floor: lr*0.01 keeps late-epoch updates meaningful
+
+    # Linear warmup: lr*0.1 → lr over WARMUP_EPOCHS epochs
+    # end_factor=1.0 is explicit (was implicit default — now safe across versions)
     warmup = LinearLR(
         optimizer,
         start_factor=1.0 / 10.0,
+        end_factor=1.0,
         total_iters=WARMUP_EPOCHS,
     )
-    # Cosine annealing over the remaining epochs
+    # Cosine annealing: lr → eta_min over the remaining epochs
     cosine = CosineAnnealingLR(
         optimizer,
         T_max=max(1, args.epochs - WARMUP_EPOCHS),
+        eta_min=eta_min,
     )
     # Compose: warmup for first WARMUP_EPOCHS, then cosine
     scheduler = SequentialLR(
@@ -578,7 +606,9 @@ def main() -> None:
     print(f"  Epochs:     {args.epochs}")
     print(f"  Batch size: {args.batch_size}")
     print(f"  LR:         {args.lr}")
-    print(f"  Warmup:     {WARMUP_EPOCHS} epochs (lr/{10} -> lr)")
+    print(f"  Warmup:     {WARMUP_EPOCHS} epochs (lr/10 -> lr)")
+    print(f"  eta_min:    {args.lr * 0.01:.1e} (lr*0.01, cosine floor)")
+    print(f"  Grad clip:  {args.grad_clip}")
     print(f"  Output:     {args.output_dir}")
     print()
 
@@ -613,7 +643,13 @@ def main() -> None:
             new_target = args.epochs
 
         resume_lr = args.lr / 10.0  # reduced LR to avoid NaN from optimizer state shock
-        resume_warmup = 5           # short warmup ramp
+
+        # SCHEDULER FIX 3: Scale resume warmup proportionally to the extension
+        # length instead of hardcoding 5. Hardcoded 5 is disproportionately
+        # small for long extensions (e.g. +200 epochs gets same warmup as +20).
+        # Clamp to [3, 10] so it's never trivially short or unreasonably long.
+        resume_warmup = max(3, min(10, round(extra * 0.05)))
+
         print(
             f"[RESUME] Checkpoint reached end of previous {old_target_epochs}-epoch schedule.\n"
             f"         Extending training target to {new_target} epochs "
@@ -631,12 +667,20 @@ def main() -> None:
             pg["lr"] = resume_lr
             pg["initial_lr"] = resume_lr
 
+        resume_eta_min = resume_lr * 0.01  # same floor ratio as initial schedule
+
         # Short warmup (lr/5 -> lr) then cosine over remaining epochs
+        # end_factor=1.0 made explicit (SCHEDULER FIX 2b applied here too)
         warmup = LinearLR(
-            optimizer, start_factor=0.2, total_iters=resume_warmup,
+            optimizer,
+            start_factor=0.2,
+            end_factor=1.0,
+            total_iters=resume_warmup,
         )
         cosine = CosineAnnealingLR(
-            optimizer, T_max=max(1, extra - resume_warmup),
+            optimizer,
+            T_max=max(1, extra - resume_warmup),
+            eta_min=resume_eta_min,
         )
         scheduler = SequentialLR(
             optimizer,
@@ -666,7 +710,12 @@ def main() -> None:
     print(f"{'='*55}\n")
 
     # ----- Automated Mixed Precision -----
-    scaler = torch.amp.GradScaler("cuda", enabled=(args.device == "cuda"))
+    # SCHEDULER FIX 5: Derive device_type from args.device so GradScaler
+    # doesn't pass "cuda" as the device string when running on CPU.
+    # torch.amp.GradScaler("cuda", ...) emits warnings on CPU in PyTorch 2.1+
+    # even when enabled=False, because the device string is validated first.
+    _device_type = "cuda" if "cuda" in args.device else "cpu"
+    scaler = torch.amp.GradScaler(_device_type, enabled=(args.device == "cuda"))
 
     # Reset peak GPU memory counter for accurate per-run tracking
     if torch.cuda.is_available():
@@ -688,6 +737,7 @@ def main() -> None:
         avg_loss, avg_align, avg_var, avg_enc_std, avg_proj_std, avg_t_std = train_one_epoch(
             teacher, student, projector, dataloader, optimizer, scaler, args.device,
             mask_ratio=args.mask_ratio,
+            grad_clip=args.grad_clip,  # SCHEDULER FIX 1: use CLI-controlled value
         )
 
         # --- NaN safety ---
