@@ -295,7 +295,7 @@ def build_models(args: argparse.Namespace):
     # Original: embed_dim=256, depth=4 -> 10M params (256->768 bottleneck)
     # Scaled:   embed_dim=384, depth=6 -> ~32M params (use batch_size=256)
     student = InceptionMambaEncoder(
-        patch_size=16, embed_dim=384, depth=6, out_dim=768,
+        patch_size=16, embed_dim=448, depth=6, out_dim=768,
     ).to(args.device)
 
 
