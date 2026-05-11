@@ -89,10 +89,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output_dir", type=str, default="eval_results",
                    help="Directory for confusion matrix PNG and logs")
     p.add_argument("--epochs", type=int, default=50)
-    p.add_argument("--batch_size", type=int, default=256)
+    # Colab Pro A100: batch_size=64-128 is safe for full_finetune.
+    # evaluate_finetune runs 5 TTA views sequentially (not stacked), so
+    # eval memory scales with batch_size×1, not batch_size×5.
+    # 256 is safe on A100 (80GB) but will OOM on V100 (16GB) with a 32M encoder.
+    p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--device", type=str, default="cuda")
-    p.add_argument("--num_workers", type=int, default=10,
+    p.add_argument("--num_workers", type=int, default=4,
                    help="Number of DataLoader worker processes")
     p.add_argument(
         "--mode", type=str, default="linear_probe",
@@ -391,7 +395,9 @@ def extract_features(
         # teacher's actual geometry (direction + magnitude).  Normalizing
         # here would erase the magnitude information that the downstream
         # BatchNorm1d classifier head expects.
-        features = encoder(images)  # (B, 768)
+        # FIX BUG 1: Force GAP (return_patches=False) so features are (B, 768),
+        # not (B, 196, 768). The linear classifier head expects a flat vector.
+        features = encoder(images, return_patches=False)  # (B, 768)
         all_features.append(features.cpu())
         all_labels.append(labels)
 
@@ -486,6 +492,7 @@ def train_finetune(
     num_classes: int,
     class_names: list,
     output_dir: str,
+    freeze_encoder: bool = False,  # FIX BUG 5: pass True for frozen_attention mode
 ) -> dict:
     """End-to-end fine-tuning of encoder + classifier.
 
@@ -509,11 +516,15 @@ def train_finetune(
     # adaptation.  The classifier head gets the full LR since it starts
     # from random init.
     encoder_lr = lr / 10.0
+    # FIX ISSUE 7: Give the encoder its own lower weight_decay.
+    # Pre-trained weights are already regularized from pre-training; applying
+    # weight_decay=0.1 to the encoder aggressively shrinks them toward zero,
+    # destroying the learned representations on small datasets like Retina.
     param_groups = [
-        {"params": encoder.parameters(), "lr": encoder_lr},
-        {"params": classifier.parameters(), "lr": lr},
+        {"params": encoder.parameters(), "lr": encoder_lr, "weight_decay": 0.01},
+        {"params": classifier.parameters(), "lr": lr, "weight_decay": 0.05},
     ]
-    optimizer = AdamW(param_groups, weight_decay=0.1)
+    optimizer = AdamW(param_groups)
     # Scheduler: warmup + cosine decay
     # We'll handle warmup manually in the loop
     scheduler = CosineAnnealingLR(optimizer, T_max=max(1, epochs - FINETUNE_WARMUP))
@@ -561,28 +572,43 @@ def train_finetune(
     print(f"  Early stopping patience: {FINETUNE_PATIENCE} epochs")
     total_start = time.time()
     
-    scaler = torch.amp.GradScaler('cuda', enabled=(device == "cuda"))
+    # FIX BUG 3: derive device_type from device string so GradScaler and
+    # autocast work correctly on "cuda:0", "cuda:1", and CPU alike.
+    _device_type = "cuda" if "cuda" in device else "cpu"
+    scaler = torch.amp.GradScaler(_device_type, enabled=("cuda" in device))
 
     for epoch in range(epochs):
         epoch_start = time.time()
 
         # ---- Warmup (1 epoch: classifier only, then unfreeze encoder) ----
         if epoch < FINETUNE_WARMUP:
-            warmup_factor = (epoch + 1) / FINETUNE_WARMUP
+            # FIX BUG 2: Actually disable encoder gradients during warmup.
+            # Setting lr=0 alone still runs the backward pass through the encoder
+            # (wasting compute) and corrupts BatchNorm running stats while in
+            # eval() mode. Proper solution: disable requires_grad entirely.
+            if not freeze_encoder:
+                for p in encoder.parameters():
+                    p.requires_grad_(False)
+            encoder.eval()
             for pg_idx, pg in enumerate(optimizer.param_groups):
                 target_lr = encoder_lr if pg_idx == 0 else lr
                 if pg_idx == 0:
-                    pg["lr"] = 0.0   # freeze encoder for 1 epoch only
+                    pg["lr"] = 0.0
                 else:
-                    pg["lr"] = target_lr * warmup_factor
-            encoder.eval()
-        elif epoch == FINETUNE_WARMUP:
-            # Unfreeze encoder — restore target LRs
+                    pg["lr"] = target_lr
+        elif epoch == FINETUNE_WARMUP and not freeze_encoder:
+            # Unfreeze encoder — restore target LRs and re-enable gradients
+            for p in encoder.parameters():
+                p.requires_grad_(True)
             optimizer.param_groups[0]["lr"] = encoder_lr
             optimizer.param_groups[1]["lr"] = lr
             encoder.train()
         else:
-            encoder.train()
+            # FIX BUG 5: respect freeze_encoder flag — never call encoder.train()
+            # in frozen_attention mode (would re-enable dropout/BN training mode
+            # on the frozen encoder and destabilise the attention classifier).
+            if not freeze_encoder:
+                encoder.train()
             
         classifier.train()
         total_loss = 0.0
@@ -596,7 +622,7 @@ def train_finetune(
             # --- Mixup ---
             images, targets_a, targets_b, lam = mixup_data(images, labels, MIXUP_ALPHA)
 
-            with autocast(device_type="cuda", enabled=(device == "cuda")):
+            with autocast(device_type=_device_type, enabled=("cuda" in device)):
                 features = encoder(images)
                 logits = classifier(features)
                 loss = mixup_criterion(criterion, logits, targets_a, targets_b, lam)
@@ -654,7 +680,12 @@ def train_finetune(
             ])
 
         # ---- Best checkpoint ----
-        if val_acc > best_acc:
+        # FIX BUG 4: capture is_best BEFORE updating best_acc.
+        # Previously the marker check ran after best_acc was already set to
+        # val_acc, so val_acc >= best_acc was always True and every epoch
+        # printed *BEST*.
+        is_best = val_acc > best_acc
+        if is_best:
             best_acc = val_acc
             best_epoch = epoch + 1
             patience_counter = 0
@@ -668,7 +699,7 @@ def train_finetune(
         else:
             patience_counter += 1
 
-        marker = " *BEST*" if val_acc >= best_acc else ""
+        marker = " *BEST*" if is_best else ""
         print(f"  Epoch [{epoch + 1:3d}/{epochs}]  "
               f"loss={avg_loss:.4f}  train={train_acc:.2f}%  "
               f"val={val_acc:.2f}%  auc={val_auc:.4f}  "
@@ -1334,7 +1365,13 @@ def run_evaluation(
 
     train_loader = DataLoader(
         subset_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=True, drop_last=False,
+        num_workers=args.num_workers, pin_memory=True,
+        # drop_last=True: BatchNorm1d in the classifier head crashes if the
+        # last batch has size 1 ("Expected more than 1 value per channel").
+        # With 9K images this is unlikely but guaranteed to bite at low
+        # label fractions (e.g. 10% of 9K = 900 images, 900 % 256 = 132 — ok,
+        # but at very small fractions a size-1 tail is plausible).
+        drop_last=True,
     )
 
     # --- Fresh encoder + classifier for each run ---
@@ -1399,6 +1436,7 @@ def run_evaluation(
             epochs=args.epochs, lr=args.lr, device=args.device,
             num_classes=args.num_classes, class_names=class_names,
             output_dir=sub_output,
+            freeze_encoder=True,  # FIX BUG 5: encoder must stay frozen
         )
         save_training_curves(history, sub_output, mode_tag)
 

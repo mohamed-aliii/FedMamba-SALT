@@ -397,7 +397,7 @@ def main():
     _warmup_r = 5
     _flat_r   = _warmup_r + int(args.max_rounds * (0.15 if args.mu > 0 else 0.25))
     print(f"  LR schedule:  warmup={_warmup_r}r | flat={_flat_r - _warmup_r}r "
-          f"| cosine={args.max_rounds - _flat_r}r | eta_min={args.lr * 0.02:.1e}")
+          f"| cosine={args.max_rounds - _flat_r}r | eta_min={1e-4}")
     print("=" * 55)
     print()
 
