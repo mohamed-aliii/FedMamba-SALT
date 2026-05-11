@@ -447,7 +447,7 @@ def main():
         WARMUP_ROUNDS = 5
         FLAT_RATIO    = 0.15 if args.mu > 0 else 0.25
         FLAT_ROUNDS   = WARMUP_ROUNDS + int(args.max_rounds * FLAT_RATIO)
-        eta_min       = args.lr * 0.02   # was 0.1; lower floor for full convergence
+        eta_min       = 1e-4   # was 0.1; lower floor for full convergence
 
         if comm_round < WARMUP_ROUNDS:
             # Linear warmup: lr/5 → lr over first 5 rounds
