@@ -514,7 +514,7 @@ def train_finetune(
     # Encoder gets lr/10: pre-trained features are already ~76% val accuracy,
     # so they are USEFUL. Gentle adaptation preserves them.
     # Classifier gets full lr: starts from random init, needs faster movement.
-    encoder_lr = lr / 5.0
+    encoder_lr = lr / 2.0
 
     # Separate weight_decay per group:
     # - Encoder: 0.01 (pre-trained weights already regularized; 0.1 destroys them)
