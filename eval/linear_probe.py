@@ -36,7 +36,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam, AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, TensorDataset, Subset
 from torch.amp import autocast, GradScaler
 from torchvision import transforms
@@ -510,24 +510,66 @@ def train_finetune(
     Returns:
         dict with lists of per-epoch metrics for visualization.
     """
-    # -- Learning Rates --
-    # Pre-trained features score ~76% val accuracy, so they ARE useful.
-    # lr/10 preserves the learned representations while allowing gentle
-    # adaptation.  The classifier head gets the full LR since it starts
-    # from random init.
-    encoder_lr = lr / 10.0
-    # FIX ISSUE 7: Give the encoder its own lower weight_decay.
-    # Pre-trained weights are already regularized from pre-training; applying
-    # weight_decay=0.1 to the encoder aggressively shrinks them toward zero,
-    # destroying the learned representations on small datasets like Retina.
+    # -- Learning rates --
+    # Encoder gets lr/10: pre-trained features are already ~76% val accuracy,
+    # so they are USEFUL. Gentle adaptation preserves them.
+    # Classifier gets full lr: starts from random init, needs faster movement.
+    encoder_lr = lr / 5.0
+
+    # Separate weight_decay per group:
+    # - Encoder: 0.01 (pre-trained weights already regularized; 0.1 destroys them)
+    # - Classifier: 0.05 (random init, needs more regularization)
     param_groups = [
-        {"params": encoder.parameters(), "lr": encoder_lr, "weight_decay": 0.01},
-        {"params": classifier.parameters(), "lr": lr, "weight_decay": 0.05},
+        {"params": encoder.parameters(),  "lr": encoder_lr, "weight_decay": 0.01},
+        {"params": classifier.parameters(), "lr": lr,        "weight_decay": 0.05},
     ]
     optimizer = AdamW(param_groups)
-    # Scheduler: warmup + cosine decay
-    # We'll handle warmup manually in the loop
-    scheduler = CosineAnnealingLR(optimizer, T_max=max(1, epochs - FINETUNE_WARMUP))
+
+    # -- Scheduler: 5-epoch linear warmup on encoder, then cosine with floor --
+    #
+    # Why 5 epochs instead of 1:
+    #   With FINETUNE_WARMUP=1 (~70 steps), the encoder jumps from frozen to
+    #   full lr/10 with no ramp. The first post-unfreeze epoch can partially
+    #   destroy representations before cosine decay helps. 5 epochs gives the
+    #   encoder gradients time to stabilize before the full LR hits.
+    #   (Same rationale as train_centralized.py's 10-epoch warmup.)
+    #
+    # Why SequentialLR instead of manual loop writes:
+    #   Manual pg["lr"] writes inside the loop fight the scheduler's internal
+    #   state and cause an off-by-1 step error (the cosine cycle starts mid-stride
+    #   because step() is skipped during warmup). SequentialLR owns the full
+    #   schedule and steps cleanly every epoch.
+    #
+    # Why eta_min = lr * 0.01 (not 0):
+    #   Default eta_min=0 decays to ~1e-7 by epoch 45 of 50 — the last 10 epochs
+    #   do essentially nothing while burning Colab compute. lr*0.01 = 1e-5 keeps
+    #   late-epoch updates meaningful. Mirrors the fix in train_centralized.py.
+    #
+    # Classifier scheduler: no warmup needed (random init is fine at full LR).
+    # Both param groups share one SequentialLR; their per-group LRs are set
+    # individually via param_groups so the scheduler multiplier applies correctly.
+
+    WARMUP_EPOCHS = min(5, max(1, epochs // 10))
+    # eta_min relative to base lr (not encoder_lr):
+    # encoder: 1e-4 → 1e-5  (10x drop, still active in late epochs)
+    # classifier: 1e-3 → 1e-5  (100x drop, slowing to refinement)
+    # Using encoder_lr * 0.01 = 1e-6 would be effectively stopped.
+    eta_min_enc = lr * 0.1  # 1e-5 at default lr=1e-3
+
+    # NOTE: CosineAnnealingLR's eta_min applies to ALL param groups uniformly.
+    # The classifier will also decay to eta_min_enc. This is fine — the
+    # classifier converges quickly in early epochs at full LR; by the cosine
+    # phase it only needs fine-grained updates anyway.
+    enc_warmup = LinearLR(
+        optimizer, start_factor=0.1, end_factor=1.0,
+        total_iters=WARMUP_EPOCHS, last_epoch=-1,
+    )
+    enc_cosine = CosineAnnealingLR(
+        optimizer, T_max=max(1, epochs - WARMUP_EPOCHS), eta_min=eta_min_enc,
+    )
+    scheduler = SequentialLR(
+        optimizer, schedulers=[enc_warmup, enc_cosine], milestones=[WARMUP_EPOCHS],
+    )
     
     # Apply class weights to aggressively prioritize harder disease classes.
     # We heavily weight non-zero classes to overcome the recall imbalance.
@@ -569,6 +611,8 @@ def train_finetune(
 
     print(f"\n  Fine-tuning encoder + classifier on {len(train_loader.dataset)} images...")
     print(f"  Encoder LR: {encoder_lr:.1e}  |  Classifier LR: {lr:.1e}  |  Epochs: {epochs}")
+    print(f"  Warmup: {WARMUP_EPOCHS} epochs (encoder frozen, LR ramps 0.1x→1x)")
+    print(f"  Cosine decay: epochs {WARMUP_EPOCHS}→{epochs}  eta_min={eta_min_enc:.1e}  (lr*0.01)")
     print(f"  Early stopping patience: {FINETUNE_PATIENCE} epochs")
     total_start = time.time()
     
@@ -580,33 +624,20 @@ def train_finetune(
     for epoch in range(epochs):
         epoch_start = time.time()
 
-        # ---- Warmup (1 epoch: classifier only, then unfreeze encoder) ----
-        if epoch < FINETUNE_WARMUP:
-            # FIX BUG 2: Actually disable encoder gradients during warmup.
-            # Setting lr=0 alone still runs the backward pass through the encoder
-            # (wasting compute) and corrupts BatchNorm running stats while in
-            # eval() mode. Proper solution: disable requires_grad entirely.
+        # ---- Encoder freeze / unfreeze ----
+        # Keep encoder frozen during warmup so the classifier stabilizes first,
+        # then unfreeze for the cosine phase. SequentialLR handles the LR ramp;
+        # we only manage requires_grad here.
+        if epoch < WARMUP_EPOCHS:
             if not freeze_encoder:
                 for p in encoder.parameters():
                     p.requires_grad_(False)
             encoder.eval()
-            for pg_idx, pg in enumerate(optimizer.param_groups):
-                target_lr = encoder_lr if pg_idx == 0 else lr
-                if pg_idx == 0:
-                    pg["lr"] = 0.0
-                else:
-                    pg["lr"] = target_lr
-        elif epoch == FINETUNE_WARMUP and not freeze_encoder:
-            # Unfreeze encoder — restore target LRs and re-enable gradients
+        elif epoch == WARMUP_EPOCHS and not freeze_encoder:
             for p in encoder.parameters():
                 p.requires_grad_(True)
-            optimizer.param_groups[0]["lr"] = encoder_lr
-            optimizer.param_groups[1]["lr"] = lr
             encoder.train()
         else:
-            # FIX BUG 5: respect freeze_encoder flag — never call encoder.train()
-            # in frozen_attention mode (would re-enable dropout/BN training mode
-            # on the frozen encoder and destabilise the attention classifier).
             if not freeze_encoder:
                 encoder.train()
             
@@ -642,9 +673,9 @@ def train_finetune(
             correct += (logits.argmax(dim=1) == dominant_labels).sum().item()
             total += images.size(0)
 
-        # Step cosine scheduler only after warmup
-        if epoch >= FINETUNE_WARMUP:
-            scheduler.step()
+        # Step scheduler every epoch — SequentialLR handles warmup vs cosine
+        # phase internally, so no epoch guard is needed.
+        scheduler.step()
         avg_loss = total_loss / total
         train_acc = 100.0 * correct / total
 
