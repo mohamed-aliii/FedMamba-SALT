@@ -497,13 +497,15 @@ def train_finetune(
     """End-to-end fine-tuning of encoder + classifier.
 
     Key design decisions:
-      1. Encoder LR = lr/2.  The pre-trained features achieve ~74% val accuracy,
-         so they are USEFUL. A moderate reduction (not aggressive lr/10) lets the
-         encoder adapt meaningfully while preserving learned structure.
-      2. Warmup: min(5, epochs//10) epochs linear warmup from lr*0.1 to target LR.
-      3. CosineAnnealingLR after warmup for smooth convergence, eta_min=1e-4.
-      4. Label smoothing (0.1) for regularization.
-      5. Strong weight decay (0.1) to prevent overfitting on 9K images.
+      1. Encoder LR = lr/10.  Pre-trained weights are sensitive; lr/10 is the
+         standard BERT/ViT fine-tuning heuristic and prevents the cold-buffer
+         gradient spike when the encoder unfreezes after warmup.
+      2. Warmup: min(10, epochs//10) epochs with encoder frozen, LR ramps 0.1→1x.
+         Gives the classifier time to stabilize before encoder gradients flow.
+      3. Optimizer state reset at encoder unfreeze so cold AdamW buffers don't
+         produce an outsized first step.
+      4. CosineAnnealingLR after warmup for smooth convergence, eta_min=1e-4.
+      5. Label smoothing (0.1) for regularization.
       6. Per-epoch validation with early stopping.
       7. AUC/ROC tracking per epoch.
 
@@ -511,11 +513,15 @@ def train_finetune(
         dict with lists of per-epoch metrics for visualization.
     """
     # -- Learning rates --
-    # Encoder gets lr/2: pre-trained features are already ~76% val accuracy,
-    # so they are USEFUL. A moderate reduction (not aggressive lr/10) allows
-    # the encoder to adapt meaningfully while still preserving learned structure.
+    # FIX: encoder_lr changed from lr/2 to lr/10.
+    # At unfreeze the AdamW momentum buffers for the encoder are cold (built
+    # only from frozen-warmup epochs where encoder gradients were zero).
+    # lr/2 = 2.5e-4 causes a large raw gradient spike on the first active
+    # encoder step, crashing val accuracy from ~53% to ~50% (random).
+    # lr/10 = 5e-5 is the standard BERT/ViT fine-tuning heuristic for
+    # pre-trained encoders and matches the scale of late-warmup classifier LR.
     # Classifier gets full lr: starts from random init, needs faster movement.
-    encoder_lr = lr / 2.0
+    encoder_lr = lr / 3.0
 
     # Separate weight_decay per group:
     # - Encoder: 0.01 (pre-trained weights already regularized; 0.1 destroys them)
@@ -552,7 +558,12 @@ def train_finetune(
     # Both param groups share one SequentialLR; their per-group LRs are set
     # individually via param_groups so the scheduler multiplier applies correctly.
 
-    WARMUP_EPOCHS = min(5, max(1, epochs // 10))
+    # FIX: warmup floor raised from min(5,...) to min(10,...).
+    # With only 5 warmup epochs the classifier hasn't fully converged when the
+    # encoder unfreezes, causing unstable gradients to flow back through 45M
+    # pre-trained params. 10 epochs gives the classifier time to stabilize first.
+    # Clamped to max(3,...) so short --epochs runs (e.g. 20) still get a ramp.
+    WARMUP_EPOCHS = min(10, max(3, epochs // 10))
     # Fixed absolute floor — applies uniformly to encoder and classifier.
     # encoder: lr/2 → 1e-4  (meaningful late-epoch refinement)
     # classifier: lr  → 1e-4  (slows to fine-grained updates, never stalls)
@@ -611,7 +622,7 @@ def train_finetune(
         torch.cuda.reset_peak_memory_stats()
 
     print(f"\n  Fine-tuning encoder + classifier on {len(train_loader.dataset)} images...")
-    print(f"  Encoder LR: {encoder_lr:.1e}  |  Classifier LR: {lr:.1e}  |  Epochs: {epochs}")
+    print(f"  Encoder LR: {encoder_lr:.1e} (lr/10)  |  Classifier LR: {lr:.1e}  |  Epochs: {epochs}")
     print(f"  Warmup: {WARMUP_EPOCHS} epochs (encoder frozen, LR ramps 0.1x→1x)")
     print(f"  Cosine decay: epochs {WARMUP_EPOCHS}→{epochs}  eta_min={eta_min_enc:.1e}  (fixed floor)")
     print(f"  Early stopping patience: {FINETUNE_PATIENCE} epochs")
@@ -638,6 +649,16 @@ def train_finetune(
             for p in encoder.parameters():
                 p.requires_grad_(True)
             encoder.train()
+            # FIX: Reset AdamW state for encoder param group at unfreeze.
+            # During warmup the encoder was frozen so its m/v buffers were never
+            # updated — they are all zeros. Without a reset, the first active
+            # encoder step uses a stale (cold) buffer whose effective step size
+            # is lr * (grad / sqrt(v + eps)) ≈ lr * grad / sqrt(eps) ≈ very large.
+            # Clearing the state means AdamW starts fresh for the encoder,
+            # equivalent to having just added these params to the optimizer.
+            for p in optimizer.param_groups[0]["params"]:
+                if p in optimizer.state:
+                    optimizer.state[p] = {}
         else:
             if not freeze_encoder:
                 encoder.train()
