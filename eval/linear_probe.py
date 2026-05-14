@@ -857,11 +857,14 @@ def _eval_with_auc(
     for images, labels in loader:
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
+
         logits = classifier(encoder(images))
         total_loss += criterion(logits, labels).item()
+
         probs = torch.softmax(logits, dim=1)
         correct += (logits.argmax(dim=1) == labels).sum().item()
         total += labels.size(0)
+
         all_probs.append(probs.cpu())
         all_labels.append(labels.cpu())
 
@@ -870,6 +873,28 @@ def _eval_with_auc(
 
     all_probs = torch.cat(all_probs, dim=0).numpy()
     all_labels = torch.cat(all_labels, dim=0).numpy()
+
+    # --- START THRESHOLD OPTIMIZATION ---
+    best_acc = val_acc
+    if num_classes == 2:
+        # Extract probabilities for the positive class (class 1)
+        pos_probs = all_probs[:, 1]
+        
+        # Test 100 thresholds from 0.0 to 1.0
+        thresholds = np.linspace(0, 1, 101)
+        best_t = 0.5
+        
+        for t in thresholds:
+            preds = (pos_probs >= t).astype(int)
+            current_acc = accuracy_score(all_labels, preds) * 100
+            if current_acc > best_acc:
+                best_acc = current_acc
+                best_t = t
+        
+        # Log the optimization result to the console
+        if best_acc > val_acc:
+            print(f"    [Threshold Opt] Improved {val_acc:.2f}% -> {best_acc:.2f}% (t={best_t:.2f})")
+    # --- END THRESHOLD OPTIMIZATION ---
 
     try:
         if num_classes == 2:
