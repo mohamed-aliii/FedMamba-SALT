@@ -857,7 +857,7 @@ def _eval_with_auc(
     for images, labels in loader:
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
-
+        
         logits = classifier(encoder(images))
         total_loss += criterion(logits, labels).item()
 
