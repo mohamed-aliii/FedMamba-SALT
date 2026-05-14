@@ -654,16 +654,24 @@ def train_finetune(
             # --- Mixup ---
             images, targets_a, targets_b, lam = mixup_data(images, labels, MIXUP_ALPHA)
 
+            optimizer.zero_grad()  # FIX BUG 2: zero_grad before forward, not after backward
+
             with autocast(device_type=_device_type, enabled=("cuda" in device)):
-                features = encoder(images)
+                # FIX BUG 1: return_patches=False forces GAP output (B, embed_dim),
+                # not patch tokens (B, 196, embed_dim). Without this the classifier
+                # receives a 3D tensor, produces garbage logits, and loss goes NaN
+                # after warmup ends and the encoder starts receiving gradients.
+                features = encoder(images, return_patches=False)
                 logits = classifier(features)
                 loss = mixup_criterion(criterion, logits, targets_a, targets_b, lam)
 
-            optimizer.zero_grad()
             scaler.scale(loss).backward()
             
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+            # FIX BUG 3: only clip params that are actually being trained;
+            # clipping frozen encoder params dilutes the effective norm during warmup.
+            active_params = [p for p in all_params if p.requires_grad]
+            torch.nn.utils.clip_grad_norm_(active_params, max_norm=1.0)
             
             scaler.step(optimizer)
             scaler.update()
@@ -779,7 +787,7 @@ def _quick_eval(
     for images, labels in loader:
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
-        logits = classifier(encoder(images))
+        logits = classifier(encoder(images, return_patches=False))
         correct += (logits.argmax(dim=1) == labels).sum().item()
         total += labels.size(0)
     return 100.0 * correct / total
