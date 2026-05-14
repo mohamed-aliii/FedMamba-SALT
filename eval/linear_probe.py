@@ -657,11 +657,10 @@ def train_finetune(
             optimizer.zero_grad()  # FIX BUG 2: zero_grad before forward, not after backward
 
             with autocast(device_type=_device_type, enabled=("cuda" in device)):
-                # FIX BUG 1: return_patches=False forces GAP output (B, embed_dim),
-                # not patch tokens (B, 196, embed_dim). Without this the classifier
-                # receives a 3D tensor, produces garbage logits, and loss goes NaN
-                # after warmup ends and the encoder starts receiving gradients.
-                features = encoder(images, return_patches=False)
+                # encoder is a PatchEncoderWrapper which calls return_patches=True
+                # internally, feeding (B, 196, D) patch tokens to AttentionPoolClassifier.
+                # Do NOT pass return_patches here — the wrapper handles it.
+                features = encoder(images)
                 logits = classifier(features)
                 loss = mixup_criterion(criterion, logits, targets_a, targets_b, lam)
 
@@ -787,7 +786,7 @@ def _quick_eval(
     for images, labels in loader:
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
-        logits = classifier(encoder(images, return_patches=False))
+        logits = classifier(encoder(images))
         correct += (logits.argmax(dim=1) == labels).sum().item()
         total += labels.size(0)
     return 100.0 * correct / total
