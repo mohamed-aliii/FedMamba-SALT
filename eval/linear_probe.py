@@ -573,7 +573,7 @@ def train_finetune(
     Returns:
         dict with lists of per-epoch metrics for visualization.
     """
-    encoder_lr = lr / 3.0
+    encoder_lr = lr / 10.0
 
     param_groups = [
         {"params": encoder.parameters(),   "lr": encoder_lr, "weight_decay": 0.01},
