@@ -65,7 +65,7 @@ FEDMAE_BASELINE = 81.93  # % accuracy, centralized baseline, Retina
 
 # Early stopping for fine-tuning
 FINETUNE_PATIENCE = 30  # stop if val_acc doesn't improve for this many epochs
-FINETUNE_WARMUP = 1     # warmup epochs for fine-tuning
+# Warmup length is computed dynamically inside train_finetune as min(5, epochs//10)
 
 # Mixup / CutMix
 MIXUP_ALPHA = 0.2       # Beta distribution parameter for Mixup (0.4 was too aggressive for 9K images)
@@ -497,11 +497,11 @@ def train_finetune(
     """End-to-end fine-tuning of encoder + classifier.
 
     Key design decisions:
-      1. Encoder LR = lr/10.  The pre-trained features now achieve 74% val
-         accuracy, so they are USEFUL and should be preserved with gentle
-         adaptation (not destroyed with high LR).
-      2. Warmup: 5 epochs linear warmup from lr/20 to target LR.
-      3. CosineAnnealingLR after warmup for smooth convergence.
+      1. Encoder LR = lr/2.  The pre-trained features achieve ~74% val accuracy,
+         so they are USEFUL. A moderate reduction (not aggressive lr/10) lets the
+         encoder adapt meaningfully while preserving learned structure.
+      2. Warmup: min(5, epochs//10) epochs linear warmup from lr*0.1 to target LR.
+      3. CosineAnnealingLR after warmup for smooth convergence, eta_min=1e-4.
       4. Label smoothing (0.1) for regularization.
       5. Strong weight decay (0.1) to prevent overfitting on 9K images.
       6. Per-epoch validation with early stopping.
@@ -511,8 +511,9 @@ def train_finetune(
         dict with lists of per-epoch metrics for visualization.
     """
     # -- Learning rates --
-    # Encoder gets lr/10: pre-trained features are already ~76% val accuracy,
-    # so they are USEFUL. Gentle adaptation preserves them.
+    # Encoder gets lr/2: pre-trained features are already ~76% val accuracy,
+    # so they are USEFUL. A moderate reduction (not aggressive lr/10) allows
+    # the encoder to adapt meaningfully while still preserving learned structure.
     # Classifier gets full lr: starts from random init, needs faster movement.
     encoder_lr = lr / 2.0
 
@@ -525,14 +526,15 @@ def train_finetune(
     ]
     optimizer = AdamW(param_groups)
 
-    # -- Scheduler: 5-epoch linear warmup on encoder, then cosine with floor --
+    # -- Scheduler: linear warmup on encoder, then cosine with floor --
     #
-    # Why 5 epochs instead of 1:
-    #   With FINETUNE_WARMUP=1 (~70 steps), the encoder jumps from frozen to
-    #   full lr/10 with no ramp. The first post-unfreeze epoch can partially
-    #   destroy representations before cosine decay helps. 5 epochs gives the
-    #   encoder gradients time to stabilize before the full LR hits.
-    #   (Same rationale as train_centralized.py's 10-epoch warmup.)
+    # Why warmup instead of jumping straight to full LR:
+    #   The encoder jumps from frozen (warmup phase) to active gradients at
+    #   epoch WARMUP_EPOCHS. A short ramp prevents the first post-unfreeze
+    #   epoch from partially destroying representations before cosine decay
+    #   kicks in. (Same rationale as train_centralized.py's 10-epoch warmup.)
+    #   WARMUP_EPOCHS = min(5, epochs // 10): scales with --epochs so short
+    #   eval runs (e.g. --epochs 10) still get a 1-epoch ramp rather than 0.
     #
     # Why SequentialLR instead of manual loop writes:
     #   Manual pg["lr"] writes inside the loop fight the scheduler's internal
@@ -540,26 +542,25 @@ def train_finetune(
     #   because step() is skipped during warmup). SequentialLR owns the full
     #   schedule and steps cleanly every epoch.
     #
-    # Why eta_min = lr * 0.01 (not 0):
+    # Why eta_min = 1e-4 (not 0):
     #   Default eta_min=0 decays to ~1e-7 by epoch 45 of 50 — the last 10 epochs
-    #   do essentially nothing while burning Colab compute. lr*0.01 = 1e-5 keeps
-    #   late-epoch updates meaningful. Mirrors the fix in train_centralized.py.
+    #   do essentially nothing while burning Colab compute. A fixed floor of 1e-4
+    #   keeps late-epoch updates meaningful for both encoder and classifier,
+    #   regardless of the chosen base lr.
     #
     # Classifier scheduler: no warmup needed (random init is fine at full LR).
     # Both param groups share one SequentialLR; their per-group LRs are set
     # individually via param_groups so the scheduler multiplier applies correctly.
 
     WARMUP_EPOCHS = min(5, max(1, epochs // 10))
-    # eta_min relative to base lr (not encoder_lr):
-    # encoder: 1e-4 → 1e-5  (10x drop, still active in late epochs)
-    # classifier: 1e-3 → 1e-5  (100x drop, slowing to refinement)
-    # Using encoder_lr * 0.01 = 1e-6 would be effectively stopped.
-    eta_min_enc = lr * 0.1  # 1e-5 at default lr=1e-3
+    # Fixed absolute floor — applies uniformly to encoder and classifier.
+    # encoder: lr/2 → 1e-4  (meaningful late-epoch refinement)
+    # classifier: lr  → 1e-4  (slows to fine-grained updates, never stalls)
+    eta_min_enc = 1e-4
 
     # NOTE: CosineAnnealingLR's eta_min applies to ALL param groups uniformly.
-    # The classifier will also decay to eta_min_enc. This is fine — the
-    # classifier converges quickly in early epochs at full LR; by the cosine
-    # phase it only needs fine-grained updates anyway.
+    # The classifier will also decay to 1e-4. This is intentional — by the cosine
+    # phase the classifier only needs fine-grained updates anyway.
     enc_warmup = LinearLR(
         optimizer, start_factor=0.1, end_factor=1.0,
         total_iters=WARMUP_EPOCHS, last_epoch=-1,
@@ -612,7 +613,7 @@ def train_finetune(
     print(f"\n  Fine-tuning encoder + classifier on {len(train_loader.dataset)} images...")
     print(f"  Encoder LR: {encoder_lr:.1e}  |  Classifier LR: {lr:.1e}  |  Epochs: {epochs}")
     print(f"  Warmup: {WARMUP_EPOCHS} epochs (encoder frozen, LR ramps 0.1x→1x)")
-    print(f"  Cosine decay: epochs {WARMUP_EPOCHS}→{epochs}  eta_min={eta_min_enc:.1e}  (lr*0.01)")
+    print(f"  Cosine decay: epochs {WARMUP_EPOCHS}→{epochs}  eta_min={eta_min_enc:.1e}  (fixed floor)")
     print(f"  Early stopping patience: {FINETUNE_PATIENCE} epochs")
     total_start = time.time()
     
@@ -1459,9 +1460,9 @@ def run_evaluation(
         sub_output = os.path.join(args.output_dir, "frozen_attention")
         os.makedirs(sub_output, exist_ok=True)
 
-        # Override train_finetune: encoder already frozen, so encoder_lr=0
-        # We pass lr as both — train_finetune will use lr/10 for encoder
-        # but encoder is frozen so gradients won't flow anyway
+        # Override train_finetune: encoder already frozen, so encoder_lr=0 in practice.
+        # We pass lr as both — train_finetune will use lr/2 for the encoder param group
+        # but encoder is frozen so gradients won't flow anyway.
         history = train_finetune(
             encoder, classifier, train_loader, test_loader,
             epochs=args.epochs, lr=args.lr, device=args.device,
