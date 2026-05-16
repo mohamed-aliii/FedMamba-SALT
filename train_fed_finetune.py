@@ -138,7 +138,7 @@ ACC_MIN_DELTA    = 0.05    # minimum improvement (%) to reset patience counter
 # Round-level LR schedule shared constants
 LR_WARMUP_ROUNDS  = 10     # linear warmup length (rounds)
 LR_FLAT_RATIO     = 0.30   # FedAvg flat-phase fraction of max_rounds
-LR_FLAT_RATIO_FED = 0.15   # FedProx flat-phase fraction (shorter → more cosine budget)
+LR_FLAT_RATIO_FED = 0.30   # FedProx flat-phase fraction (shorter → more cosine budget)
 LR_ETA_MIN_RATIO  = 0.10   # cosine floor = base_lr * this
 
 
