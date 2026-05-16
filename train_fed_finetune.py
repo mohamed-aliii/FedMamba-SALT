@@ -800,12 +800,12 @@ def main() -> None:
     # ------------------------------------------------------------------
     print(f"[4/4] Starting federated fine-tuning from round {start_round}...")
     _warmup_r = 5
-    _flat_r   = _warmup_r + int(args.max_rounds * (0.15 if args.mu > 0 else 0.25))
+    _flat_r   = _warmup_r + int(args.max_rounds * (0.30))
     print(f"  Round-level LR schedule (classifier / encoder):")
     print(f"    warmup={_warmup_r}r | flat={_flat_r - _warmup_r}r "
-          f"| cosine={args.max_rounds - _flat_r}r | eta_min={args.lr * 0.02:.1e}")
-    print(f"    classifier: {args.lr:.1e} → {args.lr * 0.02:.1e}")
-    print(f"    encoder:    {args.lr/2:.1e} → {args.lr/2 * 0.02:.1e}")
+          f"| cosine={args.max_rounds - _flat_r}r | eta_min={args.lr * 0.10:.1e}")
+    print(f"    classifier: {args.lr:.1e} → {args.lr * 0.10:.1e}")
+    print(f"    encoder:    {args.lr/2:.1e} → {args.lr/2 * 0.10:.1e}")
     if not freeze_encoder and args.E_epoch > 1:
         print(f"  Epoch-level encoder warmup: 10% → 100% of enc_lr over {args.E_epoch} local epochs/round")
     print(f"  Early stopping: no improvement for {LOSS_PATIENCE} rounds "
