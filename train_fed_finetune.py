@@ -9,8 +9,19 @@ labeled split, and the global model is aggregated via FedAvg every round.
 Architecture mirrors train_fedavg.py exactly:
   - Same FedAvg / FedProx aggregation logic
   - Same per-client persistent optimizer pattern (SCHEDULER FIX A)
-  - Same warmup + flat + cosine LR schedule (SCHEDULER FIX B/C/D)
+  - Same warmup + flat + cosine LR schedule at the round level (SCHEDULER FIX B/C/D)
   - Same early stopping, CSV logging, and checkpoint conventions
+
+Two-level LR scheduling (unique to fine-tuning):
+  Round level  — warmup(5r) → flat → cosine decay across communication rounds,
+                 applied once per round via in-place param_group update.
+                 Encoder group gets base_lr/2; classifier gets base_lr.
+  Epoch level  — within each round, the encoder group linearly ramps from
+                 10% → 100% of its round-target LR across the E_epoch local
+                 epochs (full_finetune mode only, skipped when E_epoch=1).
+                 This prevents the first local epoch from delivering a
+                 full-LR gradient shock to the pre-trained representations
+                 at the start of each round.
 
 Key differences from pre-training:
   - No teacher model; loss is cross-entropy on labeled data
@@ -352,20 +363,77 @@ def local_train_one_round(
     args,
     global_params: dict | None,
     freeze_encoder: bool,
+    comm_round: int = 0,
 ) -> tuple:
     """
     Run E_epoch local fine-tuning steps for a single client.
+
+    Within-round LR schedule for the encoder param group
+    ──────────────────────────────────────────────────────
+    The round-level schedule (compute_round_lr) sets the target LR once per
+    round. Inside the round, however, all E_epoch local epochs previously ran
+    at the same fixed LR — no intra-round scheduling.
+
+    For the *encoder* param group this matters:
+      - In the very first round the encoder jumps from frozen (pre-training)
+        to active gradients. Without a ramp, the first batch delivers a
+        full-LR gradient shock that can partially destroy representations.
+      - The same issue recurs every round at low round counts when the
+        round-level LR is still rising through warmup.
+
+    Fix: apply a short linear ramp over the E_epoch local epochs for the
+    encoder group only, scaling from (target_enc_lr * EPOCH_WARMUP_FACTOR)
+    up to target_enc_lr. The classifier group always runs at its target LR
+    (it starts from random init and needs full gradient speed from epoch 1).
+
+    EPOCH_WARMUP_FACTOR = 0.1 (same ratio as train_centralized.py's 10-epoch
+    warmup and train_finetune's WARMUP_EPOCHS logic).
+    Only applied in federated_finetune mode (freeze_encoder=False) and only
+    when E_epoch > 1 (a single local epoch has nothing to ramp over).
 
     Returns:
         avg_loss (float), train_acc (float)
     """
     _device_type = "cuda" if "cuda" in args.device else "cpu"
+    EPOCH_WARMUP_FACTOR = 0.1   # encoder starts each round at 10% of target LR
+
+    # Pull target LRs from optimizer state (already set by the round loop)
+    target_enc_lr = None
+    target_cls_lr = None
+    for pg in optimizer.param_groups:
+        if pg.get("group_name") == "encoder":
+            target_enc_lr = pg["lr"]
+        elif pg.get("group_name") == "classifier":
+            target_cls_lr = pg["lr"]
+
+    # Whether to apply the within-round encoder ramp
+    do_enc_warmup = (
+        not freeze_encoder
+        and target_enc_lr is not None
+        and args.E_epoch > 1
+    )
 
     total_loss = 0.0
     correct = 0
     total = 0
 
-    for _local_epoch in range(args.E_epoch):
+    for local_epoch in range(args.E_epoch):
+
+        # ── Within-round epoch-level LR for the encoder group ──────────
+        # Classifier always gets its full target LR; only the encoder ramps.
+        # Linear interpolation: epoch 0 → EPOCH_WARMUP_FACTOR × target,
+        #                       epoch E_epoch-1 → target (full LR).
+        if do_enc_warmup:
+            # fraction goes from EPOCH_WARMUP_FACTOR at epoch 0 to 1.0 at
+            # epoch E_epoch-1, giving E_epoch-1 equal steps.
+            frac = EPOCH_WARMUP_FACTOR + (1.0 - EPOCH_WARMUP_FACTOR) * (
+                local_epoch / max(args.E_epoch - 1, 1)
+            )
+            for pg in optimizer.param_groups:
+                if pg.get("group_name") == "encoder":
+                    pg["lr"] = target_enc_lr * frac
+        # ───────────────────────────────────────────────────────────────
+
         if not freeze_encoder:
             encoder.train()
         else:
@@ -428,6 +496,13 @@ def local_train_one_round(
             dom_labels = targets_a if lam >= 0.5 else targets_b
             correct += (logits.argmax(dim=1) == dom_labels).sum().item()
             total += images.size(0)
+
+    # Restore encoder to its full target LR after the within-round ramp,
+    # so the round-level schedule reads back the correct value next round.
+    if do_enc_warmup and target_enc_lr is not None:
+        for pg in optimizer.param_groups:
+            if pg.get("group_name") == "encoder":
+                pg["lr"] = target_enc_lr
 
     avg_loss = total_loss / max(total, 1)
     train_acc = 100.0 * correct / max(total, 1)
@@ -676,6 +751,10 @@ def main() -> None:
     # Persistent per-client optimizers (SCHEDULER FIX A from train_fedavg.py):
     # Re-creating the optimizer every round discards AdamW momentum buffers,
     # making late-round cosine LR reductions ineffective.
+    #
+    # Each param group carries a stable "group_name" tag so the round-level LR
+    # update can identify groups by name instead of by weight_decay value (which
+    # is fragile if both groups ever share the same decay setting).
     def _make_optimizer(enc, cls):
         enc_params = [p for p in enc.parameters() if p.requires_grad]
         cls_params = [p for p in cls.parameters() if p.requires_grad]
@@ -685,14 +764,16 @@ def main() -> None:
         param_groups = []
         if enc_params:
             param_groups.append({
-                "params": enc_params,
-                "lr": args.lr / 2.0,
+                "params":       enc_params,
+                "lr":           args.lr / 2.0,
                 "weight_decay": 0.01,
+                "group_name":   "encoder",
             })
         param_groups.append({
-            "params": cls_params,
-            "lr": args.lr,
+            "params":       cls_params,
+            "lr":           args.lr,
             "weight_decay": 0.05,
+            "group_name":   "classifier",
         })
         return AdamW(param_groups, betas=(0.9, 0.999))
 
@@ -720,8 +801,13 @@ def main() -> None:
     print(f"[4/4] Starting federated fine-tuning from round {start_round}...")
     _warmup_r = 5
     _flat_r   = _warmup_r + int(args.max_rounds * (0.15 if args.mu > 0 else 0.25))
-    print(f"  LR schedule:   warmup={_warmup_r}r | flat={_flat_r - _warmup_r}r "
+    print(f"  Round-level LR schedule (classifier / encoder):")
+    print(f"    warmup={_warmup_r}r | flat={_flat_r - _warmup_r}r "
           f"| cosine={args.max_rounds - _flat_r}r | eta_min={args.lr * 0.02:.1e}")
+    print(f"    classifier: {args.lr:.1e} → {args.lr * 0.02:.1e}")
+    print(f"    encoder:    {args.lr/2:.1e} → {args.lr/2 * 0.02:.1e}")
+    if not freeze_encoder and args.E_epoch > 1:
+        print(f"  Epoch-level encoder warmup: 10% → 100% of enc_lr over {args.E_epoch} local epochs/round")
     print(f"  Early stopping: no improvement for {LOSS_PATIENCE} rounds "
           f"(threshold >{ACC_MIN_DELTA:.2f}%)")
     print("=" * 60)
@@ -758,17 +844,21 @@ def main() -> None:
             opt   = client_optimizers[cid]
             scl   = client_scalers[cid]
 
-            # Update LR in-place (preserves momentum buffers, see SCHEDULER FIX A)
+            # Update round-level LR in-place via group_name tag.
+            # This is the stable alternative to the old weight_decay comparison:
+            # group_name is set once at optimizer construction and never changes,
+            # so it correctly identifies groups even if both happen to share the
+            # same weight_decay value in future config changes.
             for pg in opt.param_groups:
-                # param_groups[0] = encoder (if unfrozen), param_groups[-1] = classifier
-                if "weight_decay" in pg and pg["weight_decay"] == 0.01:
+                if pg.get("group_name") == "encoder":
                     pg["lr"] = enc_lr
-                else:
+                else:  # "classifier"
                     pg["lr"] = cls_lr
 
             loss, tacc = local_train_one_round(
                 enc, cls, client_loaders[cid], opt, scl,
                 criterion, args, global_params, freeze_encoder,
+                comm_round=comm_round,
             )
             client_losses.append(loss)
             client_train_acc.append(tacc)
