@@ -814,7 +814,7 @@ def main() -> None:
     # 4. Federated fine-tuning loop
     # ------------------------------------------------------------------
     print(f"[4/4] Starting federated fine-tuning from round {start_round}...")
-    _warmup_r = 5
+    _warmup_r = 10
     _flat_r   = _warmup_r + int(args.max_rounds * (0.30))
     print(f"  Round-level LR schedule (classifier / encoder):")
     print(f"    warmup={_warmup_r}r | flat={_flat_r - _warmup_r}r "
