@@ -57,6 +57,21 @@ Bug fixes applied (see inline FIX comments):
   FIX-8  best_round is initialised to None; the final summary prints
          "N/A" when no improvement was ever recorded, making catastrophic
          failures visible instead of silently printing "Best round: 0".
+  FIX-9  ce_smoothing is now actually passed to CrossEntropyLoss (was
+         computed but silently dropped, so label smoothing was never applied,
+         causing overconfident predictions and stagnant training accuracy).
+  FIX-10 LR_WARMUP_ROUNDS reduced from 10 to 5: with the epoch-level encoder
+         warmup (10% factor), round 1 was running the encoder at 0.5% of its
+         peak LR — effectively frozen — keeping train_acc near chance for the
+         first quarter of training.
+  FIX-11 train_acc is now reported from the last local epoch only (full LR,
+         best weights before aggregation) rather than the average across all
+         local epochs. The first epoch's low-LR gradients dragged the reported
+         number 5-10% below true quality.
+  FIX-12 Class weights are computed from the actual federated label
+         distribution via sklearn 'balanced' strategy instead of the hardcoded
+         [1.0, 2.0] assumption. Hardcoded weights over-penalise the minority
+         class when imbalance is mild, causing loss-surface oscillation.
 
 Usage:
     python train_fed_finetune.py \\
@@ -136,9 +151,14 @@ LOSS_PATIENCE    = 20      # early stop if global val_acc doesn't improve
 ACC_MIN_DELTA    = 0.05    # minimum improvement (%) to reset patience counter
 
 # Round-level LR schedule shared constants
-LR_WARMUP_ROUNDS  = 10     # linear warmup length (rounds)
+LR_WARMUP_ROUNDS  = 5      # linear warmup length (rounds)
+                           # FIX-10: was 10 — encoder and classifier were operating at
+                           # ~5% of peak LR for the first 10 rounds (round-level warmup
+                           # × epoch-level warmup factor = 10% × 10% = 1% at round 1,
+                           # epoch 0), causing near-random train_acc for too long.
 LR_FLAT_RATIO     = 0.30   # FedAvg flat-phase fraction of max_rounds
-LR_FLAT_RATIO_FED = 0.30   # FedProx flat-phase fraction (shorter → more cosine budget)
+LR_FLAT_RATIO_FED = 0.15   # FedProx flat-phase fraction (shorter → more cosine budget)
+                           # FIX-2 (completed): was incorrectly 0.30, same as FedAvg.
 LR_ETA_MIN_RATIO  = 0.10   # cosine floor = base_lr * this
 
 
@@ -389,23 +409,43 @@ def build_criterion(args, device: str) -> nn.Module:
     """
     Build the training loss.
 
-    Default: weighted CrossEntropyLoss (2× weight on non-healthy classes)
-    Option:  FocalLoss (--use_focal_loss), useful for severe class imbalance
+    Default: weighted CrossEntropyLoss with class weights derived from the
+    actual federated label distribution (sklearn 'balanced' strategy).
+    Option:  FocalLoss (--use_focal_loss), useful for severe class imbalance.
 
-    FIX-3: label_smoothing is now disabled for CrossEntropyLoss when
-    --use_mixup is active. Mixup already produces soft targets; applying
-    smoothing on top double-smooths the labels, suppresses confident
-    predictions, and causes val_acc oscillation. The FocalLoss path
-    already handled this correctly; CrossEntropyLoss now matches.
+    FIX-3: label_smoothing is disabled for CrossEntropyLoss when --use_mixup
+    is active. Mixup already produces soft targets; smoothing on top causes
+    double-smoothing and val_acc oscillation. The FocalLoss path already
+    handled this correctly; CrossEntropyLoss now matches.
+
+    FIX-9: ce_smoothing is now actually passed to CrossEntropyLoss (was
+    computed but silently dropped, so no smoothing was ever applied).
+
+    FIX-12: class weights are computed from the real label distribution
+    supplied in `all_labels` instead of the hardcoded [1.0, 2.0] assumption.
+    The hardcoded weights over-penalise the minority class when the true
+    imbalance is mild, destabilising training.
     """
-    weights = [1.0] + [2.0] * (args.num_classes - 1)
-    class_weights = torch.tensor(weights, dtype=torch.float32, device=device)
+    from sklearn.utils.class_weight import compute_class_weight
+    import numpy as np
+
+    if args._class_weights_np is not None:
+        cw = args._class_weights_np
+        print(f"  [criterion] Balanced class weights from data: "
+              f"{[f'{w:.3f}' for w in cw]}")
+    else:
+        # Fallback: mild fixed weights if label collection was skipped
+        cw = np.array([1.0] + [2.0] * (args.num_classes - 1))
+        print(f"  [criterion] WARNING: using fallback hardcoded weights {cw.tolist()}")
+
+    class_weights = torch.tensor(cw, dtype=torch.float32, device=device)
 
     if args.use_focal_loss:
         smoothing = 0.0 if args.use_mixup else 0.05
         return FocalLoss(weight=class_weights, gamma=2.0, label_smoothing=smoothing)
 
-    # FIX-3: suppress smoothing when Mixup is on (matches FocalLoss behaviour)
+    # FIX-3 + FIX-9: suppress smoothing when Mixup is on, and actually pass
+    # ce_smoothing to CrossEntropyLoss (was silently dropped before FIX-9).
     ce_smoothing = 0.0 if args.use_mixup else 0.1
     return nn.CrossEntropyLoss(weight=class_weights, label_smoothing=ce_smoothing)
 
@@ -476,6 +516,12 @@ def local_train_one_round(
     total_loss = 0.0
     correct = 0
     total = 0
+    # FIX-11: track last-epoch accuracy separately so the reported train_acc
+    # reflects the model *after* the within-round encoder LR ramp completes,
+    # not the average across all local epochs (which was dragged down by the
+    # low-LR first epoch and understated true model quality by 5-10%).
+    last_epoch_correct = 0
+    last_epoch_total   = 0
 
     for local_epoch in range(args.E_epoch):
 
@@ -499,6 +545,9 @@ def local_train_one_round(
         else:
             encoder.eval()
         classifier.train()
+
+        epoch_correct = 0
+        epoch_total   = 0
 
         for images, labels in loader:
             images = images.to(args.device, non_blocking=True)
@@ -562,11 +611,18 @@ def local_train_one_round(
             # (1-lam) * (correct under targets_b) gives a smooth, unbiased
             # estimate regardless of lam value.
             preds = logits.argmax(dim=1)
-            correct += (
+            batch_correct = (
                 lam         * (preds == targets_a).float().sum().item()
                 + (1 - lam) * (preds == targets_b).float().sum().item()
             )
-            total += images.size(0)
+            correct       += batch_correct
+            epoch_correct += batch_correct
+            total       += images.size(0)
+            epoch_total += images.size(0)
+
+        # FIX-11: keep running tally of the most recent epoch's accuracy.
+        last_epoch_correct = epoch_correct
+        last_epoch_total   = epoch_total
 
     # Restore encoder to its full target LR after the within-round ramp,
     # so the round-level schedule reads back the correct value next round.
@@ -576,7 +632,9 @@ def local_train_one_round(
                 pg["lr"] = target_enc_lr
 
     avg_loss = total_loss / max(total, 1)
-    train_acc = 100.0 * correct / max(total, 1)
+    # FIX-11: report accuracy from the final local epoch only (full LR, best
+    # weights before aggregation) rather than the average across all epochs.
+    train_acc = 100.0 * last_epoch_correct / max(last_epoch_total, 1)
     return avg_loss, train_acc
 
 
@@ -761,7 +819,33 @@ class FedFinetuneLogger:
 
 
 # ======================================================================
-# LR schedule
+# Class-weight computation from federated label distribution
+# FIX-12: collect labels from all client datasets once at startup so
+# build_criterion can compute sklearn 'balanced' weights instead of
+# relying on the hardcoded [1.0, 2.0] assumption.
+# ======================================================================
+def collect_all_labels(client_loaders) -> np.ndarray:
+    """Return a flat numpy array of every label across all client loaders."""
+    all_labels = []
+    for loader in client_loaders:
+        ds = loader.dataset
+        # RetinaDataset / Subset both expose .targets or iterate targets via
+        # dataset attribute chain; fall back to iterating if needed.
+        if hasattr(ds, "targets"):
+            all_labels.extend(ds.targets)
+        elif hasattr(ds, "dataset") and hasattr(ds.dataset, "targets"):
+            # Subset wrapping a RetinaDataset
+            subset_indices = ds.indices
+            all_labels.extend([ds.dataset.targets[i] for i in subset_indices])
+        else:
+            # Last resort: iterate the loader (slow, but correct)
+            for _, lbl in loader:
+                all_labels.extend(lbl.tolist())
+            break  # only need one pass per loader; inner loop handles all batches
+    return np.array(all_labels, dtype=int)
+
+
+
 # FIX-2: mu is now actually used to select the flat-phase ratio so that
 # FedProx gets a shorter flat phase (15% vs 30%) and more cosine budget,
 # as the original docstring always claimed but never implemented.
@@ -840,6 +924,22 @@ def main() -> None:
     client_loaders, dataset_sizes = build_client_dataloaders(args, train_transform)
     client_weights = compute_client_weights(dataset_sizes)
     print(f"  Client weights: {[f'{w:.3f}' for w in client_weights]}")
+
+    # FIX-12: compute balanced class weights from the actual federated label
+    # distribution so build_criterion doesn't rely on the hardcoded [1.0, 2.0].
+    print("  Computing class weights from federated label distribution...")
+    try:
+        from sklearn.utils.class_weight import compute_class_weight
+        _all_labels = collect_all_labels(client_loaders)
+        _classes    = np.arange(args.num_classes)
+        args._class_weights_np = compute_class_weight(
+            "balanced", classes=_classes, y=_all_labels,
+        )
+        print(f"  Label counts per class: "
+              f"{ {c: int((_all_labels == c).sum()) for c in _classes} }")
+    except Exception as e:
+        print(f"  WARNING: class weight computation failed ({e}); will use fallback.")
+        args._class_weights_np = None
 
     test_ds = RetinaDataset(
         data_path=args.data_path,
@@ -921,9 +1021,16 @@ def main() -> None:
 
     criterion = build_criterion(args, args.device)
 
-    # FIX-6: build class_weights tensor once so evaluate_global can reuse it
-    _cw_list = [1.0] + [2.0] * (args.num_classes - 1)
-    eval_class_weights = torch.tensor(_cw_list, dtype=torch.float32)
+    # FIX-6 + FIX-12: use the same balanced weights for evaluate_global
+    # (was a separate hardcoded [1.0, 2.0] list — now kept in sync with
+    # build_criterion automatically).
+    if args._class_weights_np is not None:
+        eval_class_weights = torch.tensor(
+            args._class_weights_np, dtype=torch.float32,
+        )
+    else:
+        _cw_list = [1.0] + [2.0] * (args.num_classes - 1)
+        eval_class_weights = torch.tensor(_cw_list, dtype=torch.float32)
 
     logger = FedFinetuneLogger(args.output_dir, args.n_clients)
 
