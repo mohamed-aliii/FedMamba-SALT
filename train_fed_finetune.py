@@ -927,10 +927,13 @@ def main() -> None:
         client_loss_str = "  ".join(
             f"c{i+1}={client_losses[i]:.4f}" for i in range(args.n_clients)
         )
+        avg_train_acc = sum(
+            client_train_acc[i] * client_weights[i] for i in range(args.n_clients)
+        )
         marker = " *BEST*" if is_best else ""
         print(
             f"  Round [{comm_round + 1:3d}/{args.max_rounds}]  "
-            f"val={val_acc:.2f}%  auc={val_auc:.4f}  "
+            f"train_acc={avg_train_acc:.2f}%  val={val_acc:.2f}%  auc={val_auc:.4f}  "
             f"val_loss={val_loss:.4f}  "
             f"enc_lr={enc_lr:.1e}  cls_lr={cls_lr:.1e}  "
             f"time={round_time:.1f}s  {client_loss_str}{marker}"
