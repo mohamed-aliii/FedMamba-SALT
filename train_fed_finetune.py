@@ -512,7 +512,7 @@ def local_train_one_round(
         avg_loss (float), train_acc (float)
     """
     _device_type = "cuda" if "cuda" in args.device else "cpu"
-    EPOCH_WARMUP_FACTOR = 0.1   # encoder starts each round at 10% of target LR
+    EPOCH_WARMUP_FACTOR = 0.05  # encoder starts each round at 5% of target LR
 
     # Pull target LRs from optimizer state (already set by the round loop)
     target_enc_lr = None
@@ -1079,7 +1079,7 @@ def main() -> None:
     # then fine-tune" curriculum in transfer learning.
     # Skipped on resume (start_round > 0) and in linear_probe mode.
     # ------------------------------------------------------------------
-    PROBE_ROUNDS = 0 if freeze_encoder else 5
+    PROBE_ROUNDS = 0 if freeze_encoder else 3
 
     if PROBE_ROUNDS > 0 and start_round == 0:
         print(f"\n  [Warm-start] Freezing encoder for {PROBE_ROUNDS} head-only "
@@ -1152,7 +1152,7 @@ def main() -> None:
     print(f"    classifier: {args.lr:.1e} → {args.lr * LR_ETA_MIN_RATIO:.1e}")
     print(f"    encoder:    {args.lr/2:.1e} → {args.lr/2 * LR_ETA_MIN_RATIO:.1e}")
     if not freeze_encoder and args.E_epoch > 1:
-        print(f"  Epoch-level encoder warmup: 10% → 100% of enc_lr over {args.E_epoch} local epochs/round")
+        print(f"  Epoch-level encoder warmup: 5% → 100% of enc_lr over {args.E_epoch} local epochs/round")
     print(f"  Early stopping: no improvement for {LOSS_PATIENCE} rounds "
           f"(threshold >{ACC_MIN_DELTA:.2f}%)")
     print("=" * 60)
@@ -1165,14 +1165,33 @@ def main() -> None:
         "val_auc": [], "enc_lr": [], "cls_lr": [],
     }
 
+    # FIX-14: after the warm-start probe the classifier is oriented but the
+    # encoder has been frozen. Applying full enc_lr immediately in round 1
+    # disrupts the head's learned direction (train_acc regresses ~4% vs probe).
+    # Solution: add an extra per-round encoder damping factor that starts at
+    # POST_PROBE_FACTOR and linearly reaches 1.0 after POST_PROBE_RAMP rounds.
+    # This is multiplicative on top of the normal round-level schedule so the
+    # two warmup mechanisms compose cleanly.
+    POST_PROBE_FACTOR = 0.1   # encoder starts at 10% of its scheduled LR
+    POST_PROBE_RAMP   = 5     # reaches 100% by round 5
+
     for comm_round in range(start_round, args.max_rounds):
         round_start = time.time()
 
         # ---- Compute current LR ----
         current_lr = compute_round_lr(comm_round, args.max_rounds, args.lr, args.mu)
         # Encoder gets lr/2; classifier gets full lr (mirrors _make_optimizer)
-        enc_lr = current_lr / 2.0
         cls_lr = current_lr
+
+        # FIX-14: post-probe encoder damping — ramps from POST_PROBE_FACTOR
+        # to 1.0 over POST_PROBE_RAMP rounds, then stays at 1.0.
+        if PROBE_ROUNDS > 0 and comm_round < POST_PROBE_RAMP:
+            post_probe_scale = POST_PROBE_FACTOR + (1.0 - POST_PROBE_FACTOR) * (
+                comm_round / max(POST_PROBE_RAMP - 1, 1)
+            )
+        else:
+            post_probe_scale = 1.0
+        enc_lr = (current_lr / 2.0) * post_probe_scale
 
         # ---- FedProx: snapshot global params before any client trains ----
         global_params = None
