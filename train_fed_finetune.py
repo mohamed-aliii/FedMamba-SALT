@@ -651,10 +651,10 @@ def compute_round_lr(comm_round: int, max_rounds: int, base_lr: float,
     FedProx uses a shorter flat phase (15% vs 25%) to spend more budget
     in the cosine phase, compensating for the extra regularization from mu.
     """
-    WARMUP_ROUNDS = 5
-    FLAT_RATIO    = 0.15 if mu > 0 else 0.25
+    WARMUP_ROUNDS = 10
+    FLAT_RATIO    = 0.30
     FLAT_ROUNDS   = WARMUP_ROUNDS + int(max_rounds * FLAT_RATIO)
-    eta_min       = base_lr * 0.02
+    eta_min       = base_lr * 0.10
 
     if comm_round < WARMUP_ROUNDS:
         return base_lr * (comm_round + 1) / WARMUP_ROUNDS
