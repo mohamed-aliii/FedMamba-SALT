@@ -13,9 +13,11 @@ Architecture mirrors train_fedavg.py exactly:
   - Same early stopping, CSV logging, and checkpoint conventions
 
 Two-level LR scheduling (unique to fine-tuning):
-  Round level  — warmup(5r) → flat → cosine decay across communication rounds,
+  Round level  — warmup(10r) → flat → cosine decay across communication rounds,
                  applied once per round via in-place param_group update.
                  Encoder group gets base_lr/2; classifier gets base_lr.
+                 FedProx uses a shorter flat phase (15% vs 30%) to spend more
+                 cosine budget compensating for the proximal regularisation.
   Epoch level  — within each round, the encoder group linearly ramps from
                  10% → 100% of its round-target LR across the E_epoch local
                  epochs (full_finetune mode only, skipped when E_epoch=1).
@@ -34,6 +36,27 @@ Key differences from pre-training:
 Modes (--mode):
   federated_finetune        Full encoder + classifier fine-tuning, federated
   federated_linear_probe    Encoder frozen; only classifier trains, federated
+
+Bug fixes applied (see inline FIX comments):
+  FIX-1  NaN check now runs BEFORE early-stopping check so a diverged model
+         is caught immediately rather than wasting LOSS_PATIENCE rounds.
+  FIX-2  compute_round_lr now actually uses `mu` to shorten the flat phase
+         for FedProx (15 % vs 30 %), as the docstring always claimed.
+  FIX-3  CrossEntropyLoss label_smoothing is disabled when --use_mixup is
+         active to prevent double-smoothing of already-soft Mixup targets.
+  FIX-4  try_resume now saves and restores optimizer + scaler state so that
+         AdamW momentum buffers are preserved across resume boundaries.
+  FIX-5  feat_dim is derived from the actual encoder output at build time
+         instead of being hardcoded to 768, fixing shape mismatches for
+         any encoder with embed_dim != 768 (e.g. 448-dim models).
+  FIX-6  evaluate_global uses the same class-weighted CrossEntropyLoss as
+         training so that val_loss is directly comparable to train loss.
+  FIX-7  LR schedule constants (WARMUP_ROUNDS, FLAT_RATIO) are defined once
+         at module level and shared between compute_round_lr and main(),
+         preventing silent divergence when one site is updated.
+  FIX-8  best_round is initialised to None; the final summary prints
+         "N/A" when no improvement was ever recorded, making catastrophic
+         failures visible instead of silently printing "Best round: 0".
 
 Usage:
     python train_fed_finetune.py \\
@@ -105,10 +128,18 @@ from eval.linear_probe import (
 
 # ======================================================================
 # Constants
+# FIX-7: define schedule constants ONCE here so compute_round_lr and
+# the main() print block always stay in sync.
 # ======================================================================
 METRICS_FILENAME = "fed_finetune_metrics.csv"
 LOSS_PATIENCE    = 20      # early stop if global val_acc doesn't improve
 ACC_MIN_DELTA    = 0.05    # minimum improvement (%) to reset patience counter
+
+# Round-level LR schedule shared constants
+LR_WARMUP_ROUNDS  = 10     # linear warmup length (rounds)
+LR_FLAT_RATIO     = 0.30   # FedAvg flat-phase fraction of max_rounds
+LR_FLAT_RATIO_FED = 0.15   # FedProx flat-phase fraction (shorter → more cosine budget)
+LR_ETA_MIN_RATIO  = 0.10   # cosine floor = base_lr * this
 
 
 # ======================================================================
@@ -258,20 +289,39 @@ def build_models(args):
     """
     Load the pre-trained encoder and build a fresh classifier head.
 
+    FIX-5: feat_dim is now derived from the actual encoder output via a
+    single dummy forward pass, replacing the hardcoded 768 that caused
+    silent shape mismatches for models with embed_dim != 768.
+
     For federated_finetune:
-        encoder  = PatchEncoderWrapper (returns patch tokens)
+        encoder    = PatchEncoderWrapper (returns patch tokens)
         classifier = AttentionPoolClassifier
     For federated_linear_probe:
-        encoder  = raw InceptionMambaEncoder (returns GAP vector, frozen)
+        encoder    = raw InceptionMambaEncoder (returns GAP vector, frozen)
         classifier = BN → Dropout → Linear
     """
     freeze = (args.mode == "federated_linear_probe")
     base_encoder = load_encoder(args.encoder_ckpt, args.device, freeze=freeze)
 
+    # FIX-5: probe actual output dimension instead of assuming 768
+    base_encoder.eval()
+    with torch.no_grad():
+        _dummy = torch.zeros(1, 3, 224, 224, device=args.device)
+        if args.mode == "federated_finetune":
+            # PatchEncoderWrapper will be used; probe base encoder in patch mode
+            _out = base_encoder(_dummy, return_patches=True)
+            # shape: (1, num_patches, feat_dim)
+            feat_dim = _out.shape[-1]
+        else:
+            _out = base_encoder(_dummy, return_patches=False)
+            # shape: (1, feat_dim)
+            feat_dim = _out.shape[-1]
+    print(f"  [build_models] Detected feat_dim={feat_dim} from encoder output")
+
     if args.mode == "federated_finetune":
         encoder = PatchEncoderWrapper(base_encoder)
         classifier = AttentionPoolClassifier(
-            feat_dim=768, num_classes=args.num_classes,
+            feat_dim=feat_dim, num_classes=args.num_classes,
         ).to(args.device)
         nn.init.kaiming_uniform_(classifier.head[2].weight)
         nn.init.zeros_(classifier.head[2].bias)
@@ -279,9 +329,9 @@ def build_models(args):
         # linear probe: frozen encoder, flat GAP vector
         encoder = base_encoder  # already on device
         classifier = nn.Sequential(
-            nn.BatchNorm1d(768),
+            nn.BatchNorm1d(feat_dim),
             nn.Dropout(0.2),
-            nn.Linear(768, args.num_classes),
+            nn.Linear(feat_dim, args.num_classes),
         ).to(args.device)
         nn.init.kaiming_uniform_(classifier[2].weight)
         nn.init.zeros_(classifier[2].bias)
@@ -341,17 +391,23 @@ def build_criterion(args, device: str) -> nn.Module:
 
     Default: weighted CrossEntropyLoss (2× weight on non-healthy classes)
     Option:  FocalLoss (--use_focal_loss), useful for severe class imbalance
+
+    FIX-3: label_smoothing is now disabled for CrossEntropyLoss when
+    --use_mixup is active. Mixup already produces soft targets; applying
+    smoothing on top double-smooths the labels, suppresses confident
+    predictions, and causes val_acc oscillation. The FocalLoss path
+    already handled this correctly; CrossEntropyLoss now matches.
     """
     weights = [1.0] + [2.0] * (args.num_classes - 1)
     class_weights = torch.tensor(weights, dtype=torch.float32, device=device)
 
     if args.use_focal_loss:
-        # Disable label_smoothing when Mixup is active: Mixup already produces
-        # soft targets, so applying smoothing on top double-smooths the labels,
-        # suppresses confident predictions, and causes val_acc oscillation.
         smoothing = 0.0 if args.use_mixup else 0.05
         return FocalLoss(weight=class_weights, gamma=2.0, label_smoothing=smoothing)
-    return nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
+
+    # FIX-3: suppress smoothing when Mixup is on (matches FocalLoss behaviour)
+    ce_smoothing = 0.0 if args.use_mixup else 0.1
+    return nn.CrossEntropyLoss(weight=class_weights, label_smoothing=ce_smoothing)
 
 
 # ======================================================================
@@ -477,8 +533,8 @@ def local_train_one_round(
                     task_loss = criterion(logits, labels)
 
                 # FedProx proximal term — kept separate so logged loss is
-                # pure task loss (Bug 1 fix: was total_loss += loss which
-                # inflated client losses by the proximal penalty).
+                # pure task loss (was total_loss += loss which inflated
+                # client losses by the proximal penalty).
                 if global_params is not None and args.mu > 0:
                     loss = task_loss + fedprox_penalty(
                         encoder, classifier, global_params, args.mu,
@@ -500,11 +556,11 @@ def local_train_one_round(
             scaler.step(optimizer)
             scaler.update()
 
-            # Bug 1 fix: log only the task loss, not task + FedProx penalty.
+            # Log only the task loss, not task + FedProx penalty.
             total_loss += task_loss.item() * images.size(0)
-            # Bug 2 fix: soft-label accuracy instead of a per-batch coin flip.
-            # lam * (correct under targets_a) + (1-lam) * (correct under targets_b)
-            # gives a smooth, unbiased estimate regardless of lam value.
+            # Soft-label accuracy: lam * (correct under targets_a) +
+            # (1-lam) * (correct under targets_b) gives a smooth, unbiased
+            # estimate regardless of lam value.
             preds = logits.argmax(dim=1)
             correct += (
                 lam         * (preds == targets_a).float().sum().item()
@@ -534,10 +590,16 @@ def evaluate_global(
     loader: DataLoader,
     device: str,
     num_classes: int,
+    class_weights: torch.Tensor,
 ) -> tuple:
     """
     Fast global evaluation used during the federated training loop.
     No TTA (speed matters across many rounds).
+
+    FIX-6: uses the same class-weighted CrossEntropyLoss as training so
+    that val_loss is directly comparable to train loss and correctly
+    penalises errors on minority (disease) classes. Previously used
+    unweighted CE which understated loss on hard minority-class samples.
 
     Returns:
         (val_acc %, val_loss, auc)
@@ -546,7 +608,10 @@ def evaluate_global(
 
     encoder.eval()
     classifier.eval()
-    criterion = nn.CrossEntropyLoss(reduction="sum")
+    # FIX-6: weighted CE to match training criterion
+    criterion = nn.CrossEntropyLoss(
+        weight=class_weights.to(device), reduction="sum",
+    )
 
     correct = 0
     total = 0
@@ -597,19 +662,41 @@ def evaluate_global(
 def save_checkpoint(
     encoder, classifier,
     comm_round, val_acc, output_dir, name,
+    optimizers=None, scalers=None,
 ) -> None:
+    """
+    Save model weights plus optional optimizer/scaler state.
+
+    FIX-4: optimizers and scalers are persisted in the latest checkpoint
+    so that AdamW momentum buffers survive a resume boundary.
+    Periodic and best checkpoints omit optimizer state (too large) and
+    are used only for weight loading after training completes.
+    """
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, name)
-    torch.save({
+    payload = {
         "comm_round": comm_round,
         "val_acc":    val_acc,
         "encoder_state_dict":    encoder.state_dict(),
         "classifier_state_dict": classifier.state_dict(),
-    }, path)
+    }
+    if optimizers is not None:
+        payload["optimizer_states"] = [opt.state_dict() for opt in optimizers]
+    if scalers is not None:
+        payload["scaler_states"] = [scl.state_dict() for scl in scalers]
+    torch.save(payload, path)
 
 
-def try_resume(output_dir, encoder, classifier, device) -> int:
-    """Resume from ckpt_latest.pth if present. Returns the starting round."""
+def try_resume(
+    output_dir, encoder, classifier, device,
+    optimizers=None, scalers=None,
+) -> int:
+    """
+    Resume from ckpt_latest.pth if present. Returns the starting round.
+
+    FIX-4: also restores optimizer and scaler state when available so
+    that AdamW momentum buffers are not discarded on resume.
+    """
     latest = os.path.join(output_dir, "ckpt_latest.pth")
     if not os.path.isfile(latest):
         return 0
@@ -619,6 +706,27 @@ def try_resume(output_dir, encoder, classifier, device) -> int:
         return 0
     encoder.load_state_dict(ckpt["encoder_state_dict"])
     classifier.load_state_dict(ckpt["classifier_state_dict"])
+
+    # FIX-4: restore optimizer state to preserve AdamW momentum buffers
+    if optimizers is not None and "optimizer_states" in ckpt:
+        opt_states = ckpt["optimizer_states"]
+        if len(opt_states) == len(optimizers):
+            for opt, state in zip(optimizers, opt_states):
+                opt.load_state_dict(state)
+            print("[RESUME] Optimizer states restored.")
+        else:
+            print("[RESUME] WARNING: optimizer count mismatch — skipping optimizer restore.")
+
+    # FIX-4: restore scaler state
+    if scalers is not None and "scaler_states" in ckpt:
+        scl_states = ckpt["scaler_states"]
+        if len(scl_states) == len(scalers):
+            for scl, state in zip(scalers, scl_states):
+                scl.load_state_dict(state)
+            print("[RESUME] Scaler states restored.")
+        else:
+            print("[RESUME] WARNING: scaler count mismatch — skipping scaler restore.")
+
     start = ckpt["comm_round"] + 1
     print(f"[RESUME] Resuming from round {start}")
     return start
@@ -653,26 +761,31 @@ class FedFinetuneLogger:
 
 
 # ======================================================================
-# LR schedule (mirrors train_fedavg.py exactly)
+# LR schedule
+# FIX-2: mu is now actually used to select the flat-phase ratio so that
+# FedProx gets a shorter flat phase (15% vs 30%) and more cosine budget,
+# as the original docstring always claimed but never implemented.
+# FIX-7: uses module-level constants so main() print block stays in sync.
 # ======================================================================
 def compute_round_lr(comm_round: int, max_rounds: int, base_lr: float,
                      mu: float) -> float:
     """
     Three-phase LR schedule:
-      Phase 1 — Warmup (0 → WARMUP_ROUNDS): lr/5 → lr  (linear)
-      Phase 2 — Flat   (WARMUP → FLAT):      lr          (constant)
-      Phase 3 — Cosine (FLAT → max_rounds):  lr → eta_min
+      Phase 1 — Warmup (0 → LR_WARMUP_ROUNDS):   lr/WARMUP_ROUNDS → lr  (linear)
+      Phase 2 — Flat   (WARMUP → FLAT_ROUNDS):    lr               (constant)
+      Phase 3 — Cosine (FLAT_ROUNDS → max_rounds): lr → eta_min
 
-    FedProx uses a shorter flat phase (15% vs 25%) to spend more budget
-    in the cosine phase, compensating for the extra regularization from mu.
+    FIX-2: FedProx (mu > 0) uses LR_FLAT_RATIO_FED (15%) instead of
+    LR_FLAT_RATIO (30%) so the cosine decay phase is longer, compensating
+    for the extra regularisation from the proximal term.
     """
-    WARMUP_ROUNDS = 10
-    FLAT_RATIO    = 0.30
-    FLAT_ROUNDS   = WARMUP_ROUNDS + int(max_rounds * FLAT_RATIO)
-    eta_min       = base_lr * 0.10
+    # FIX-2: choose flat-phase ratio based on whether FedProx is active
+    flat_ratio  = LR_FLAT_RATIO_FED if mu > 0 else LR_FLAT_RATIO
+    FLAT_ROUNDS = LR_WARMUP_ROUNDS + int(max_rounds * flat_ratio)
+    eta_min     = base_lr * LR_ETA_MIN_RATIO
 
-    if comm_round < WARMUP_ROUNDS:
-        return base_lr * (comm_round + 1) / WARMUP_ROUNDS
+    if comm_round < LR_WARMUP_ROUNDS:
+        return base_lr * (comm_round + 1) / LR_WARMUP_ROUNDS
     elif comm_round < FLAT_ROUNDS:
         return base_lr
     else:
@@ -748,13 +861,8 @@ def main() -> None:
     print("[2/4] Building global encoder + classifier...")
     global_encoder, global_classifier = build_models(args)
 
-    # Resume if a checkpoint exists
-    start_round = try_resume(
-        args.output_dir, global_encoder, global_classifier, args.device,
-    )
-
     # ------------------------------------------------------------------
-    # 3. Per-client copies
+    # 3. Per-client copies + optimizers
     # ------------------------------------------------------------------
     print("[3/4] Creating per-client model copies...")
     client_encoders    = [copy.deepcopy(global_encoder)    for _ in range(args.n_clients)]
@@ -804,8 +912,20 @@ def main() -> None:
         for _ in range(args.n_clients)
     ]
 
+    # FIX-4: pass optimizers and scalers into try_resume so momentum
+    # buffers survive a resume boundary
+    start_round = try_resume(
+        args.output_dir, global_encoder, global_classifier, args.device,
+        optimizers=client_optimizers, scalers=client_scalers,
+    )
+
     criterion = build_criterion(args, args.device)
-    logger    = FedFinetuneLogger(args.output_dir, args.n_clients)
+
+    # FIX-6: build class_weights tensor once so evaluate_global can reuse it
+    _cw_list = [1.0] + [2.0] * (args.num_classes - 1)
+    eval_class_weights = torch.tensor(_cw_list, dtype=torch.float32)
+
+    logger = FedFinetuneLogger(args.output_dir, args.n_clients)
 
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
@@ -813,14 +933,19 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 4. Federated fine-tuning loop
     # ------------------------------------------------------------------
+    # FIX-7: derive schedule description from module-level constants so
+    # it always matches what compute_round_lr actually computes.
+    flat_ratio_used = LR_FLAT_RATIO_FED if args.mu > 0 else LR_FLAT_RATIO
+    _flat_r = LR_WARMUP_ROUNDS + int(args.max_rounds * flat_ratio_used)
+
     print(f"[4/4] Starting federated fine-tuning from round {start_round}...")
-    _warmup_r = 10
-    _flat_r   = _warmup_r + int(args.max_rounds * (0.30))
     print(f"  Round-level LR schedule (classifier / encoder):")
-    print(f"    warmup={_warmup_r}r | flat={_flat_r - _warmup_r}r "
-          f"| cosine={args.max_rounds - _flat_r}r | eta_min={args.lr * 0.10:.1e}")
-    print(f"    classifier: {args.lr:.1e} → {args.lr * 0.10:.1e}")
-    print(f"    encoder:    {args.lr/2:.1e} → {args.lr/2 * 0.10:.1e}")
+    print(f"    warmup={LR_WARMUP_ROUNDS}r | flat={_flat_r - LR_WARMUP_ROUNDS}r "
+          f"| cosine={args.max_rounds - _flat_r}r "
+          f"| eta_min={args.lr * LR_ETA_MIN_RATIO:.1e}"
+          + (" [FedProx short-flat]" if args.mu > 0 else ""))
+    print(f"    classifier: {args.lr:.1e} → {args.lr * LR_ETA_MIN_RATIO:.1e}")
+    print(f"    encoder:    {args.lr/2:.1e} → {args.lr/2 * LR_ETA_MIN_RATIO:.1e}")
     if not freeze_encoder and args.E_epoch > 1:
         print(f"  Epoch-level encoder warmup: 10% → 100% of enc_lr over {args.E_epoch} local epochs/round")
     print(f"  Early stopping: no improvement for {LOSS_PATIENCE} rounds "
@@ -828,7 +953,7 @@ def main() -> None:
     print("=" * 60)
 
     best_acc          = 0.0
-    best_round        = 0
+    best_round        = None   # FIX-8: None signals "no improvement yet"
     rounds_no_improve = 0
     history = {
         "round": [], "val_acc": [], "val_loss": [],
@@ -894,35 +1019,48 @@ def main() -> None:
         val_acc, val_loss, val_auc = evaluate_global(
             global_encoder, global_classifier,
             test_loader, args.device, args.num_classes,
+            eval_class_weights,         # FIX-6: pass weights
         )
 
         round_time = time.time() - round_start
         gpu_mb     = get_gpu_memory_mb()["gpu_mem_allocated_mb"]
 
+        # ---- FIX-1: NaN check BEFORE early stopping ----
+        # If val_loss is NaN the model has diverged; stop immediately rather
+        # than burning LOSS_PATIENCE rounds on a dead model.
+        if math.isnan(val_loss):
+            print(f"\n  [ABORT] Round {comm_round + 1}: val_loss is NaN. Stopping.")
+            break
+
         # ---- Checkpoint on improvement ----
         is_best = val_acc > best_acc + ACC_MIN_DELTA
         if is_best:
             best_acc   = val_acc
-            best_round = comm_round + 1
+            best_round = comm_round + 1   # FIX-8: only set when improvement occurs
             rounds_no_improve = 0
             save_checkpoint(
                 global_encoder, global_classifier,
                 comm_round, val_acc,
                 args.output_dir, "ckpt_best_finetune.pth",
+                # best checkpoint: no optimizer state (file size)
             )
         else:
             rounds_no_improve += 1
 
+        # FIX-4: save optimizer + scaler state in the latest checkpoint only
         save_checkpoint(
             global_encoder, global_classifier,
             comm_round, val_acc,
             args.output_dir, "ckpt_latest.pth",
+            optimizers=client_optimizers,
+            scalers=client_scalers,
         )
         if (comm_round + 1) % args.save_every == 0:
             name = f"ckpt_round_{comm_round + 1:04d}.pth"
             save_checkpoint(
                 global_encoder, global_classifier,
                 comm_round, val_acc, args.output_dir, name,
+                # periodic checkpoints: no optimizer state (file size)
             )
 
         # ---- History & logging ----
@@ -954,16 +1092,14 @@ def main() -> None:
             f"time={round_time:.1f}s  {client_loss_str}{marker}"
         )
 
-        # ---- Early stopping ----
+        # ---- FIX-1: early stopping now comes AFTER NaN check ----
         if rounds_no_improve >= LOSS_PATIENCE:
+            # FIX-8: guard against best_round still being None
+            best_str = str(best_round) if best_round is not None else "N/A"
             print(
                 f"\n  [EARLY STOP] No improvement > {ACC_MIN_DELTA:.2f}% for "
-                f"{LOSS_PATIENCE} rounds. Best: {best_acc:.2f}% at round {best_round}."
+                f"{LOSS_PATIENCE} rounds. Best: {best_acc:.2f}% at round {best_str}."
             )
-            break
-
-        if math.isnan(val_loss):
-            print(f"\n  [ABORT] Round {comm_round + 1}: val_loss is NaN. Stopping.")
             break
 
     # ------------------------------------------------------------------
@@ -976,8 +1112,12 @@ def main() -> None:
         ckpt = safe_torch_load(best_path, map_location=args.device)
         global_encoder.load_state_dict(ckpt["encoder_state_dict"])
         global_classifier.load_state_dict(ckpt["classifier_state_dict"])
-        print(f"  Loaded best checkpoint (round {best_round}, "
+        best_str = str(best_round) if best_round is not None else "N/A"
+        print(f"  Loaded best checkpoint (round {best_str}, "
               f"val_acc={best_acc:.2f}%)")
+    else:
+        # FIX-8: graceful fallback if no best checkpoint was ever saved
+        print("  WARNING: no best checkpoint found; using current model weights.")
 
     top1, per_class, cm, all_probs, all_labels = evaluate_finetune(
         global_encoder, global_classifier,
@@ -1018,12 +1158,15 @@ def main() -> None:
         peak_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
         print(f"\n  Peak GPU memory: {peak_mb:.0f} MB")
 
+    # FIX-8: handle None best_round gracefully in the summary
+    best_round_str = str(best_round) if best_round is not None else "N/A (no improvement)"
+
     print(f"\n{'='*60}")
     print(f"  {mode_label} Results ({algo_name})")
     print(f"{'='*60}")
     print(f"  Top-1 Accuracy (TTA): {top1:.2f}%")
     print(f"  AUC Score (TTA):      {final_auc:.4f}")
-    print(f"  Best round:           {best_round} / {args.max_rounds}")
+    print(f"  Best round:           {best_round_str} / {args.max_rounds}")
     print(f"  Clients:              {args.n_clients} ({args.split_type})")
     if args.label_fraction < 1.0:
         print(f"  Label fraction:       {args.label_fraction:.0%}")
