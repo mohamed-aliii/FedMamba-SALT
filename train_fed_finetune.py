@@ -1014,7 +1014,7 @@ def main() -> None:
         if enc_params:
             param_groups.append({
                 "params":       enc_params,
-                "lr":           args.lr / 2.0,
+                "lr":           args.lr / 5.0,
                 "weight_decay": 0.01,
                 "group_name":   "encoder",
             })
