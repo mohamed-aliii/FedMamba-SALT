@@ -136,7 +136,7 @@ LOSS_PATIENCE    = 20      # early stop if global val_acc doesn't improve
 ACC_MIN_DELTA    = 0.05    # minimum improvement (%) to reset patience counter
 
 # Round-level LR schedule shared constants
-LR_WARMUP_ROUNDS  = 5     # linear warmup length (rounds)
+LR_WARMUP_ROUNDS  = 10     # linear warmup length (rounds)
 LR_FLAT_RATIO     = 0.30   # FedAvg flat-phase fraction of max_rounds
 LR_FLAT_RATIO_FED = 0.30   # FedProx flat-phase fraction (shorter → more cosine budget)
 LR_ETA_MIN_RATIO  = 0.10   # cosine floor = base_lr * this
@@ -610,7 +610,7 @@ def evaluate_global(
     classifier.eval()
     # FIX-6: weighted CE to match training criterion
     criterion = nn.CrossEntropyLoss(
-        weight=class_weights.to(device), reduction="sum",
+        weight=class_weights.to(device), reduction="mean",
     )
 
     correct = 0
@@ -637,7 +637,7 @@ def evaluate_global(
         all_labels.append(labels.cpu())
 
     val_acc  = 100.0 * correct / max(total, 1)
-    val_loss = total_loss / max(total, 1)
+    val_loss = total_loss / max(len(loader), 1)
 
     all_probs_np  = torch.cat(all_probs).numpy()
     all_labels_np = torch.cat(all_labels).numpy()
