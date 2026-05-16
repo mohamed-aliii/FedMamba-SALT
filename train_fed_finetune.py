@@ -346,7 +346,11 @@ def build_criterion(args, device: str) -> nn.Module:
     class_weights = torch.tensor(weights, dtype=torch.float32, device=device)
 
     if args.use_focal_loss:
-        return FocalLoss(weight=class_weights, gamma=2.0, label_smoothing=0.05)
+        # Disable label_smoothing when Mixup is active: Mixup already produces
+        # soft targets, so applying smoothing on top double-smooths the labels,
+        # suppresses confident predictions, and causes val_acc oscillation.
+        smoothing = 0.0 if args.use_mixup else 0.05
+        return FocalLoss(weight=class_weights, gamma=2.0, label_smoothing=smoothing)
     return nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
 
 
@@ -466,17 +470,21 @@ def local_train_one_round(
                 logits = classifier(features)
 
                 if args.use_mixup:
-                    loss = mixup_criterion(
+                    task_loss = mixup_criterion(
                         criterion, logits, targets_a, targets_b, lam,
                     )
                 else:
-                    loss = criterion(logits, labels)
+                    task_loss = criterion(logits, labels)
 
-                # FedProx proximal term
+                # FedProx proximal term — kept separate so logged loss is
+                # pure task loss (Bug 1 fix: was total_loss += loss which
+                # inflated client losses by the proximal penalty).
                 if global_params is not None and args.mu > 0:
-                    loss = loss + fedprox_penalty(
+                    loss = task_loss + fedprox_penalty(
                         encoder, classifier, global_params, args.mu,
                     )
+                else:
+                    loss = task_loss
 
             scaler.scale(loss).backward()
 
@@ -492,9 +500,16 @@ def local_train_one_round(
             scaler.step(optimizer)
             scaler.update()
 
-            total_loss += loss.item() * images.size(0)
-            dom_labels = targets_a if lam >= 0.5 else targets_b
-            correct += (logits.argmax(dim=1) == dom_labels).sum().item()
+            # Bug 1 fix: log only the task loss, not task + FedProx penalty.
+            total_loss += task_loss.item() * images.size(0)
+            # Bug 2 fix: soft-label accuracy instead of a per-batch coin flip.
+            # lam * (correct under targets_a) + (1-lam) * (correct under targets_b)
+            # gives a smooth, unbiased estimate regardless of lam value.
+            preds = logits.argmax(dim=1)
+            correct += (
+                lam         * (preds == targets_a).float().sum().item()
+                + (1 - lam) * (preds == targets_b).float().sum().item()
+            )
             total += images.size(0)
 
     # Restore encoder to its full target LR after the within-round ramp,
