@@ -1079,7 +1079,7 @@ def main() -> None:
     # then fine-tune" curriculum in transfer learning.
     # Skipped on resume (start_round > 0) and in linear_probe mode.
     # ------------------------------------------------------------------
-    PROBE_ROUNDS = 0 if freeze_encoder else 3
+    PROBE_ROUNDS = 0 if freeze_encoder else 5
 
     if PROBE_ROUNDS > 0 and start_round == 0:
         print(f"\n  [Warm-start] Freezing encoder for {PROBE_ROUNDS} head-only "
