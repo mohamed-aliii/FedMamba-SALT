@@ -151,7 +151,7 @@ LOSS_PATIENCE    = 20      # early stop if global val_acc doesn't improve
 ACC_MIN_DELTA    = 0.05    # minimum improvement (%) to reset patience counter
 
 # Round-level LR schedule shared constants
-LR_WARMUP_ROUNDS  = 10      # linear warmup length (rounds)
+LR_WARMUP_ROUNDS  = 5      # linear warmup length (rounds)
                            # FIX-10: was 10 — encoder and classifier were operating at
                            # ~5% of peak LR for the first 10 rounds (round-level warmup
                            # × epoch-level warmup factor = 10% × 10% = 1% at round 1,
@@ -431,12 +431,21 @@ def build_criterion(args, device: str) -> nn.Module:
 
     if args._class_weights_np is not None:
         cw = args._class_weights_np
-        print(f"  [criterion] Balanced class weights from data: "
-              f"{[f'{w:.3f}' for w in cw]}")
+        # If the dataset is near-balanced (max weight / min weight < 1.5),
+        # class weighting does more harm than good — the optimizer chases a
+        # 2-3% imbalance signal that is dwarfed by batch noise, causing the
+        # loss surface to oscillate. Use uniform weights instead.
+        imbalance_ratio = float(np.max(cw) / np.min(cw))
+        if imbalance_ratio < 1.5:
+            print(f"  [criterion] Data near-balanced (ratio={imbalance_ratio:.2f}) "
+                  f"→ using uniform class weights (no penalty).")
+            cw = np.ones(args.num_classes)
+        else:
+            print(f"  [criterion] Balanced class weights from data: "
+                  f"{[f'{w:.3f}' for w in cw]}  (ratio={imbalance_ratio:.2f})")
     else:
-        # Fallback: mild fixed weights if label collection was skipped
-        cw = np.array([1.0] + [2.0] * (args.num_classes - 1))
-        print(f"  [criterion] WARNING: using fallback hardcoded weights {cw.tolist()}")
+        cw = np.ones(args.num_classes)
+        print(f"  [criterion] WARNING: using uniform weights (label collection failed)")
 
     class_weights = torch.tensor(cw, dtype=torch.float32, device=device)
 
@@ -446,7 +455,9 @@ def build_criterion(args, device: str) -> nn.Module:
 
     # FIX-3 + FIX-9: suppress smoothing when Mixup is on, and actually pass
     # ce_smoothing to CrossEntropyLoss (was silently dropped before FIX-9).
-    ce_smoothing = 0.0 if args.use_mixup else 0.1
+    # Smoothing reduced from 0.1 → 0.05: with balanced classes and no class
+    # weighting, 0.1 over-regularises a 2-class head and slows convergence.
+    ce_smoothing = 0.0 if args.use_mixup else 0.05
     return nn.CrossEntropyLoss(weight=class_weights, label_smoothing=ce_smoothing)
 
 
@@ -825,23 +836,32 @@ class FedFinetuneLogger:
 # relying on the hardcoded [1.0, 2.0] assumption.
 # ======================================================================
 def collect_all_labels(client_loaders) -> np.ndarray:
-    """Return a flat numpy array of every label across all client loaders."""
+    """Return a flat numpy array of every label across all client loaders.
+
+    BUG FIX: the original fallback path had `break` after iterating the loader,
+    which exited the *outer* client loop rather than just the inner batch loop,
+    so only client 1's labels were ever collected when the fast-path (.targets)
+    was unavailable. Removed — every client is always processed.
+    """
     all_labels = []
     for loader in client_loaders:
         ds = loader.dataset
-        # RetinaDataset / Subset both expose .targets or iterate targets via
-        # dataset attribute chain; fall back to iterating if needed.
         if hasattr(ds, "targets"):
+            # Fast path: RetinaDataset exposes .targets directly
             all_labels.extend(ds.targets)
         elif hasattr(ds, "dataset") and hasattr(ds.dataset, "targets"):
             # Subset wrapping a RetinaDataset
             subset_indices = ds.indices
             all_labels.extend([ds.dataset.targets[i] for i in subset_indices])
         else:
-            # Last resort: iterate the loader (slow, but correct)
-            for _, lbl in loader:
-                all_labels.extend(lbl.tolist())
-            break  # only need one pass per loader; inner loop handles all batches
+            # Last resort: scan underlying dataset without disturbing loader state
+            raw_ds = ds.dataset if hasattr(ds, "dataset") else ds
+            indices = list(ds.indices) if hasattr(ds, "indices") else range(len(raw_ds))
+            if hasattr(raw_ds, "targets"):
+                all_labels.extend([raw_ds.targets[i] for i in indices])
+            else:
+                for _, lbl in loader:
+                    all_labels.extend(lbl.tolist())
     return np.array(all_labels, dtype=int)
 
 
