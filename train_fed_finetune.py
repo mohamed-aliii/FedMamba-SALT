@@ -343,7 +343,13 @@ def build_models(args):
         classifier = AttentionPoolClassifier(
             feat_dim=feat_dim, num_classes=args.num_classes,
         ).to(args.device)
-        nn.init.kaiming_uniform_(classifier.head[2].weight)
+        # FIX-13: replace kaiming_uniform with a small truncated-normal init.
+        # kaiming assumes ReLU-style activations and typical ImageNet scale;
+        # pre-trained Mamba patch tokens are LayerNorm-normalised and have a
+        # much tighter distribution. Large initial weights → the head saturates
+        # after round 1 and collapses to predicting one class.
+        # trunc_normal_(std=0.02) matches ViT/DeiT classifier head conventions.
+        nn.init.trunc_normal_(classifier.head[2].weight, std=0.02)
         nn.init.zeros_(classifier.head[2].bias)
     else:
         # linear probe: frozen encoder, flat GAP vector
@@ -353,7 +359,7 @@ def build_models(args):
             nn.Dropout(0.2),
             nn.Linear(feat_dim, args.num_classes),
         ).to(args.device)
-        nn.init.kaiming_uniform_(classifier[2].weight)
+        nn.init.trunc_normal_(classifier[2].weight, std=0.02)
         nn.init.zeros_(classifier[2].bias)
 
     enc_params = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
@@ -1056,6 +1062,78 @@ def main() -> None:
 
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
+
+    # ------------------------------------------------------------------
+    # FIX-13: Classifier warm-start (head-only probe phase)
+    # ------------------------------------------------------------------
+    # Problem: AttentionPoolClassifier is kaiming-initialised but the
+    # pre-trained encoder patch tokens have a very different activation
+    # scale. In round 1 the head immediately develops a strong bias toward
+    # one class (loss drops but train_acc stays ~55%). Once baked into the
+    # FedAvg-aggregated head, encoder updates in later rounds reinforce
+    # rather than correct it.
+    #
+    # Fix: run PROBE_ROUNDS federated rounds with the encoder *frozen*,
+    # training only the classifier at high LR to orient the head before
+    # encoder weights start moving. Mirrors the standard "linear probe
+    # then fine-tune" curriculum in transfer learning.
+    # Skipped on resume (start_round > 0) and in linear_probe mode.
+    # ------------------------------------------------------------------
+    PROBE_ROUNDS = 0 if freeze_encoder else 3
+
+    if PROBE_ROUNDS > 0 and start_round == 0:
+        print(f"\n  [Warm-start] Freezing encoder for {PROBE_ROUNDS} head-only "
+              f"rounds to orient classifier before full fine-tuning...")
+
+        probe_optimizers = [
+            AdamW(
+                [{"params": [p for p in cls.parameters() if p.requires_grad],
+                  "lr": args.lr, "weight_decay": 0.05, "group_name": "classifier"}],
+                betas=(0.9, 0.999),
+            )
+            for cls in client_classifiers
+        ]
+        probe_scalers = [
+            torch.amp.GradScaler(
+                "cuda" if "cuda" in args.device else "cpu",
+                enabled=("cuda" in args.device),
+            )
+            for _ in range(args.n_clients)
+        ]
+
+        for probe_round in range(PROBE_ROUNDS):
+            probe_losses = []
+            probe_accs   = []
+
+            for cid in range(args.n_clients):
+                for pg in probe_optimizers[cid].param_groups:
+                    pg["lr"] = args.lr
+                loss, tacc = local_train_one_round(
+                    client_encoders[cid], client_classifiers[cid],
+                    client_loaders[cid],
+                    probe_optimizers[cid], probe_scalers[cid],
+                    criterion, args,
+                    global_params=None,
+                    freeze_encoder=True,
+                    comm_round=0,
+                )
+                probe_losses.append(loss)
+                probe_accs.append(tacc)
+
+            average_models(global_classifier, client_classifiers, client_weights)
+            broadcast_global_to_clients(global_classifier, client_classifiers)
+
+            avg_probe_acc = sum(
+                probe_accs[i] * client_weights[i] for i in range(args.n_clients)
+            )
+            loss_str = "  ".join(
+                f"c{i+1}={probe_losses[i]:.4f}" for i in range(args.n_clients)
+            )
+            print(f"  [Warm-start {probe_round+1}/{PROBE_ROUNDS}]  "
+                  f"train_acc={avg_probe_acc:.2f}%  {loss_str}")
+
+        broadcast_global_to_clients(global_classifier, client_classifiers)
+        print(f"  [Warm-start] Done — encoder unfrozen, full fine-tuning begins.\n")
 
     # ------------------------------------------------------------------
     # 4. Federated fine-tuning loop
