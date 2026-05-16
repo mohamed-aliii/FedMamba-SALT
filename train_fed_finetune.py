@@ -151,7 +151,7 @@ LOSS_PATIENCE    = 20      # early stop if global val_acc doesn't improve
 ACC_MIN_DELTA    = 0.05    # minimum improvement (%) to reset patience counter
 
 # Round-level LR schedule shared constants
-LR_WARMUP_ROUNDS  = 5      # linear warmup length (rounds)
+LR_WARMUP_ROUNDS  = 10      # linear warmup length (rounds)
                            # FIX-10: was 10 — encoder and classifier were operating at
                            # ~5% of peak LR for the first 10 rounds (round-level warmup
                            # × epoch-level warmup factor = 10% × 10% = 1% at round 1,
