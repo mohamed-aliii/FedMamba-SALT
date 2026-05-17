@@ -1007,7 +1007,7 @@ def main() -> None:
     def _make_optimizer(enc, cls):
         enc_params = [p for p in enc.parameters() if p.requires_grad]
         cls_params = [p for p in cls.parameters() if p.requires_grad]
-        # Separate LR groups: encoder gets lr/2 to protect pre-trained features.
+        # Separate LR groups: encoder gets lr/5 to protect pre-trained features.
         # Classifier gets full lr (random init needs faster movement).
         # Linear probe: encoder has requires_grad=False so enc_params is empty.
         param_groups = []
@@ -1150,7 +1150,7 @@ def main() -> None:
           f"| eta_min={args.lr * LR_ETA_MIN_RATIO:.1e}"
           + (" [FedProx short-flat]" if args.mu > 0 else ""))
     print(f"    classifier: {args.lr:.1e} → {args.lr * LR_ETA_MIN_RATIO:.1e}")
-    print(f"    encoder:    {args.lr/2:.1e} → {args.lr/2 * LR_ETA_MIN_RATIO:.1e}")
+    print(f"    encoder:    {args.lr/5.0:.1e} → {args.lr/5.0 * LR_ETA_MIN_RATIO:.1e}")
     if not freeze_encoder and args.E_epoch > 1:
         print(f"  Epoch-level encoder warmup: 5% → 100% of enc_lr over {args.E_epoch} local epochs/round")
     print(f"  Early stopping: no improvement for {LOSS_PATIENCE} rounds "
@@ -1180,7 +1180,7 @@ def main() -> None:
 
         # ---- Compute current LR ----
         current_lr = compute_round_lr(comm_round, args.max_rounds, args.lr, args.mu)
-        # Encoder gets lr/2; classifier gets full lr (mirrors _make_optimizer)
+        # Encoder gets lr/5; classifier gets full lr (mirrors _make_optimizer)
         cls_lr = current_lr
 
         # FIX-14: post-probe encoder damping — ramps from POST_PROBE_FACTOR
@@ -1191,7 +1191,7 @@ def main() -> None:
             )
         else:
             post_probe_scale = 1.0
-        enc_lr = (current_lr / 2.0) * post_probe_scale
+        enc_lr = (current_lr / 5.0) * post_probe_scale
 
         # ---- FedProx: snapshot global params before any client trains ----
         global_params = None

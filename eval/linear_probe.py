@@ -512,11 +512,11 @@ def train_finetune(
         dict with lists of per-epoch metrics for visualization.
     """
     # -- Learning rates --
-    # Encoder gets lr/2: pre-trained features are already ~76% val accuracy,
+    # Encoder gets lr/5.0: pre-trained features are already ~76% val accuracy,
     # so they are USEFUL. A moderate reduction (not aggressive lr/10) allows
     # the encoder to adapt meaningfully while still preserving learned structure.
     # Classifier gets full lr: starts from random init, needs faster movement.
-    encoder_lr = lr / 2.0
+    encoder_lr = lr / 5.0
 
     # Separate weight_decay per group:
     # - Encoder: 0.01 (pre-trained weights already regularized; 0.1 destroys them)
