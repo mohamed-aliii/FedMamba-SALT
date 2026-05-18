@@ -24,6 +24,7 @@ from models.inception_mamba import InceptionMambaEncoder, MAMBA_AVAILABLE
 BATCH = 2  # keep small -- the model is memory-hungry
 IMG_SHAPE = (3, 224, 224)
 OUT_DIM = 768
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def _count_params(model: torch.nn.Module) -> int:
@@ -38,8 +39,8 @@ def _count_trainable(model: torch.nn.Module) -> int:
 #  Test 1 -- Output shape
 # =====================================================================
 def test_output_shape() -> bool:
-    encoder = InceptionMambaEncoder(patch_size=16, embed_dim=256, depth=4, out_dim=OUT_DIM)
-    x = torch.randn(BATCH, *IMG_SHAPE)
+    encoder = InceptionMambaEncoder(patch_size=16, embed_dim=256, depth=4, out_dim=OUT_DIM).to(DEVICE)
+    x = torch.randn(BATCH, *IMG_SHAPE, device=DEVICE)
     out = encoder(x)
 
     expected = (BATCH, OUT_DIM)
@@ -54,9 +55,9 @@ def test_output_shape() -> bool:
 # =====================================================================
 def test_gradient_flow() -> bool:
     """After output.sum().backward(), every trainable param must have a gradient."""
-    encoder = InceptionMambaEncoder(patch_size=16, embed_dim=256, depth=4, out_dim=OUT_DIM)
-    x = torch.randn(BATCH, *IMG_SHAPE)
-    out = encoder(x)
+    encoder = InceptionMambaEncoder(patch_size=16, embed_dim=256, depth=4, out_dim=OUT_DIM).to(DEVICE)
+    x = torch.randn(BATCH, *IMG_SHAPE, device=DEVICE)
+    out = encoder(x, mask_ratio=0.5)
     out.sum().backward()
 
     no_grad_params = []
@@ -81,7 +82,7 @@ def test_gradient_flow() -> bool:
 #  Test 3 -- Parameter count
 # =====================================================================
 def test_param_count() -> bool:
-    encoder = InceptionMambaEncoder(patch_size=16, embed_dim=256, depth=4, out_dim=OUT_DIM)
+    encoder = InceptionMambaEncoder(patch_size=16, embed_dim=256, depth=4, out_dim=OUT_DIM).to(DEVICE)
     total = _count_params(encoder)
     trainable = _count_trainable(encoder)
     total_m = total / 1e6

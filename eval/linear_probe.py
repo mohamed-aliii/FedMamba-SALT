@@ -516,13 +516,13 @@ def train_finetune(
     # so they are USEFUL. A moderate reduction (not aggressive lr/10) allows
     # the encoder to adapt meaningfully while still preserving learned structure.
     # Classifier gets full lr: starts from random init, needs faster movement.
-    encoder_lr = lr / 5.0
+    encoder_lr = lr / 10.0
 
     # Separate weight_decay per group:
     # - Encoder: 0.01 (pre-trained weights already regularized; 0.1 destroys them)
     # - Classifier: 0.05 (random init, needs more regularization)
     param_groups = [
-        {"params": encoder.parameters(),  "lr": encoder_lr, "weight_decay": 0.01},
+        {"params": encoder.parameters(),  "lr": encoder_lr, "weight_decay": 0.03},
         {"params": classifier.parameters(), "lr": lr,        "weight_decay": 0.05},
     ]
     optimizer = AdamW(param_groups)

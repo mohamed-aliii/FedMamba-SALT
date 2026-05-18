@@ -765,20 +765,31 @@ def save_checkpoint(
 def try_resume(
     output_dir, encoder, classifier, device,
     optimizers=None, scalers=None,
-) -> int:
+) -> tuple:
     """
-    Resume from ckpt_latest.pth if present. Returns the starting round.
+    Resume from ckpt_latest.pth if present. Returns (start_round, best_acc).
 
     FIX-4: also restores optimizer and scaler state when available so
     that AdamW momentum buffers are not discarded on resume.
     """
     latest = os.path.join(output_dir, "ckpt_latest.pth")
+    best_acc = 0.0
+    best_path = os.path.join(output_dir, "ckpt_best_finetune.pth")
+    
+    if os.path.isfile(best_path):
+        try:
+            best_ckpt = safe_torch_load(best_path, map_location=device)
+            best_acc = best_ckpt.get("val_acc", 0.0)
+            print(f"[RESUME] Recovered previous best accuracy: {best_acc:.2f}%")
+        except Exception as e:
+            print(f"[RESUME] Could not load best_acc from {best_path}: {e}")
+
     if not os.path.isfile(latest):
-        return 0
+        return 0, best_acc
     print(f"[RESUME] Loading {latest}")
     ckpt = safe_torch_load(latest, map_location=device)
     if "encoder_state_dict" not in ckpt:
-        return 0
+        return 0, best_acc
     encoder.load_state_dict(ckpt["encoder_state_dict"])
     classifier.load_state_dict(ckpt["classifier_state_dict"])
 
@@ -804,7 +815,7 @@ def try_resume(
 
     start = ckpt["comm_round"] + 1
     print(f"[RESUME] Resuming from round {start}")
-    return start
+    return start, best_acc
 
 
 # ======================================================================
@@ -1040,7 +1051,7 @@ def main() -> None:
 
     # FIX-4: pass optimizers and scalers into try_resume so momentum
     # buffers survive a resume boundary
-    start_round = try_resume(
+    start_round, best_acc = try_resume(
         args.output_dir, global_encoder, global_classifier, args.device,
         optimizers=client_optimizers, scalers=client_scalers,
     )
@@ -1157,7 +1168,7 @@ def main() -> None:
           f"(threshold >{ACC_MIN_DELTA:.2f}%)")
     print("=" * 60)
 
-    best_acc          = 0.0
+    # best_acc is populated by try_resume() so we don't overwrite previous best
     best_round        = None   # FIX-8: None signals "no improvement yet"
     rounds_no_improve = 0
     history = {

@@ -88,7 +88,7 @@ def test_end_to_end() -> bool:
     print("  [4/8] Student + projector forward (dense patches)...")
     student.train()
     projector.train()
-    s_emb = student(student_view, return_patches=True)       # (B, 196, 768)
+    s_emb = student(student_view, return_patches=True, mask_ratio=0.5)       # (B, 196, 768)
     s_proj = projector(s_emb)                                # (B, 196, 768)
 
     # ----- SALT loss -----

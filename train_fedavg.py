@@ -90,6 +90,9 @@ def parse_args() -> argparse.Namespace:
 
     # Output
     parser.add_argument("--output_dir", type=str, default="outputs/fedavg")
+    parser.add_argument("--init_ckpt", type=str, default=None,
+                        help="Path to a checkpoint to initialize weights from. "
+                             "Loads student/projector weights but starts round counter at 0.")
 
     # Federated settings
     parser.add_argument("--n_clients", type=int, default=5,
@@ -98,7 +101,7 @@ def parse_args() -> argparse.Namespace:
                         help="Data split: split_1, split_2, split_3")
     parser.add_argument("--max_rounds", type=int, default=200,
                         help="Total communication rounds")
-    parser.add_argument("--E_epoch", type=int, default=2,
+    parser.add_argument("--E_epoch", type=int, default=3,
                         help="Local training epochs per round per client")
     parser.add_argument("--mu", type=float, default=0.0,
                         help="FedProx proximal penalty. 0 = FedAvg, >0 = FedProx")
@@ -112,7 +115,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--save_every", type=int, default=10)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--mask_ratio", type=float, default=0.5,
+    parser.add_argument("--mask_ratio", type=float, default=0.3,
                         help="Internal latent masking ratio for student")
 
     # Two-pass config loading (same pattern as train_centralized.py)
@@ -345,6 +348,20 @@ def main():
         args.output_dir, global_student, global_projector, args.device,
     )
 
+    # ----- Warm-start from a previous checkpoint (fresh round counter) -----
+    if start_round == 0 and args.init_ckpt is not None:
+        if os.path.isfile(args.init_ckpt):
+            print(f"[INIT] Loading weights from: {args.init_ckpt}")
+            ckpt = safe_torch_load(args.init_ckpt, map_location=args.device)
+            if "student_state_dict" in ckpt:
+                global_student.load_state_dict(ckpt["student_state_dict"])
+                global_projector.load_state_dict(ckpt["projector_state_dict"])
+                print(f"[INIT] Weights loaded. Starting fresh from round 0.")
+            else:
+                print(f"[INIT] Checkpoint has no student_state_dict. Skipping.")
+        else:
+            print(f"[INIT] File not found: {args.init_ckpt}. Training from scratch.")
+
     # ----- Create per-client model copies -----
     print("[3/4] Creating client model copies...")
     client_students = [
@@ -395,9 +412,9 @@ def main():
     print(f"  Early stopping: loss patience={LOSS_PATIENCE}")
     # Print schedule summary so it's visible in Colab logs
     _warmup_r = 5
-    _flat_r   = _warmup_r + int(args.max_rounds * (0.15 if args.mu > 0 else 0.25))
+    _flat_r   = _warmup_r + int(args.max_rounds * 0.40)
     print(f"  LR schedule:  warmup={_warmup_r}r | flat={_flat_r - _warmup_r}r "
-          f"| cosine={args.max_rounds - _flat_r}r | eta_min={1e-4}")
+          f"| cosine={args.max_rounds - _flat_r}r | eta_min={2e-4}")
     print("=" * 55)
     print()
 
@@ -445,9 +462,9 @@ def main():
         # Persistent optimizer (Fix A) makes low LR effective now.
         # ------------------------------------------------------------------
         WARMUP_ROUNDS = 5
-        FLAT_RATIO    = 0.15 if args.mu > 0 else 0.25
+        FLAT_RATIO    = 0.40
         FLAT_ROUNDS   = WARMUP_ROUNDS + int(args.max_rounds * FLAT_RATIO)
-        eta_min       = 1e-4   # was 0.1; lower floor for full convergence
+        eta_min       = 2e-4   # higher floor: data proves model learns well at this LR
 
         if comm_round < WARMUP_ROUNDS:
             # Linear warmup: lr/5 → lr over first 5 rounds
