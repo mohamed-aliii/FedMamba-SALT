@@ -63,3 +63,14 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 ---
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
+
+## 5. Mathematical & Architectural Lessons (FedMamba-SALT)
+
+**Avoid Spatial Collapse in Dense Distillation:**
+- When applying standardization (like SALT) to dense patches `(B, N, D)`, **never flatten** the batch and spatial dimensions before calculating statistics.
+- Standardizing across `(B*N, D)` destroys the inter-image signal by overwhelming it with intra-image spatial variance.
+- **Rule:** Always calculate standardisation across the batch dimension (`dim=0`) independently per patch location, then flatten for MSE alignment.
+
+**Honest Collapse Diagnostics:**
+- **Never evaluate representation collapse metrics on masked tensors.** The variance between masked and unmasked tokens will artificially inflate standard deviation metrics, completely hiding global representation collapse.
+- **Rule:** Always compute `enc_std` on the Global Average Pooled embeddings of *unmasked* tokens or `s_emb.mean(dim=1)` if no explicit CLS token exists.

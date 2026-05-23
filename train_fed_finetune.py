@@ -151,11 +151,10 @@ LOSS_PATIENCE    = 20      # early stop if global val_acc doesn't improve
 ACC_MIN_DELTA    = 0.05    # minimum improvement (%) to reset patience counter
 
 # Round-level LR schedule shared constants
-LR_WARMUP_ROUNDS  = 5      # linear warmup length (rounds)
-                           # FIX-10: was 10 — encoder and classifier were operating at
-                           # ~5% of peak LR for the first 10 rounds (round-level warmup
-                           # × epoch-level warmup factor = 10% × 10% = 1% at round 1,
-                           # epoch 0), causing near-random train_acc for too long.
+LR_WARMUP_ROUNDS  = 3      # linear warmup length (rounds)
+                           # Reduced from 5 → 3: the 3-round probe warmstart already
+                           # orients the classifier before the main loop begins, so
+                           # 3 additional rounds of round-level warmup is sufficient.
 LR_FLAT_RATIO     = 0.30   # FedAvg flat-phase fraction of max_rounds
 LR_FLAT_RATIO_FED = 0.15   # FedProx flat-phase fraction (shorter → more cosine budget)
                            # FIX-2 (completed): was incorrectly 0.30, same as FedAvg.
@@ -512,7 +511,7 @@ def local_train_one_round(
         avg_loss (float), train_acc (float)
     """
     _device_type = "cuda" if "cuda" in args.device else "cpu"
-    EPOCH_WARMUP_FACTOR = 0.05  # encoder starts each round at 5% of target LR
+    EPOCH_WARMUP_FACTOR = 0.3   # encoder starts each round at 30% of target LR
 
     # Pull target LRs from optimizer state (already set by the round loop)
     target_enc_lr = None
@@ -1183,8 +1182,8 @@ def main() -> None:
     # POST_PROBE_FACTOR and linearly reaches 1.0 after POST_PROBE_RAMP rounds.
     # This is multiplicative on top of the normal round-level schedule so the
     # two warmup mechanisms compose cleanly.
-    POST_PROBE_FACTOR = 0.1   # encoder starts at 10% of its scheduled LR
-    POST_PROBE_RAMP   = 5     # reaches 100% by round 5
+    POST_PROBE_FACTOR = 1.0   # disabled — epoch warmup at 0.3 provides sufficient protection
+    POST_PROBE_RAMP   = 0     # no post-probe ramp needed
 
     for comm_round in range(start_round, args.max_rounds):
         round_start = time.time()

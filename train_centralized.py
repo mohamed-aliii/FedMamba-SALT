@@ -539,9 +539,15 @@ def train_one_epoch(
                 loss = loss.float() + (mu / 2.0) * prox
 
         # ----- Collapse diagnostics (both encoder and projector) -----
-        enc_std = embedding_std(s_emb.detach())
-        proj_std = embedding_std(s_proj.detach())
-        t_std = embedding_std(t_emb.detach())
+        # Compute on Global Average Pooled embeddings to ignore intra-image spatial variance
+        # and masking artifacts, giving a true measure of global representation collapse.
+        _s_emb_diag = s_emb.detach().mean(dim=1) if s_emb.dim() == 3 else s_emb.detach()
+        _s_proj_diag = s_proj.detach().mean(dim=1) if s_proj.dim() == 3 else s_proj.detach()
+        _t_emb_diag = t_emb.detach().mean(dim=1) if t_emb.dim() == 3 else t_emb.detach()
+        
+        enc_std = embedding_std(_s_emb_diag)
+        proj_std = embedding_std(_s_proj_diag)
+        t_std = embedding_std(_t_emb_diag)
 
         # ----- Backward pass with Dynamic Loss Scaling -----
         optimizer.zero_grad()

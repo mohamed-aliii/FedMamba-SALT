@@ -15,6 +15,8 @@ to PIL Images for compatibility with torchvision transforms.
 """
 
 import os
+import random
+import warnings
 from pathlib import Path
 from typing import Callable, Optional, Tuple
 
@@ -114,37 +116,51 @@ class RetinaDataset(Dataset):
         return len(self.img_paths)
 
     def __getitem__(self, index: int) -> Tuple[Image.Image, int]:
-        index = index % len(self.img_paths)
-        fname = self.img_paths[index]
-        path = os.path.join(self.data_path, self.phase, fname)
+        max_retries = 10
+        for attempt in range(max_retries):
+            idx = index % len(self.img_paths) if attempt == 0 else random.randint(0, len(self.img_paths) - 1)
+            fname = self.img_paths[idx]
+            path = os.path.join(self.data_path, self.phase, fname)
 
-        # Load .npy and resize
-        img = np.load(path)
-        img = sk_resize(img, (self.resize_to, self.resize_to))
+            try:
+                # Load .npy and resize
+                img = np.load(path)
+                img = sk_resize(img, (self.resize_to, self.resize_to))
+            except (ValueError, Exception) as e:
+                warnings.warn(
+                    f"[RetinaDataset] Corrupt file skipped: {fname} ({e})",
+                    stacklevel=2,
+                )
+                continue
 
-        # Ensure 3-channel
-        if img.ndim < 3:
-            img = np.stack((img,) * 3, axis=-1)
-        elif img.shape[2] >= 3:
-            img = img[:, :, :3]
+            # Ensure 3-channel
+            if img.ndim < 3:
+                img = np.stack((img,) * 3, axis=-1)
+            elif img.shape[2] >= 3:
+                img = img[:, :, :3]
 
-        # Convert to PIL intelligently based on the mathematical data bounds
-        # skimage.resize outputs float type. If original array natively spanned
-        # 0.0 - 255.0, multiplying by 255 corrupts it into pure white noise.
-        if img.max() <= 1.0:
-            img_uint8 = (img * 255).clip(0, 255).astype(np.uint8)
-        else:
-            img_uint8 = img.clip(0, 255).astype(np.uint8)
-            
-        pil_img = Image.fromarray(img_uint8)
+            # Convert to PIL intelligently based on the mathematical data bounds
+            # skimage.resize outputs float type. If original array natively spanned
+            # 0.0 - 255.0, multiplying by 255 corrupts it into pure white noise.
+            if img.max() <= 1.0:
+                img_uint8 = (img * 255).clip(0, 255).astype(np.uint8)
+            else:
+                img_uint8 = img.clip(0, 255).astype(np.uint8)
+                
+            pil_img = Image.fromarray(img_uint8)
 
-        # Label
-        target = self.labels.get(fname, 0)
+            # Label
+            target = self.labels.get(fname, 0)
 
-        if self.transform is not None:
-            pil_img = self.transform(pil_img)
+            if self.transform is not None:
+                pil_img = self.transform(pil_img)
 
-        return pil_img, target
+            return pil_img, target
+
+        raise RuntimeError(
+            f"[RetinaDataset] Failed to load a valid sample after {max_retries} retries "
+            f"(last index={index}). Too many corrupt .npy files in the dataset."
+        )
 
     @property
     def classes(self):

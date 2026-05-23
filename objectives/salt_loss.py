@@ -167,26 +167,28 @@ def salt_loss(
     # For variance_loss we need image-level features (GAP of patches)
     # to maintain meaningful collapse detection, so save them separately.
     student_emb_for_var = student_emb
-    if student_proj.dim() == 3:
-        if student_emb is not None:
-            # Collapse detection: use per-image GAP, not per-patch
-            student_emb_for_var = student_emb.mean(dim=1)  # (B, D)
-        student_proj = student_proj.flatten(0, 1)  # (B*N, D)
-        teacher_emb = teacher_emb.flatten(0, 1)
+    if student_proj.dim() == 3 and student_emb is not None:
+        # Collapse detection: use per-image GAP, not per-patch
+        student_emb_for_var = student_emb.mean(dim=1)  # (B, D)
 
     # --- Detach the teacher ---
     teacher_emb = teacher_emb.detach()
 
-    # --- Center both ---
+    # --- Center both across the batch dimension (dim=0) ---
+    # If inputs are (B, N, D), this subtracts the patch-specific mean across the batch.
+    # This isolates patient-to-patient variance and removes massive spatial variance.
     t_centered = teacher_emb - teacher_emb.mean(dim=0, keepdim=True)
     s_centered = student_proj - student_proj.mean(dim=0, keepdim=True)
 
     # --- Standardise teacher residuals ---
-    # The teacher's per-batch std is ~0.054 (from diagnostics).
-    # Dividing by this amplifies the class signal by ~18x,
-    # making targets O(1) instead of O(0.001).
+    # t_centered now only contains inter-patient variance.
     t_std = t_centered.std() + 1e-6  # scalar std across all elements
     t_target = t_centered / t_std
+
+    # --- Flatten for MSE alignment and Covariance penalty if dense distillation ---
+    if s_centered.dim() == 3:
+        s_centered = s_centered.flatten(0, 1)
+        t_target = t_target.flatten(0, 1)
 
     # Force float32 for loss computation to prevent FP16 overflow
     s_centered_f32 = s_centered.float()

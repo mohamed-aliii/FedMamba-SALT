@@ -115,7 +115,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--save_every", type=int, default=10)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--mask_ratio", type=float, default=0.3,
+    parser.add_argument("--mask_ratio", type=float, default=0.5,
                         help="Internal latent masking ratio for student")
 
     # Two-pass config loading (same pattern as train_centralized.py)
@@ -243,36 +243,52 @@ def snapshot_global_params(student, projector):
 def save_fed_checkpoint(
     global_student, global_projector,
     comm_round, loss, output_dir, name,
+    optimizer_states=None, scaler_states=None,
 ):
     """Save a federated training checkpoint."""
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, name)
-    torch.save({
+    ckpt = {
         "comm_round": comm_round,
         "loss": loss,
         "dense_distillation": True,
         "student_state_dict": global_student.state_dict(),
         "projector_state_dict": global_projector.state_dict(),
-    }, path)
+    }
+    if optimizer_states is not None:
+        ckpt["optimizer_states"] = optimizer_states
+    if scaler_states is not None:
+        ckpt["scaler_states"] = scaler_states
+    torch.save(ckpt, path)
 
 
 def try_resume_fed(output_dir, global_student, global_projector, device):
-    """Resume from ckpt_latest.pth if it exists. Returns start_round."""
+    """Resume from ckpt_latest.pth if it exists. Returns (start_round, extra_state)."""
     latest = os.path.join(output_dir, "ckpt_latest.pth")
     if not os.path.isfile(latest):
-        return 0
+        return 0, {}
 
     print(f"[RESUME] Loading: {latest}")
     ckpt = safe_torch_load(latest, map_location=device)
     if "student_state_dict" not in ckpt:
-        return 0
+        return 0, {}
 
     global_student.load_state_dict(ckpt["student_state_dict"])
     global_projector.load_state_dict(ckpt["projector_state_dict"])
 
     start_round = ckpt["comm_round"] + 1
+    extra = {}
+    if "optimizer_states" in ckpt:
+        extra["optimizer_states"] = ckpt["optimizer_states"]
+    if "scaler_states" in ckpt:
+        extra["scaler_states"] = ckpt["scaler_states"]
+
     print(f"[RESUME] Resuming from round {start_round}")
-    return start_round
+    if extra:
+        print(f"[RESUME] Optimizer/scaler states found — will restore.")
+    else:
+        print(f"[RESUME] No optimizer states in checkpoint — will use 3-round LR warmup.")
+    return start_round, extra
 
 
 # ======================================================================
@@ -344,11 +360,11 @@ def main():
     teacher, global_student, global_projector = build_models(args)
 
     # ----- Resume -----
-    start_round = try_resume_fed(
+    start_round, resume_state = try_resume_fed(
         args.output_dir, global_student, global_projector, args.device,
     )
 
-    # ----- Warm-start from a previous checkpoint (fresh round counter) -----
+    # ----- Warm-start from a previous checkpoint (fresh round counter or resumed) -----
     if start_round == 0 and args.init_ckpt is not None:
         if os.path.isfile(args.init_ckpt):
             print(f"[INIT] Loading weights from: {args.init_ckpt}")
@@ -356,7 +372,11 @@ def main():
             if "student_state_dict" in ckpt:
                 global_student.load_state_dict(ckpt["student_state_dict"])
                 global_projector.load_state_dict(ckpt["projector_state_dict"])
-                print(f"[INIT] Weights loaded. Starting fresh from round 0.")
+                if "comm_round" in ckpt:
+                    start_round = ckpt["comm_round"] + 1
+                    print(f"[INIT] Weights loaded. Resuming from round {start_round}.")
+                else:
+                    print(f"[INIT] Weights loaded. Starting fresh from round 0.")
             else:
                 print(f"[INIT] Checkpoint has no student_state_dict. Skipping.")
         else:
@@ -401,6 +421,24 @@ def main():
         for _ in range(args.n_clients)
     ]
 
+    # ----- Restore optimizer/scaler states from resume checkpoint -----
+    if resume_state.get("optimizer_states"):
+        opt_states = resume_state["optimizer_states"]
+        if len(opt_states) == len(client_optimizers):
+            for i, state in enumerate(opt_states):
+                client_optimizers[i].load_state_dict(state)
+            print("[RESUME] Optimizer states restored.")
+        else:
+            print("[RESUME] WARNING: optimizer count mismatch — skipping optimizer restore.")
+    if resume_state.get("scaler_states"):
+        sc_states = resume_state["scaler_states"]
+        if len(sc_states) == len(client_scalers):
+            for i, state in enumerate(sc_states):
+                client_scalers[i].load_state_dict(state)
+            print("[RESUME] Scaler states restored.")
+        else:
+            print("[RESUME] WARNING: scaler count mismatch — skipping scaler restore.")
+
     # ----- Metrics logger -----
     logger = FedMetricsLogger(args.output_dir, args.n_clients)
 
@@ -414,7 +452,7 @@ def main():
     _warmup_r = 5
     _flat_r   = _warmup_r + int(args.max_rounds * 0.40)
     print(f"  LR schedule:  warmup={_warmup_r}r | flat={_flat_r - _warmup_r}r "
-          f"| cosine={args.max_rounds - _flat_r}r | eta_min={2e-4}")
+          f"| cosine={args.max_rounds - _flat_r}r | eta_min={1e-4}")
     print("=" * 55)
     print()
 
@@ -464,7 +502,7 @@ def main():
         WARMUP_ROUNDS = 5
         FLAT_RATIO    = 0.40
         FLAT_ROUNDS   = WARMUP_ROUNDS + int(args.max_rounds * FLAT_RATIO)
-        eta_min       = 2e-4   # higher floor: data proves model learns well at this LR
+        eta_min       = 1e-4   # revert to 1e-4 for proper cooling
 
         if comm_round < WARMUP_ROUNDS:
             # Linear warmup: lr/5 → lr over first 5 rounds
@@ -479,6 +517,13 @@ def main():
             current_lr = eta_min + 0.5 * (args.lr - eta_min) * (
                 1 + math.cos(math.pi * t_cur / T_decay)
             )
+
+        # Resume warmup: ramp LR over 3 rounds when optimizer states were lost
+        RESUME_WARMUP = 3
+        if start_round > 0 and not resume_state.get("optimizer_states"):
+            rounds_since_resume = comm_round - start_round
+            if rounds_since_resume < RESUME_WARMUP:
+                current_lr = current_lr * (rounds_since_resume + 1) / RESUME_WARMUP
         
         # ----- Local training for each client -----
         for client_id in range(args.n_clients):
@@ -573,10 +618,10 @@ def main():
                 break
 
         # Collapse check — only fire after warmup, use realistic threshold
-        if comm_round > 10 and round_enc_std < 0.30:
+        if comm_round > 10 and round_enc_std < 0.05:
             print(
                 f"  [WARNING] Round {comm_round + 1}: "
-                f"enc_std={round_enc_std:.4f} < 0.30 — representation collapsing!"
+                f"enc_std={round_enc_std:.4f} < 0.05 — representation collapsing!"
             )
 
         # ----- Logging -----
@@ -605,6 +650,8 @@ def main():
         save_fed_checkpoint(
             global_student, global_projector,
             comm_round, round_loss, args.output_dir, "ckpt_latest.pth",
+            optimizer_states=[opt.state_dict() for opt in client_optimizers],
+            scaler_states=[sc.state_dict() for sc in client_scalers],
         )
 
         if (comm_round + 1) % args.save_every == 0:
