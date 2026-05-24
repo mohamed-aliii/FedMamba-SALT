@@ -685,7 +685,7 @@ def local_train_one_round(
     # FIX-11: report accuracy from the final local epoch only (full LR, best
     # weights before aggregation) rather than the average across all epochs.
     train_acc = 100.0 * last_epoch_correct / max(last_epoch_total, 1)
-    return avg_loss, train_acc
+    return avg_loss, train_acc, accumulated_grads
 
 
 # ======================================================================
