@@ -323,26 +323,26 @@ def build_models(args):
     base_encoder.eval()
     with torch.no_grad():
         _dummy = torch.zeros(1, 3, 224, 224, device=args.device)
-        # Both modes now use GAP (return_patches=False)
-        _out = base_encoder(_dummy, return_patches=False)
-        # shape: (1, feat_dim)
-        feat_dim = _out.shape[-1]
+        if args.mode == "federated_finetune":
+            # PatchEncoderWrapper will be used; probe base encoder in patch mode
+            _out = base_encoder(_dummy, return_patches=True)
+            # shape: (1, num_patches, feat_dim)
+            feat_dim = _out.shape[-1]
+        else:
+            _out = base_encoder(_dummy, return_patches=False)
+            # shape: (1, feat_dim)
+            feat_dim = _out.shape[-1]
     print(f"  [build_models] Detected feat_dim={feat_dim} from encoder output")
 
     if args.mode == "federated_finetune":
-        # Strategy A: use GAP+Linear (same as centralized baseline that
-        # achieved 81.93%).  GAP has zero learnable spatial params, making
-        # it robust to FedAvg averaging.  AttentionPool's 100K params are
-        # overparameterized per-client (0.018 samples/param) and each client
-        # learns different attention patterns that FedAvg blurs.
-        encoder = base_encoder  # raw encoder, return_patches=False (GAP)
-        classifier = nn.Sequential(
-            nn.BatchNorm1d(feat_dim),
-            nn.Dropout(0.5),
-            nn.Linear(feat_dim, args.num_classes),
+        # Match centralized full_finetune architecture exactly:
+        # PatchEncoderWrapper + AttentionPoolClassifier
+        encoder = PatchEncoderWrapper(base_encoder)
+        classifier = AttentionPoolClassifier(
+            feat_dim=feat_dim, num_classes=args.num_classes,
         ).to(args.device)
-        nn.init.trunc_normal_(classifier[2].weight, std=0.02)
-        nn.init.zeros_(classifier[2].bias)
+        nn.init.trunc_normal_(classifier.head[2].weight, std=0.02)
+        nn.init.zeros_(classifier.head[2].bias)
     else:
         # linear probe: frozen encoder, flat GAP vector
         encoder = base_encoder  # already on device
