@@ -200,9 +200,9 @@ def parse_args() -> argparse.Namespace:
                    help="Local fine-tuning epochs per round per client")
     p.add_argument("--mu", type=float, default=0.0,
                    help="FedProx proximal term weight. 0 = FedAvg")
-    p.add_argument("--algo", type=str, default="scaffold",
+    p.add_argument("--algo", type=str, default="fedavgm",
                    choices=["scaffold", "fedavgm", "fedprox", "fedavg"],
-                   help="Federated algorithm: scaffold (default), fedavgm, fedprox, fedavg")
+                   help="Federated algorithm: fedavgm (default), scaffold, fedprox, fedavg")
 
     # Training hyper-parameters
     p.add_argument("--batch_size", type=int, default=64,
@@ -389,28 +389,22 @@ def snapshot_global_params(encoder, classifier) -> dict:
 
 def fedprox_penalty(encoder, classifier, global_params: dict, mu: float) -> torch.Tensor:
     """
-    Compute the FedProx proximal term.
-    
-    Applies a strong pull to the encoder (mu * 5) to retain pre-trained features,
-    and a weak pull to the classifier (mu / 10) to let it adapt freely from
-    random initialization.
-    """
-    mu_enc = mu * 5.0
-    mu_cls = mu / 10.0
+    Compute the FedProx proximal term:
+        (mu / 2) * ||w - w_global||^2
 
-    penalty_enc = torch.tensor(0.0, device=next(encoder.parameters()).device)
+    This pulls each client's local parameters back toward the global model,
+    reducing client drift in heterogeneous data settings.
+    """
+    penalty = torch.tensor(0.0, device=next(encoder.parameters()).device)
     for name, param in encoder.named_parameters():
         if param.requires_grad and f"enc.{name}" in global_params:
             g = global_params[f"enc.{name}"].to(param.device)
-            penalty_enc = penalty_enc + ((param - g) ** 2).sum()
-            
-    penalty_cls = torch.tensor(0.0, device=next(classifier.parameters()).device)
+            penalty = penalty + ((param - g) ** 2).sum()
     for name, param in classifier.named_parameters():
         if param.requires_grad and f"cls.{name}" in global_params:
             g = global_params[f"cls.{name}"].to(param.device)
-            penalty_cls = penalty_cls + ((param - g) ** 2).sum()
-            
-    return (mu_enc / 2.0) * penalty_enc + (mu_cls / 2.0) * penalty_cls
+            penalty = penalty + ((param - g) ** 2).sum()
+    return (mu / 2.0) * penalty
 
 
 # ======================================================================
@@ -461,13 +455,12 @@ def build_criterion(args, device: str) -> nn.Module:
     class_weights = torch.tensor(cw, dtype=torch.float32, device=device)
 
     if args.use_focal_loss:
-        # Re-enabled smoothing=0.05 even with mixup to match centralized baseline
-        smoothing = 0.05
+        smoothing = 0.0 if args.use_mixup else 0.05
         return FocalLoss(weight=class_weights, gamma=2.0, label_smoothing=smoothing)
 
-    # FIX-3 + FIX-9: ce_smoothing is now actually passed to CrossEntropyLoss.
-    # Re-enabled smoothing=0.05 even with mixup to match centralized baseline.
-    ce_smoothing = 0.05
+    # Disable smoothing when Mixup is on (double-smoothing over-regularizes
+    # with small per-client datasets in federated settings).
+    ce_smoothing = 0.0 if args.use_mixup else 0.05
     return nn.CrossEntropyLoss(weight=class_weights, label_smoothing=ce_smoothing)
 
 
