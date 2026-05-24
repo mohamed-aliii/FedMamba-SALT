@@ -1153,7 +1153,7 @@ def main() -> None:
             for cid in range(args.n_clients):
                 for pg in probe_optimizers[cid].param_groups:
                     pg["lr"] = args.lr
-                loss, tacc = local_train_one_round(
+                loss, tacc, _ = local_train_one_round(
                     client_encoders[cid], client_classifiers[cid],
                     client_loaders[cid],
                     probe_optimizers[cid], probe_scalers[cid],
