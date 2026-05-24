@@ -1172,6 +1172,10 @@ def main() -> None:
         "round": [], "val_acc": [], "val_loss": [],
         "val_auc": [], "enc_lr": [], "cls_lr": [],
     }
+    
+    # Initialize server-side momentum for FedAvgM
+    server_momentum_enc = {k: torch.zeros_like(v) for k, v in global_encoder.state_dict().items() if v.is_floating_point()}
+    server_momentum_cls = {k: torch.zeros_like(v) for k, v in global_classifier.state_dict().items() if v.is_floating_point()}
 
     # FIX-14: after the warm-start probe the classifier is oriented but the
     # encoder has been frozen. Applying full enc_lr immediately in round 1
@@ -1240,8 +1244,8 @@ def main() -> None:
         # This is safe even when the encoder is frozen: averaging frozen params
         # is a no-op (all clients share identical weights), and the classifier
         # aggregation is what matters in linear probe mode.
-        average_models(global_encoder,    client_encoders,    client_weights)
-        average_models(global_classifier, client_classifiers, client_weights)
+        average_models(global_encoder,    client_encoders,    client_weights, server_momentum=server_momentum_enc)
+        average_models(global_classifier, client_classifiers, client_weights, server_momentum=server_momentum_cls)
 
         # ---- Broadcast back ----
         broadcast_global_to_clients(global_encoder,    client_encoders)
