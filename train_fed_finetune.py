@@ -200,9 +200,9 @@ def parse_args() -> argparse.Namespace:
                    help="Local fine-tuning epochs per round per client")
     p.add_argument("--mu", type=float, default=0.0,
                    help="FedProx proximal term weight. 0 = FedAvg")
-    p.add_argument("--algo", type=str, default="fedavgm",
+    p.add_argument("--algo", type=str, default="scaffold",
                    choices=["scaffold", "fedavgm", "fedprox", "fedavg"],
-                   help="Federated algorithm: fedavgm (default), scaffold, fedprox, fedavg")
+                   help="Federated algorithm: scaffold (default), fedavgm, fedprox, fedavg")
 
     # Training hyper-parameters
     p.add_argument("--batch_size", type=int, default=64,
@@ -389,22 +389,28 @@ def snapshot_global_params(encoder, classifier) -> dict:
 
 def fedprox_penalty(encoder, classifier, global_params: dict, mu: float) -> torch.Tensor:
     """
-    Compute the FedProx proximal term:
-        (mu / 2) * ||w - w_global||^2
-
-    This pulls each client's local parameters back toward the global model,
-    reducing client drift in heterogeneous data settings.
+    Compute the FedProx proximal term.
+    
+    Applies a strong pull to the encoder (mu * 5) to retain pre-trained features,
+    and a weak pull to the classifier (mu / 10) to let it adapt freely from
+    random initialization.
     """
-    penalty = torch.tensor(0.0, device=next(encoder.parameters()).device)
+    mu_enc = mu * 5.0
+    mu_cls = mu / 10.0
+
+    penalty_enc = torch.tensor(0.0, device=next(encoder.parameters()).device)
     for name, param in encoder.named_parameters():
         if param.requires_grad and f"enc.{name}" in global_params:
             g = global_params[f"enc.{name}"].to(param.device)
-            penalty = penalty + ((param - g) ** 2).sum()
+            penalty_enc = penalty_enc + ((param - g) ** 2).sum()
+            
+    penalty_cls = torch.tensor(0.0, device=next(classifier.parameters()).device)
     for name, param in classifier.named_parameters():
         if param.requires_grad and f"cls.{name}" in global_params:
             g = global_params[f"cls.{name}"].to(param.device)
-            penalty = penalty + ((param - g) ** 2).sum()
-    return (mu / 2.0) * penalty
+            penalty_cls = penalty_cls + ((param - g) ** 2).sum()
+            
+    return (mu_enc / 2.0) * penalty_enc + (mu_cls / 2.0) * penalty_cls
 
 
 # ======================================================================
@@ -455,12 +461,13 @@ def build_criterion(args, device: str) -> nn.Module:
     class_weights = torch.tensor(cw, dtype=torch.float32, device=device)
 
     if args.use_focal_loss:
-        smoothing = 0.0 if args.use_mixup else 0.05
+        # Re-enabled smoothing=0.05 even with mixup to match centralized baseline
+        smoothing = 0.05
         return FocalLoss(weight=class_weights, gamma=2.0, label_smoothing=smoothing)
 
-    # Disable smoothing when Mixup is on (double-smoothing over-regularizes
-    # with small per-client datasets in federated settings).
-    ce_smoothing = 0.0 if args.use_mixup else 0.05
+    # FIX-3 + FIX-9: ce_smoothing is now actually passed to CrossEntropyLoss.
+    # Re-enabled smoothing=0.05 even with mixup to match centralized baseline.
+    ce_smoothing = 0.05
     return nn.CrossEntropyLoss(weight=class_weights, label_smoothing=ce_smoothing)
 
 
@@ -507,7 +514,7 @@ def local_train_one_round(
     when E_epoch > 1 (a single local epoch has nothing to ramp over).
 
     Returns:
-        avg_loss (float), train_acc (float)
+        avg_loss (float), train_acc (float), accumulated_grads (dict|None)
     """
     _device_type = "cuda" if "cuda" in args.device else "cpu"
     EPOCH_WARMUP_FACTOR = 0.05  # encoder starts each round at 5% of target LR
@@ -531,6 +538,17 @@ def local_train_one_round(
     total_loss = 0.0
     correct = 0
     total = 0
+    
+    accumulated_grads = None
+    if scaffold_state is not None:
+        accumulated_grads = {}
+        for name, param in encoder.named_parameters():
+            if param.requires_grad:
+                accumulated_grads[f"enc.{name}"] = torch.zeros_like(param.data)
+        for name, param in classifier.named_parameters():
+            if param.requires_grad:
+                accumulated_grads[f"cls.{name}"] = torch.zeros_like(param.data)
+
     # FIX-11: track last-epoch accuracy separately so the reported train_acc
     # reflects the model *after* the within-round encoder LR ramp completes,
     # not the average across all local epochs (which was dragged down by the
@@ -608,10 +626,20 @@ def local_train_one_round(
 
             scaler.scale(loss).backward()
 
-            # Always unscale before SCAFFOLD correction / clipping
+            # Always unscale before gradient accumulation / SCAFFOLD / clipping
             scaler.unscale_(optimizer)
 
-            # SCAFFOLD gradient correction
+            # Accumulate TRUE RAW gradients for AdamW-safe SCAFFOLD
+            if accumulated_grads is not None:
+                with torch.no_grad():
+                    for name, param in encoder.named_parameters():
+                        if param.requires_grad and param.grad is not None:
+                            accumulated_grads[f"enc.{name}"].add_(param.grad.data)
+                    for name, param in classifier.named_parameters():
+                        if param.requires_grad and param.grad is not None:
+                            accumulated_grads[f"cls.{name}"].add_(param.grad.data)
+
+            # SCAFFOLD gradient correction (modifies param.grad.data in-place)
             if scaffold_state is not None:
                 c_global, c_local = scaffold_state
                 apply_scaffold_correction(encoder, classifier, c_global, c_local)
@@ -1261,7 +1289,7 @@ def main() -> None:
             if scaffold_active:
                 scaffold_state = (c_global, c_clients[cid])
 
-            loss, tacc = local_train_one_round(
+            loss, tacc, accumulated_grads = local_train_one_round(
                 enc, cls, client_loaders[cid], opt, scl,
                 criterion, args,
                 global_params if (args.mu > 0 and not use_scaffold) else None,
@@ -1273,11 +1301,10 @@ def main() -> None:
             client_train_acc.append(tacc)
 
             # ---- SCAFFOLD: update this client's control variate ----
-            if scaffold_active and global_params is not None:
+            if scaffold_active:
                 K = args.E_epoch * len(client_loaders[cid])
                 c_new, delta_c = compute_control_variate_update(
-                    enc, cls, c_global, c_clients[cid],
-                    global_params, K, enc_lr, cls_lr,
+                    enc, cls, c_clients[cid], accumulated_grads, K
                 )
                 c_clients[cid] = c_new
                 all_delta_c.append(delta_c)
