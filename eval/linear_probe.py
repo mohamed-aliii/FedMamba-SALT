@@ -255,7 +255,7 @@ class AttentionPoolClassifier(nn.Module):
             nn.Linear(128, 1),
         )
         self.head = nn.Sequential(
-            nn.BatchNorm1d(feat_dim),
+            nn.LayerNorm(feat_dim),
             nn.Dropout(0.5),
             nn.Linear(feat_dim, num_classes),
         )

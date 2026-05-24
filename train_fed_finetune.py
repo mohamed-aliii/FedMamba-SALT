@@ -382,22 +382,28 @@ def snapshot_global_params(encoder, classifier) -> dict:
 
 def fedprox_penalty(encoder, classifier, global_params: dict, mu: float) -> torch.Tensor:
     """
-    Compute the FedProx proximal term:
-        (mu / 2) * ||w - w_global||^2
-
-    This pulls each client's local parameters back toward the global model,
-    reducing client drift in heterogeneous data settings.
+    Compute the FedProx proximal term.
+    
+    Applies a strong pull to the encoder (mu * 5) to retain pre-trained features,
+    and a weak pull to the classifier (mu / 10) to let it adapt freely from
+    random initialization.
     """
-    penalty = torch.tensor(0.0, device=next(encoder.parameters()).device)
+    mu_enc = mu * 5.0
+    mu_cls = mu / 10.0
+
+    penalty_enc = torch.tensor(0.0, device=next(encoder.parameters()).device)
     for name, param in encoder.named_parameters():
         if param.requires_grad and f"enc.{name}" in global_params:
             g = global_params[f"enc.{name}"].to(param.device)
-            penalty = penalty + ((param - g) ** 2).sum()
+            penalty_enc = penalty_enc + ((param - g) ** 2).sum()
+            
+    penalty_cls = torch.tensor(0.0, device=next(classifier.parameters()).device)
     for name, param in classifier.named_parameters():
         if param.requires_grad and f"cls.{name}" in global_params:
             g = global_params[f"cls.{name}"].to(param.device)
-            penalty = penalty + ((param - g) ** 2).sum()
-    return (mu / 2.0) * penalty
+            penalty_cls = penalty_cls + ((param - g) ** 2).sum()
+            
+    return (mu_enc / 2.0) * penalty_enc + (mu_cls / 2.0) * penalty_cls
 
 
 # ======================================================================
@@ -448,14 +454,13 @@ def build_criterion(args, device: str) -> nn.Module:
     class_weights = torch.tensor(cw, dtype=torch.float32, device=device)
 
     if args.use_focal_loss:
-        smoothing = 0.0 if args.use_mixup else 0.05
+        # Re-enabled smoothing=0.05 even with mixup to match centralized baseline
+        smoothing = 0.05
         return FocalLoss(weight=class_weights, gamma=2.0, label_smoothing=smoothing)
 
-    # FIX-3 + FIX-9: suppress smoothing when Mixup is on, and actually pass
-    # ce_smoothing to CrossEntropyLoss (was silently dropped before FIX-9).
-    # Smoothing reduced from 0.1 → 0.05: with balanced classes and no class
-    # weighting, 0.1 over-regularises a 2-class head and slows convergence.
-    ce_smoothing = 0.0 if args.use_mixup else 0.05
+    # FIX-3 + FIX-9: ce_smoothing is now actually passed to CrossEntropyLoss.
+    # Re-enabled smoothing=0.05 even with mixup to match centralized baseline.
+    ce_smoothing = 0.05
     return nn.CrossEntropyLoss(weight=class_weights, label_smoothing=ce_smoothing)
 
 
