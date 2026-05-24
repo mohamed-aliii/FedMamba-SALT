@@ -15,7 +15,7 @@ Architecture mirrors train_fedavg.py exactly:
 Two-level LR scheduling (unique to fine-tuning):
   Round level  — warmup(10r) → flat → cosine decay across communication rounds,
                  applied once per round via in-place param_group update.
-                 Encoder group gets base_lr/2; classifier gets base_lr.
+                 Encoder group gets base_lr/10; classifier gets base_lr.
                  FedProx uses a shorter flat phase (15% vs 30%) to spend more
                  cosine budget compensating for the proximal regularisation.
   Epoch level  — within each round, the encoder group linearly ramps from
@@ -151,10 +151,7 @@ LOSS_PATIENCE    = 20      # early stop if global val_acc doesn't improve
 ACC_MIN_DELTA    = 0.05    # minimum improvement (%) to reset patience counter
 
 # Round-level LR schedule shared constants
-LR_WARMUP_ROUNDS  = 3      # linear warmup length (rounds)
-                           # Reduced from 5 → 3: the 3-round probe warmstart already
-                           # orients the classifier before the main loop begins, so
-                           # 3 additional rounds of round-level warmup is sufficient.
+LR_WARMUP_ROUNDS  = 5      # linear warmup length (rounds)
 LR_FLAT_RATIO     = 0.30   # FedAvg flat-phase fraction of max_rounds
 LR_FLAT_RATIO_FED = 0.15   # FedProx flat-phase fraction (shorter → more cosine budget)
                            # FIX-2 (completed): was incorrectly 0.30, same as FedAvg.
@@ -326,30 +323,26 @@ def build_models(args):
     base_encoder.eval()
     with torch.no_grad():
         _dummy = torch.zeros(1, 3, 224, 224, device=args.device)
-        if args.mode == "federated_finetune":
-            # PatchEncoderWrapper will be used; probe base encoder in patch mode
-            _out = base_encoder(_dummy, return_patches=True)
-            # shape: (1, num_patches, feat_dim)
-            feat_dim = _out.shape[-1]
-        else:
-            _out = base_encoder(_dummy, return_patches=False)
-            # shape: (1, feat_dim)
-            feat_dim = _out.shape[-1]
+        # Both modes now use GAP (return_patches=False)
+        _out = base_encoder(_dummy, return_patches=False)
+        # shape: (1, feat_dim)
+        feat_dim = _out.shape[-1]
     print(f"  [build_models] Detected feat_dim={feat_dim} from encoder output")
 
     if args.mode == "federated_finetune":
-        encoder = PatchEncoderWrapper(base_encoder)
-        classifier = AttentionPoolClassifier(
-            feat_dim=feat_dim, num_classes=args.num_classes,
+        # Strategy A: use GAP+Linear (same as centralized baseline that
+        # achieved 81.93%).  GAP has zero learnable spatial params, making
+        # it robust to FedAvg averaging.  AttentionPool's 100K params are
+        # overparameterized per-client (0.018 samples/param) and each client
+        # learns different attention patterns that FedAvg blurs.
+        encoder = base_encoder  # raw encoder, return_patches=False (GAP)
+        classifier = nn.Sequential(
+            nn.BatchNorm1d(feat_dim),
+            nn.Dropout(0.5),
+            nn.Linear(feat_dim, args.num_classes),
         ).to(args.device)
-        # FIX-13: replace kaiming_uniform with a small truncated-normal init.
-        # kaiming assumes ReLU-style activations and typical ImageNet scale;
-        # pre-trained Mamba patch tokens are LayerNorm-normalised and have a
-        # much tighter distribution. Large initial weights → the head saturates
-        # after round 1 and collapses to predicting one class.
-        # trunc_normal_(std=0.02) matches ViT/DeiT classifier head conventions.
-        nn.init.trunc_normal_(classifier.head[2].weight, std=0.02)
-        nn.init.zeros_(classifier.head[2].bias)
+        nn.init.trunc_normal_(classifier[2].weight, std=0.02)
+        nn.init.zeros_(classifier[2].bias)
     else:
         # linear probe: frozen encoder, flat GAP vector
         encoder = base_encoder  # already on device
@@ -511,7 +504,7 @@ def local_train_one_round(
         avg_loss (float), train_acc (float)
     """
     _device_type = "cuda" if "cuda" in args.device else "cpu"
-    EPOCH_WARMUP_FACTOR = 0.3   # encoder starts each round at 30% of target LR
+    EPOCH_WARMUP_FACTOR = 0.05  # encoder starts each round at 5% of target LR
 
     # Pull target LRs from optimizer state (already set by the round loop)
     target_enc_lr = None
@@ -1017,15 +1010,15 @@ def main() -> None:
     def _make_optimizer(enc, cls):
         enc_params = [p for p in enc.parameters() if p.requires_grad]
         cls_params = [p for p in cls.parameters() if p.requires_grad]
-        # Separate LR groups: encoder gets lr/5 to protect pre-trained features.
-        # Classifier gets full lr (random init needs faster movement).
+        # Separate LR groups: encoder gets lr/10 to protect pre-trained features
+        # (matches centralized baseline).  Classifier gets full lr.
         # Linear probe: encoder has requires_grad=False so enc_params is empty.
         param_groups = []
         if enc_params:
             param_groups.append({
                 "params":       enc_params,
-                "lr":           args.lr / 5.0,
-                "weight_decay": 0.01,
+                "lr":           args.lr / 10.0,
+                "weight_decay": 0.03,
                 "group_name":   "encoder",
             })
         param_groups.append({
@@ -1160,7 +1153,7 @@ def main() -> None:
           f"| eta_min={args.lr * LR_ETA_MIN_RATIO:.1e}"
           + (" [FedProx short-flat]" if args.mu > 0 else ""))
     print(f"    classifier: {args.lr:.1e} → {args.lr * LR_ETA_MIN_RATIO:.1e}")
-    print(f"    encoder:    {args.lr/5.0:.1e} → {args.lr/5.0 * LR_ETA_MIN_RATIO:.1e}")
+    print(f"    encoder:    {args.lr/10.0:.1e} → {args.lr/10.0 * LR_ETA_MIN_RATIO:.1e}")
     if not freeze_encoder and args.E_epoch > 1:
         print(f"  Epoch-level encoder warmup: 5% → 100% of enc_lr over {args.E_epoch} local epochs/round")
     print(f"  Early stopping: no improvement for {LOSS_PATIENCE} rounds "
@@ -1182,8 +1175,8 @@ def main() -> None:
     # POST_PROBE_FACTOR and linearly reaches 1.0 after POST_PROBE_RAMP rounds.
     # This is multiplicative on top of the normal round-level schedule so the
     # two warmup mechanisms compose cleanly.
-    POST_PROBE_FACTOR = 1.0   # disabled — epoch warmup at 0.3 provides sufficient protection
-    POST_PROBE_RAMP   = 0     # no post-probe ramp needed
+    POST_PROBE_FACTOR = 0.1   # encoder starts at 10% of its scheduled LR
+    POST_PROBE_RAMP   = 5     # reaches 100% by round 5
 
     for comm_round in range(start_round, args.max_rounds):
         round_start = time.time()
@@ -1201,7 +1194,7 @@ def main() -> None:
             )
         else:
             post_probe_scale = 1.0
-        enc_lr = (current_lr / 5.0) * post_probe_scale
+        enc_lr = (current_lr / 10.0) * post_probe_scale
 
         # ---- FedProx: snapshot global params before any client trains ----
         global_params = None
