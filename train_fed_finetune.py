@@ -1199,6 +1199,7 @@ def main() -> None:
 
     # Initialize SCAFFOLD control variates (only used when algo=scaffold)
     use_scaffold = (args.algo == "scaffold")
+    SCAFFOLD_WARMUP = LR_WARMUP_ROUNDS + POST_PROBE_RAMP  # plain FedAvg during LR warmup
     c_global = None
     c_clients = None
     if use_scaffold:
@@ -1206,6 +1207,7 @@ def main() -> None:
             global_encoder, global_classifier, args.n_clients,
         )
         print(f"  [SCAFFOLD] Initialized control variates for {args.n_clients} clients")
+        print(f"  [SCAFFOLD] Corrections activate at round {SCAFFOLD_WARMUP} (after LR warmup)")
 
     # FIX-14: after the warm-start probe the classifier is oriented but the
     # encoder has been frozen. Applying full enc_lr immediately in round 1
@@ -1258,9 +1260,12 @@ def main() -> None:
                 else:  # "classifier"
                     pg["lr"] = cls_lr
 
-            # Build SCAFFOLD state for this client (None if algo != scaffold)
+            # Build SCAFFOLD state for this client
+            # Delayed until after LR warmup to prevent control variate explosion
+            # from dividing by near-zero LR in the update formula.
             scaffold_state = None
-            if use_scaffold:
+            scaffold_active = use_scaffold and comm_round >= SCAFFOLD_WARMUP
+            if scaffold_active:
                 scaffold_state = (c_global, c_clients[cid])
 
             loss, tacc = local_train_one_round(
@@ -1275,7 +1280,7 @@ def main() -> None:
             client_train_acc.append(tacc)
 
             # ---- SCAFFOLD: update this client's control variate ----
-            if use_scaffold and global_params is not None:
+            if scaffold_active and global_params is not None:
                 K = args.E_epoch * len(client_loaders[cid])
                 c_new, delta_c = compute_control_variate_update(
                     enc, cls, c_global, c_clients[cid],
@@ -1285,7 +1290,7 @@ def main() -> None:
                 all_delta_c.append(delta_c)
 
         # ---- SCAFFOLD: update server control variate ----
-        if use_scaffold and all_delta_c:
+        if scaffold_active and all_delta_c:
             update_server_control_variate(c_global, all_delta_c, args.n_clients)
 
         # ---- Model aggregation ----
