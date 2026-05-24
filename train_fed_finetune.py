@@ -1199,7 +1199,7 @@ def main() -> None:
 
     # Initialize SCAFFOLD control variates (only used when algo=scaffold)
     use_scaffold = (args.algo == "scaffold")
-    SCAFFOLD_WARMUP = LR_WARMUP_ROUNDS + POST_PROBE_RAMP  # plain FedAvg during LR warmup
+    SCAFFOLD_WARMUP = 10  # plain FedAvg for first 10 rounds (LR warmup + post-probe ramp)
     c_global = None
     c_clients = None
     if use_scaffold:
