@@ -119,6 +119,10 @@ from utils.ckpt_compat import safe_torch_load
 from utils.fedavg import (
     average_models, broadcast_global_to_clients, compute_client_weights,
 )
+from utils.scaffold import (
+    init_control_variates, apply_scaffold_correction,
+    compute_control_variate_update, update_server_control_variate,
+)
 
 # Reuse shared components from the linear probe script
 from eval.linear_probe import (
@@ -196,6 +200,9 @@ def parse_args() -> argparse.Namespace:
                    help="Local fine-tuning epochs per round per client")
     p.add_argument("--mu", type=float, default=0.0,
                    help="FedProx proximal term weight. 0 = FedAvg")
+    p.add_argument("--algo", type=str, default="scaffold",
+                   choices=["scaffold", "fedavgm", "fedprox", "fedavg"],
+                   help="Federated algorithm: scaffold (default), fedavgm, fedprox, fedavg")
 
     # Training hyper-parameters
     p.add_argument("--batch_size", type=int, default=64,
@@ -478,6 +485,7 @@ def local_train_one_round(
     global_params: dict | None,
     freeze_encoder: bool,
     comm_round: int = 0,
+    scaffold_state: tuple | None = None,
 ) -> tuple:
     """
     Run E_epoch local fine-tuning steps for a single client.
@@ -607,9 +615,16 @@ def local_train_one_round(
 
             scaler.scale(loss).backward()
 
+            # Always unscale before SCAFFOLD correction / clipping
+            scaler.unscale_(optimizer)
+
+            # SCAFFOLD gradient correction
+            if scaffold_state is not None:
+                c_global, c_local = scaffold_state
+                apply_scaffold_correction(encoder, classifier, c_global, c_local)
+
             # Gradient clipping on active params only (skip frozen encoder)
             if args.grad_clip > 0:
-                scaler.unscale_(optimizer)
                 active = [
                     p for p in list(encoder.parameters()) + list(classifier.parameters())
                     if p.requires_grad and p.grad is not None
@@ -919,7 +934,7 @@ def compute_round_lr(comm_round: int, max_rounds: int, base_lr: float,
 # ======================================================================
 def main() -> None:
     args = parse_args()
-    algo_name = "FedProx" if args.mu > 0 else "FedAvg"
+    algo_name = args.algo.upper()
     mode_label = (
         "Federated Full Fine-tune" if args.mode == "federated_finetune"
         else "Federated Linear Probe"
@@ -936,6 +951,7 @@ def main() -> None:
     print(f"  Clients:        {args.n_clients}")
     print(f"  Rounds:         {args.max_rounds}")
     print(f"  E_epoch:        {args.E_epoch}")
+    print(f"  Algorithm:      {args.algo}")
     print(f"  mu (FedProx):   {args.mu}")
     print(f"  Batch size:     {args.batch_size}")
     print(f"  LR:             {args.lr}")
@@ -1173,9 +1189,23 @@ def main() -> None:
         "val_auc": [], "enc_lr": [], "cls_lr": [],
     }
     
-    # Initialize server-side momentum for FedAvgM
-    server_momentum_enc = {k: torch.zeros_like(v) for k, v in global_encoder.state_dict().items() if v.is_floating_point()}
-    server_momentum_cls = {k: torch.zeros_like(v) for k, v in global_classifier.state_dict().items() if v.is_floating_point()}
+    # Initialize server-side momentum for FedAvgM (only used when algo=fedavgm)
+    use_fedavgm = (args.algo == "fedavgm")
+    server_momentum_enc = None
+    server_momentum_cls = None
+    if use_fedavgm:
+        server_momentum_enc = {k: torch.zeros_like(v) for k, v in global_encoder.state_dict().items() if v.is_floating_point()}
+        server_momentum_cls = {k: torch.zeros_like(v) for k, v in global_classifier.state_dict().items() if v.is_floating_point()}
+
+    # Initialize SCAFFOLD control variates (only used when algo=scaffold)
+    use_scaffold = (args.algo == "scaffold")
+    c_global = None
+    c_clients = None
+    if use_scaffold:
+        c_global, c_clients = init_control_variates(
+            global_encoder, global_classifier, args.n_clients,
+        )
+        print(f"  [SCAFFOLD] Initialized control variates for {args.n_clients} clients")
 
     # FIX-14: after the warm-start probe the classifier is oriented but the
     # encoder has been frozen. Applying full enc_lr immediately in round 1
@@ -1205,13 +1235,14 @@ def main() -> None:
             post_probe_scale = 1.0
         enc_lr = (current_lr / 10.0) * post_probe_scale
 
-        # ---- FedProx: snapshot global params before any client trains ----
+        # ---- Snapshot global params (needed for FedProx and SCAFFOLD) ----
         global_params = None
-        if args.mu > 0:
+        if args.mu > 0 or use_scaffold:
             global_params = snapshot_global_params(global_encoder, global_classifier)
 
         client_losses    = []
         client_train_acc = []
+        all_delta_c      = []   # SCAFFOLD: accumulate control variate deltas
 
         # ---- Local training for each client ----
         for cid in range(args.n_clients):
@@ -1221,31 +1252,47 @@ def main() -> None:
             scl   = client_scalers[cid]
 
             # Update round-level LR in-place via group_name tag.
-            # This is the stable alternative to the old weight_decay comparison:
-            # group_name is set once at optimizer construction and never changes,
-            # so it correctly identifies groups even if both happen to share the
-            # same weight_decay value in future config changes.
             for pg in opt.param_groups:
                 if pg.get("group_name") == "encoder":
                     pg["lr"] = enc_lr
                 else:  # "classifier"
                     pg["lr"] = cls_lr
 
+            # Build SCAFFOLD state for this client (None if algo != scaffold)
+            scaffold_state = None
+            if use_scaffold:
+                scaffold_state = (c_global, c_clients[cid])
+
             loss, tacc = local_train_one_round(
                 enc, cls, client_loaders[cid], opt, scl,
-                criterion, args, global_params, freeze_encoder,
+                criterion, args,
+                global_params if (args.mu > 0 and not use_scaffold) else None,
+                freeze_encoder,
                 comm_round=comm_round,
+                scaffold_state=scaffold_state,
             )
             client_losses.append(loss)
             client_train_acc.append(tacc)
 
-        # ---- FedAvg aggregation ----
-        # Aggregate encoder and classifier independently using dataset-size weights.
-        # This is safe even when the encoder is frozen: averaging frozen params
-        # is a no-op (all clients share identical weights), and the classifier
-        # aggregation is what matters in linear probe mode.
-        average_models(global_encoder,    client_encoders,    client_weights, server_momentum=server_momentum_enc)
-        average_models(global_classifier, client_classifiers, client_weights, server_momentum=server_momentum_cls)
+            # ---- SCAFFOLD: update this client's control variate ----
+            if use_scaffold and global_params is not None:
+                K = args.E_epoch * len(client_loaders[cid])
+                c_new, delta_c = compute_control_variate_update(
+                    enc, cls, c_global, c_clients[cid],
+                    global_params, K, enc_lr, cls_lr,
+                )
+                c_clients[cid] = c_new
+                all_delta_c.append(delta_c)
+
+        # ---- SCAFFOLD: update server control variate ----
+        if use_scaffold and all_delta_c:
+            update_server_control_variate(c_global, all_delta_c, args.n_clients)
+
+        # ---- Model aggregation ----
+        average_models(global_encoder,    client_encoders,    client_weights,
+                       server_momentum=server_momentum_enc)
+        average_models(global_classifier, client_classifiers, client_weights,
+                       server_momentum=server_momentum_cls)
 
         # ---- Broadcast back ----
         broadcast_global_to_clients(global_encoder,    client_encoders)
