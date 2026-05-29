@@ -182,7 +182,7 @@ def salt_loss(
 
     # --- Standardise teacher residuals ---
     # t_centered now only contains inter-patient variance.
-    t_std = t_centered.std() + 1e-6  # scalar std across all elements
+    t_std = t_centered.std(dim=0, keepdim=True) + 1e-6  # FIX: strictly across batch dimension
     t_target = t_centered / t_std
 
     # --- Flatten for MSE alignment and Covariance penalty if dense distillation ---

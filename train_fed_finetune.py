@@ -517,23 +517,6 @@ def local_train_one_round(
         avg_loss (float), train_acc (float), accumulated_grads (dict|None)
     """
     _device_type = "cuda" if "cuda" in args.device else "cpu"
-    EPOCH_WARMUP_FACTOR = 0.05  # encoder starts each round at 5% of target LR
-
-    # Pull target LRs from optimizer state (already set by the round loop)
-    target_enc_lr = None
-    target_cls_lr = None
-    for pg in optimizer.param_groups:
-        if pg.get("group_name") == "encoder":
-            target_enc_lr = pg["lr"]
-        elif pg.get("group_name") == "classifier":
-            target_cls_lr = pg["lr"]
-
-    # Whether to apply the within-round encoder ramp
-    do_enc_warmup = (
-        not freeze_encoder
-        and target_enc_lr is not None
-        and args.E_epoch > 1
-    )
 
     total_loss = 0.0
     correct = 0
@@ -557,22 +540,6 @@ def local_train_one_round(
     last_epoch_total   = 0
 
     for local_epoch in range(args.E_epoch):
-
-        # ── Within-round epoch-level LR for the encoder group ──────────
-        # Classifier always gets its full target LR; only the encoder ramps.
-        # Linear interpolation: epoch 0 → EPOCH_WARMUP_FACTOR × target,
-        #                       epoch E_epoch-1 → target (full LR).
-        if do_enc_warmup:
-            # fraction goes from EPOCH_WARMUP_FACTOR at epoch 0 to 1.0 at
-            # epoch E_epoch-1, giving E_epoch-1 equal steps.
-            frac = EPOCH_WARMUP_FACTOR + (1.0 - EPOCH_WARMUP_FACTOR) * (
-                local_epoch / max(args.E_epoch - 1, 1)
-            )
-            for pg in optimizer.param_groups:
-                if pg.get("group_name") == "encoder":
-                    pg["lr"] = target_enc_lr * frac
-        # ───────────────────────────────────────────────────────────────
-
         if not freeze_encoder:
             encoder.train()
         else:
@@ -1196,8 +1163,6 @@ def main() -> None:
           + (" [FedProx short-flat]" if args.mu > 0 else ""))
     print(f"    classifier: {args.lr:.1e} → {args.lr * LR_ETA_MIN_RATIO:.1e}")
     print(f"    encoder:    {args.lr/10.0:.1e} → {args.lr/10.0 * LR_ETA_MIN_RATIO:.1e}")
-    if not freeze_encoder and args.E_epoch > 1:
-        print(f"  Epoch-level encoder warmup: 5% → 100% of enc_lr over {args.E_epoch} local epochs/round")
     print(f"  Early stopping: no improvement for {LOSS_PATIENCE} rounds "
           f"(threshold >{ACC_MIN_DELTA:.2f}%)")
     print("=" * 60)
