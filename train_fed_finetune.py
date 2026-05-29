@@ -641,12 +641,7 @@ def local_train_one_round(
         last_epoch_correct = epoch_correct
         last_epoch_total   = epoch_total
 
-    # Restore encoder to its full target LR after the within-round ramp,
-    # so the round-level schedule reads back the correct value next round.
-    if do_enc_warmup and target_enc_lr is not None:
-        for pg in optimizer.param_groups:
-            if pg.get("group_name") == "encoder":
-                pg["lr"] = target_enc_lr
+
 
     avg_loss = total_loss / max(total, 1)
     # FIX-11: report accuracy from the final local epoch only (full LR, best
