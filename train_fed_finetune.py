@@ -1212,15 +1212,13 @@ def main() -> None:
         # Encoder gets lr/5; classifier gets full lr (mirrors _make_optimizer)
         cls_lr = current_lr
 
-        # FIX-14: post-probe encoder damping — ramps from POST_PROBE_FACTOR
-        # to 1.0 over POST_PROBE_RAMP rounds, then stays at 1.0.
+        # FIX-14: post-probe encoder damping
         if PROBE_ROUNDS > 0 and comm_round < POST_PROBE_RAMP:
-            post_probe_scale = POST_PROBE_FACTOR + (1.0 - POST_PROBE_FACTOR) * (
-                comm_round / max(POST_PROBE_RAMP - 1, 1)
-            )
+            # Bypass the double-warmup by scaling directly off the target base
+            post_probe_scale = comm_round / max(POST_PROBE_RAMP - 1, 1)
+            enc_lr = (args.lr / 10.0) * post_probe_scale
         else:
-            post_probe_scale = 1.0
-        enc_lr = (current_lr / 10.0) * post_probe_scale
+            enc_lr = (current_lr / 10.0)
 
         # ---- Snapshot global params (needed for FedProx and SCAFFOLD) ----
         global_params = None
