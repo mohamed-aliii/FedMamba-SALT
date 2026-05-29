@@ -458,6 +458,10 @@ def build_criterion(args, device: str) -> nn.Module:
         cw = np.ones(args.num_classes)
         print(f"  [criterion] WARNING: using uniform weights (label collection failed)")
 
+    if args.use_mixup and args._class_weights_np is not None:
+        print("  [criterion] Mixup is active. Disabling class weights to prevent gradient distortion.")
+        cw = np.ones(args.num_classes)
+
     class_weights = torch.tensor(cw, dtype=torch.float32, device=device)
 
     if args.use_focal_loss:
