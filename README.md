@@ -47,8 +47,9 @@ To force hard visual inference rather than trivial mimicry, we decouple the stud
 ### 4. Inception-Mamba Backbone
 The student encoder (`models/inception_mamba.py`) replaces standard self-attention with a highly efficient hybrid architecture:
 - **Mamba State-Space Models (SSM):** Scales linearly $O(N)$ with sequence length, employing 4-directional cross-scanning (Left-to-Right, Right-to-Left, Top-to-Bottom, Bottom-to-Top) for global context.
-- **Inception Multi-Scale Convolutions:** Captures pathological features at multiple scales ($3\times3, 5\times5, 7\times7$ spatial depthwise convolutions).
-- **Efficiency:** Only 31.8M parameters allowing rapid CPU inference (~90ms/image), significantly outperforming larger ViT alternatives.
+- **Paper-aligned Inception Local Path:** Preserves the InceptionMamba four-branch local extractor: $1\times1$, $1\times1\rightarrow3\times3$, $1\times1\rightarrow3\times3\rightarrow3\times3$, and $3\times3$ average pooling followed by $1\times1$ projection.
+- **FedMamba-SALT Adaptation:** Keeps the paper's dual-branch Inception + SSM block, but uses $16\times16$ patches without hierarchical patch merging so the student produces the same 196 dense patch tokens as the frozen MAE ViT-B/16 teacher.
+- **Efficiency:** The current paper experiment uses a 10.1M-10.9M parameter encoder, depending on mock vs. real `mamba-ssm`, plus a 7.35M projection head during SALT pretraining. The teacher is frozen and is not counted as trainable.
 
 ---
 

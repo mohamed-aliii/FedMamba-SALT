@@ -1,21 +1,29 @@
 """
-models/inception_mamba.py -- Paper-Accurate Inception-Mamba student encoder for FedMamba-SALT.
+models/inception_mamba.py -- InceptionMamba student encoder for FedMamba-SALT.
 
-Adapted from: "InceptionMamba: A Lightweight and Effective Model for Medical Image Classification"
-Adjusted for FedMamba-SALT: Bypasses hierarchical patch merging to maintain a strict
-196-patch sequence length required for Dense Patch-Level Distillation with ViT-B/16.
+Reference backbone:
+  "InceptionMamba: A Lightweight and Effective Model for Medical Image
+  Classification Revealing Mamba's Low-Frequency Bias", Neural Processing
+  Letters 58:15, 2026.
 
-Key Paper Features Implemented:
-  1. Parallel Dual-Branch Design (Channel Split).
-  2. Authentic Inception Module (1x1 bottlenecks, multi-scale 3x3, pool).
-  3. Global Channel Attention on the Inception branch.
-  4. SS2D-style Gating and DWConv on the SSM branch, with Learnable Directional Weights.
-  5. Feature Fusion via Channel Shuffle.
-  6. DropPath stochastic depth for aggregation robustness.
+Paper-aligned block features preserved here:
+  1. Dual branch channel split: C/2 Inception path + C/2 SSM path.
+  2. Inception local path with four branches:
+     1x1, 1x1->3x3, 1x1->3x3->3x3, and AvgPool3x3->1x1.
+  3. Channel attention after multi-scale Inception fusion.
+  4. SSM path with LayerNorm, Linear, DWConv3x3, SiLU gating,
+     four-direction SS2D-style scans, and output projection.
+  5. Channel concat, channel shuffle, and residual fusion.
 
-Federated Adaptations:
-  - GroupNorm replaces BatchNorm2d (running stats diverge across FL clients).
-  - Isotropic 196-patch layout (no patch merging) for SALT dense distillation.
+FedMamba-SALT adaptations:
+  - Uses 16x16 patches and no patch merging so the student keeps the same
+    14x14 = 196 dense token grid as the frozen MAE ViT-B/16 teacher.
+  - Projects every student patch token to 768 dimensions for dense SALT
+    distillation against the ViT teacher.
+  - Replaces BatchNorm2d/ReLU with GroupNorm/GELU in convolution blocks to
+    avoid client-specific running-stat drift in federated training.
+  - The original paper classifier is replaced downstream by SALT pretraining,
+    linear probing, and federated attention-pooling fine-tuning heads.
 """
 
 import math

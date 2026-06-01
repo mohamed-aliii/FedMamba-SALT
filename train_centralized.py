@@ -291,9 +291,9 @@ def build_models(args: argparse.Namespace):
         )
     teacher = FrozenViTTeacher(ckpt_path=args.teacher_ckpt).to(args.device)
 
-    # Student: Inception-Mamba encoder (scaled up for capacity)
-    # Original: embed_dim=256, depth=4 -> 10M params (256->768 bottleneck)
-    # Scaled:   embed_dim=384, depth=6 -> ~32M params (use batch_size=256)
+    # Student: paper-aligned InceptionMamba block, adapted for SALT.
+    # We use 16x16 patches and no patch merging to preserve the 196-token
+    # ViT-B/16 grid, then project each token to the teacher's 768-dim space.
     student = InceptionMambaEncoder(
         patch_size=16, embed_dim=448, depth=6, out_dim=768,
     ).to(args.device)

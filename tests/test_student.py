@@ -4,12 +4,13 @@ tests/test_student.py -- Smoke tests for the Inception-Mamba student encoder.
 Three checks:
   1. Output shape is (B, 768) for a batch of random inputs
   2. Gradients flow through every trainable parameter
-  3. Total parameter count is in a sane range (10M -- 100M)
+  3. Total parameter count matches the FedMamba-SALT paper config
 
 Run from the project root:
     python -m tests.test_student
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -21,9 +22,12 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.inception_mamba import InceptionMambaEncoder, MAMBA_AVAILABLE
 
-BATCH = 2  # keep small -- the model is memory-hungry
+BATCH = int(os.environ.get("FEDMAMBA_SMOKE_BATCH", "1"))
 IMG_SHAPE = (3, 224, 224)
 OUT_DIM = 768
+PATCH_SIZE = 16
+EMBED_DIM = 448
+DEPTH = 6
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -35,11 +39,21 @@ def _count_trainable(model: torch.nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
+def _build_encoder() -> InceptionMambaEncoder:
+    """Build the same encoder configuration used by training and the notebook."""
+    return InceptionMambaEncoder(
+        patch_size=PATCH_SIZE,
+        embed_dim=EMBED_DIM,
+        depth=DEPTH,
+        out_dim=OUT_DIM,
+    ).to(DEVICE)
+
+
 # =====================================================================
 #  Test 1 -- Output shape
 # =====================================================================
 def test_output_shape() -> bool:
-    encoder = InceptionMambaEncoder(patch_size=16, embed_dim=256, depth=4, out_dim=OUT_DIM).to(DEVICE)
+    encoder = _build_encoder()
     x = torch.randn(BATCH, *IMG_SHAPE, device=DEVICE)
     out = encoder(x)
 
@@ -55,7 +69,7 @@ def test_output_shape() -> bool:
 # =====================================================================
 def test_gradient_flow() -> bool:
     """After output.sum().backward(), every trainable param must have a gradient."""
-    encoder = InceptionMambaEncoder(patch_size=16, embed_dim=256, depth=4, out_dim=OUT_DIM).to(DEVICE)
+    encoder = _build_encoder()
     x = torch.randn(BATCH, *IMG_SHAPE, device=DEVICE)
     out = encoder(x, mask_ratio=0.5)
     out.sum().backward()
@@ -82,20 +96,20 @@ def test_gradient_flow() -> bool:
 #  Test 3 -- Parameter count
 # =====================================================================
 def test_param_count() -> bool:
-    encoder = InceptionMambaEncoder(patch_size=16, embed_dim=256, depth=4, out_dim=OUT_DIM).to(DEVICE)
+    encoder = _build_encoder()
     total = _count_params(encoder)
     trainable = _count_trainable(encoder)
     total_m = total / 1e6
     trainable_m = trainable / 1e6
 
-    # Real mamba-ssm should land in the advertised 8M--100M range for this
-    # smoke-test configuration. The fallback mock intentionally has fewer
-    # parameters and is used only to validate shapes/gradients in CPU-only CI.
-    lo = 8.0 if MAMBA_AVAILABLE else 2.0
-    passed = lo <= total_m <= 100.0
+    # Encoder-only count for embed_dim=448/depth=6 is about 10.1M with the
+    # local mock and about 10.9M with real mamba-ssm. The SALT projection head
+    # is tested separately with the loss objective and is not counted here.
+    lo, hi = 9.5, 12.0
+    passed = lo <= total_m <= hi
     tag = "PASS" if passed else "FAIL"
     print(f"  [{tag}] Test 3 -- Parameter count: {total_m:.2f}M total, "
-          f"{trainable_m:.2f}M trainable  (expected {lo:.0f}--100M)")
+          f"{trainable_m:.2f}M trainable  (expected {lo:.1f}--{hi:.1f}M)")
     if not MAMBA_AVAILABLE:
         print(f"          NOTE: using mock Mamba -- count will differ from real mamba-ssm")
     return passed

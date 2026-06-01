@@ -196,9 +196,9 @@ def build_models(args):
         )
     teacher = FrozenViTTeacher(ckpt_path=args.teacher_ckpt).to(args.device)
 
-    # FIX BUG 3: embed_dim corrected from 448 to 384 to match train_centralized.py.
-    # Mismatched embed_dim makes centralized and federated checkpoints incompatible
-    # and prevents meaningful comparison between the two training regimes.
+    # InceptionMamba block from Huang et al. is kept, while the outer scaffold
+    # is adapted for SALT: 16x16 patches, no patch merging, 196 dense tokens,
+    # and a 768-dim output to match the frozen MAE ViT-B/16 teacher.
     student = InceptionMambaEncoder(
         patch_size=16, embed_dim=448, depth=6, out_dim=768,
     ).to(args.device)
