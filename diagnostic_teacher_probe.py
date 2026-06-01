@@ -246,7 +246,17 @@ def main():
         state_dict = ckpt.get("student_state_dict", ckpt)
         
         # --- Infer architecture from checkpoint ---
-        embed_dim = state_dict["patch_embed.proj.0.weight"].shape[0]
+        if "patch_embed.proj.weight" in state_dict:
+            proj_key = "patch_embed.proj.weight"
+        elif "patch_embed.proj.0.weight" in state_dict:
+            proj_key = "patch_embed.proj.0.weight"
+        else:
+            pe_keys = [k for k in state_dict if "patch_embed" in k]
+            raise KeyError(
+                f"Cannot find patch_embed.proj weight in checkpoint. "
+                f"Available patch_embed keys: {pe_keys[:10]}"
+            )
+        embed_dim = state_dict[proj_key].shape[0]
         block_indices = set()
         for key in state_dict:
             if key.startswith("blocks."):

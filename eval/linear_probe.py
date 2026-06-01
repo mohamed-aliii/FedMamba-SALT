@@ -332,11 +332,16 @@ def load_encoder(ckpt_path: str, device: str, freeze: bool) -> InceptionMambaEnc
     # embed_dim: shape of patch_embed.proj.weight is (embed_dim, 3, 16, 16).
     # Older checkpoints may have used a Sequential wrapper and stored
     # patch_embed.proj.0.weight instead.
-    proj_key = (
-        "patch_embed.proj.weight"
-        if "patch_embed.proj.weight" in state_dict
-        else "patch_embed.proj.0.weight"
-    )
+    if "patch_embed.proj.weight" in state_dict:
+        proj_key = "patch_embed.proj.weight"
+    elif "patch_embed.proj.0.weight" in state_dict:
+        proj_key = "patch_embed.proj.0.weight"
+    else:
+        pe_keys = [k for k in state_dict if "patch_embed" in k]
+        raise KeyError(
+            f"Cannot find patch_embed.proj weight in checkpoint. "
+            f"Available patch_embed keys: {pe_keys[:10]}"
+        )
     embed_dim = state_dict[proj_key].shape[0]
 
     # depth: count unique block indices (blocks.0.*, blocks.1.*, ...)
