@@ -1021,17 +1021,26 @@ def main() -> None:
         # Layer-Wise Learning Rate Decay (LLRD) for encoder
         if any(p.requires_grad for p in enc.parameters()):
             # Count number of blocks to set decay factor
-            depth = max([int(n.split('.')[1]) for n, p in enc.named_parameters() if 'blocks.' in n and p.requires_grad] + [0]) + 1
+            # Use split('blocks.')[1] to handle prefixes like 'encoder.blocks.0.weight'
+            depth = max([int(n.split('blocks.')[1].split('.')[0]) for n, p in enc.named_parameters() if 'blocks.' in n and p.requires_grad] + [0]) + 1
             llrd_decay = 0.75
             
             groups = {}
             for name, param in enc.named_parameters():
                 if not param.requires_grad:
                     continue
-                if name.startswith('patch_embed'):
+                
+                # Strip wrapper prefixes
+                norm_name = name
+                if norm_name.startswith('encoder.'):
+                    norm_name = norm_name[len('encoder.'):]
+                elif norm_name.startswith('base_encoder.'):
+                    norm_name = norm_name[len('base_encoder.'):]
+
+                if norm_name.startswith('patch_embed'):
                     layer_id = 0
-                elif name.startswith('blocks.'):
-                    layer_id = int(name.split('.')[1]) + 1
+                elif norm_name.startswith('blocks.'):
+                    layer_id = int(norm_name.split('.')[1]) + 1
                 else:
                     layer_id = depth + 1
                 
