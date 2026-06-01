@@ -66,7 +66,7 @@ from utils.fedavg import (
 # Constants
 # ======================================================================
 METRICS_FILENAME = "federated_metrics.csv"
-LOSS_PATIENCE = 35       # increased: warm-up phase can look flat for ~20 rounds
+LOSS_PATIENCE = 200     # increased heavily: curriculum masking forces loss spikes every 50 rounds
 LOSS_MIN_DELTA = 1e-4    # raised: 1e-5 was too tight, noise triggered false plateaus
 
 
