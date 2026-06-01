@@ -22,8 +22,12 @@ from typing import Callable, Optional, Tuple
 
 import numpy as np
 from PIL import Image
-from skimage.transform import resize as sk_resize
 from torch.utils.data import Dataset
+
+try:
+    from skimage.transform import resize as sk_resize
+except ImportError:  # pragma: no cover - exercised in minimal test envs
+    sk_resize = None
 
 
 # ======================================================================
@@ -31,6 +35,24 @@ from torch.utils.data import Dataset
 # ======================================================================
 RETINA_MEAN = (0.5007, 0.5010, 0.5019)
 RETINA_STD = (0.0342, 0.0535, 0.0484)
+
+
+def _array_to_uint8(img: np.ndarray) -> np.ndarray:
+    """Convert a grayscale/RGB numpy image to uint8 without changing scale twice."""
+    if img.max() <= 1.0:
+        return (img * 255).clip(0, 255).astype(np.uint8)
+    return img.clip(0, 255).astype(np.uint8)
+
+
+def _resize_array(img: np.ndarray, size: int) -> np.ndarray:
+    """Resize an ndarray image; use skimage when available, PIL as fallback."""
+    if sk_resize is not None:
+        return sk_resize(img, (size, size), preserve_range=True)
+
+    img_uint8 = _array_to_uint8(img)
+    pil_img = Image.fromarray(img_uint8)
+    pil_img = pil_img.resize((size, size), resample=Image.BILINEAR)
+    return np.asarray(pil_img)
 
 
 class RetinaDataset(Dataset):
@@ -108,6 +130,7 @@ class RetinaDataset(Dataset):
             self.labels[f] for f in self.img_paths if f in self.labels
         ))
         self.num_classes = len(self.class_set)
+        self.targets = [self.labels.get(f, 0) for f in self.img_paths]
 
         print(f"[RetinaDataset] {phase}: {len(self.img_paths)} images, "
               f"{self.num_classes} classes, split={split_type}/{split_csv}")
@@ -125,7 +148,7 @@ class RetinaDataset(Dataset):
             try:
                 # Load .npy and resize
                 img = np.load(path)
-                img = sk_resize(img, (self.resize_to, self.resize_to))
+                img = _resize_array(img, self.resize_to)
             except (ValueError, Exception) as e:
                 warnings.warn(
                     f"[RetinaDataset] Corrupt file skipped: {fname} ({e})",
@@ -142,10 +165,7 @@ class RetinaDataset(Dataset):
             # Convert to PIL intelligently based on the mathematical data bounds
             # skimage.resize outputs float type. If original array natively spanned
             # 0.0 - 255.0, multiplying by 255 corrupts it into pure white noise.
-            if img.max() <= 1.0:
-                img_uint8 = (img * 255).clip(0, 255).astype(np.uint8)
-            else:
-                img_uint8 = img.clip(0, 255).astype(np.uint8)
+            img_uint8 = _array_to_uint8(img)
                 
             pil_img = Image.fromarray(img_uint8)
 

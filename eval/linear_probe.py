@@ -329,8 +329,15 @@ def load_encoder(ckpt_path: str, device: str, freeze: bool) -> InceptionMambaEnc
         state_dict = ckpt.get("student_state_dict", ckpt)
 
     # --- Infer architecture from checkpoint ---
-    # embed_dim: shape of patch_embed.proj.0.weight is (embed_dim, 3, 16, 16)
-    embed_dim = state_dict["patch_embed.proj.0.weight"].shape[0]
+    # embed_dim: shape of patch_embed.proj.weight is (embed_dim, 3, 16, 16).
+    # Older checkpoints may have used a Sequential wrapper and stored
+    # patch_embed.proj.0.weight instead.
+    proj_key = (
+        "patch_embed.proj.weight"
+        if "patch_embed.proj.weight" in state_dict
+        else "patch_embed.proj.0.weight"
+    )
+    embed_dim = state_dict[proj_key].shape[0]
 
     # depth: count unique block indices (blocks.0.*, blocks.1.*, ...)
     block_indices = set()

@@ -13,14 +13,13 @@ Run from the project root:
     python -m tests.test_augmentations
 """
 
-import os
 import sys
-import tempfile
 from pathlib import Path
 
 import numpy as np
 import torch
 from PIL import Image
+from torch.utils.data import Dataset
 
 # Ensure project root is on sys.path when run as a script
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -42,14 +41,20 @@ OUTPUT_DIR = PROJECT_ROOT / "tests"
 SAMPLE_PATH = OUTPUT_DIR / "aug_sample.png"
 
 
-def _create_test_images(directory: str, n: int = 5, size: int = 256) -> None:
-    """Create ``n`` random RGB images inside ``directory/class0/``."""
-    class_dir = os.path.join(directory, "class0")
-    os.makedirs(class_dir, exist_ok=True)
-    for i in range(n):
-        arr = np.random.randint(0, 256, (size, size, 3), dtype=np.uint8)
-        img = Image.fromarray(arr, mode="RGB")
-        img.save(os.path.join(class_dir, f"img_{i:03d}.png"))
+class SyntheticImageDataset(Dataset):
+    """Tiny in-memory RGB image dataset for augmentation smoke tests."""
+
+    def __init__(self, n: int = 5, size: int = 256):
+        self.images = []
+        for _ in range(n):
+            arr = np.random.randint(0, 256, (size, size, 3), dtype=np.uint8)
+            self.images.append(Image.fromarray(arr, mode="RGB"))
+
+    def __len__(self) -> int:
+        return len(self.images)
+
+    def __getitem__(self, index: int):
+        return self.images[index], 0
 
 
 def _denormalize(tensor: torch.Tensor) -> np.ndarray:
@@ -71,7 +76,7 @@ def test_output_shape(teacher_view: torch.Tensor, student_view: torch.Tensor) ->
     s_ok = student_view.shape == torch.Size(expected)
     passed = t_ok and s_ok
     tag = "PASS" if passed else "FAIL"
-    print(f"  [{tag}] Test 1 — Shape: teacher={tuple(teacher_view.shape)}, "
+    print(f"  [{tag}] Test 1 -- Shape: teacher={tuple(teacher_view.shape)}, "
           f"student={tuple(student_view.shape)}  (expected {expected})")
     return passed
 
@@ -81,7 +86,7 @@ def test_views_differ(teacher_view: torch.Tensor, student_view: torch.Tensor) ->
     passed = not torch.equal(teacher_view, student_view)
     tag = "PASS" if passed else "FAIL"
     max_diff = (teacher_view - student_view).abs().max().item()
-    print(f"  [{tag}] Test 2 — Views differ (max |diff| = {max_diff:.4f})")
+    print(f"  [{tag}] Test 2 -- Views differ (max |diff| = {max_diff:.4f})")
     return passed
 
 
@@ -92,7 +97,7 @@ def test_pixel_range(teacher_view: torch.Tensor, student_view: torch.Tensor) -> 
     s_ok = student_view.min().item() >= lo and student_view.max().item() <= hi
     passed = t_ok and s_ok
     tag = "PASS" if passed else "FAIL"
-    print(f"  [{tag}] Test 3 — Pixel range: teacher=[{teacher_view.min():.2f}, "
+    print(f"  [{tag}] Test 3 -- Pixel range: teacher=[{teacher_view.min():.2f}, "
           f"{teacher_view.max():.2f}], student=[{student_view.min():.2f}, "
           f"{student_view.max():.2f}]  (expected within [{lo}, {hi}])")
     return passed
@@ -117,7 +122,7 @@ def test_save_visual(teacher_view: torch.Tensor, student_view: torch.Tensor) -> 
         axes[1].axis("off")
 
         fig.suptitle(
-            "Asymmetric Augmentation — Same source image",
+            "Asymmetric Augmentation -- Same source image",
             fontsize=14,
             fontweight="bold",
         )
@@ -127,9 +132,9 @@ def test_save_visual(teacher_view: torch.Tensor, student_view: torch.Tensor) -> 
 
         passed = SAMPLE_PATH.exists()
         tag = "PASS" if passed else "FAIL"
-        print(f"  [{tag}] Test 4 — Saved visual to {SAMPLE_PATH}")
+        print(f"  [{tag}] Test 4 -- Saved visual to {SAMPLE_PATH}")
     except ImportError:
-        print("  [SKIP] Test 4 — matplotlib not installed, cannot save visual")
+        print("  [SKIP] Test 4 -- matplotlib not installed, cannot save visual")
         passed = True  # non-fatal
     return passed
 
@@ -139,40 +144,32 @@ def test_save_visual(teacher_view: torch.Tensor, student_view: torch.Tensor) -> 
 # =====================================================================
 def main() -> None:
     print("=" * 62)
-    print("  Dual Augmentation Pipeline — Smoke Tests")
+    print("  Dual Augmentation Pipeline -- Smoke Tests")
     print("=" * 62)
 
-    # Create a temporary image folder
-    with tempfile.TemporaryDirectory() as tmpdir:
-        _create_test_images(tmpdir, n=5, size=256)
+    base_ds = SyntheticImageDataset(n=5, size=256)
+    dual_ds = DualViewDataset(base_ds)
 
-        # Use torchvision ImageFolder as the base dataset
-        from torchvision.datasets import ImageFolder
+    print(f"\n  Dataset length: {len(dual_ds)}")
+    print(f"  Teacher transform:\n    {dual_ds.teacher_transform}")
+    print(f"  Student transform:\n    {dual_ds.student_transform}\n")
 
-        base_ds = ImageFolder(root=tmpdir)
-        dual_ds = DualViewDataset(base_ds)
+    teacher_view, student_view = dual_ds[0]
 
-        print(f"\n  Dataset length: {len(dual_ds)}")
-        print(f"  Teacher transform:\n    {dual_ds.teacher_transform}")
-        print(f"  Student transform:\n    {dual_ds.student_transform}\n")
-
-        # Fetch one sample
-        teacher_view, student_view = dual_ds[0]
-
-        results = [
-            test_output_shape(teacher_view, student_view),
-            test_views_differ(teacher_view, student_view),
-            test_pixel_range(teacher_view, student_view),
-            test_save_visual(teacher_view, student_view),
-        ]
+    results = [
+        test_output_shape(teacher_view, student_view),
+        test_views_differ(teacher_view, student_view),
+        test_pixel_range(teacher_view, student_view),
+        test_save_visual(teacher_view, student_view),
+    ]
 
     print("=" * 62)
     n_passed = sum(results)
     print(f"  Result: {n_passed}/4 tests passed")
     if n_passed == 4:
-        print("  ✓ All tests PASSED — augmentation pipelines are ready.")
+        print("  [OK] All tests PASSED -- augmentation pipelines are ready.")
     else:
-        print("  ✗ SOME TESTS FAILED — review before proceeding.")
+        print("  [!!] SOME TESTS FAILED -- review before proceeding.")
     print("=" * 62)
 
     sys.exit(0 if n_passed == 4 else 1)

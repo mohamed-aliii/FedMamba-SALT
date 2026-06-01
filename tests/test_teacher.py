@@ -119,7 +119,7 @@ def test_not_collapsed() -> bool:
 
     passed = not torch.equal(out1, out2)
     tag = "PASS" if passed else "FAIL"
-    print(f"  [{tag}] Test 4 — Non-collapsed (different inputs → different outputs)")
+    print(f"  [{tag}] Test 4 -- Non-collapsed (different inputs -> different outputs)")
     return passed
 
 
@@ -142,9 +142,9 @@ if __name__ == "__main__":
     n_passed = sum(results)
     print(f"  Result: {n_passed}/4 tests passed")
     if n_passed == 4:
-        print("  ✓ All tests PASSED — ready for Phase 2.")
+        print("  [OK] All tests PASSED -- ready for Phase 2.")
     else:
-        print("  ✗ SOME TESTS FAILED — review before proceeding.")
+        print("  [!!] SOME TESTS FAILED -- review before proceeding.")
     print("=" * 60)
 
     sys.exit(0 if n_passed == 4 else 1)
