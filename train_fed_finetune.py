@@ -156,9 +156,9 @@ ACC_MIN_DELTA    = 0.05    # minimum improvement (%) to reset patience counter
 
 # Round-level LR schedule shared constants
 LR_WARMUP_ROUNDS  = 5      # linear warmup length (rounds)
-LR_FLAT_RATIO     = 0.30   # FedAvg flat-phase fraction of max_rounds
-LR_FLAT_RATIO_FED = 0.15   # FedProx flat-phase fraction (shorter → more cosine budget)
-                           # FIX-2 (completed): was incorrectly 0.30, same as FedAvg.
+LR_FLAT_RATIO     = 0.40   # FedAvg flat-phase fraction of max_rounds
+LR_FLAT_RATIO_FED = 0.50   # FedProx flat-phase fraction 
+                           # Increased from 0.15 to 0.40 to avoid early starvation
 LR_ETA_MIN_RATIO  = 0.10   # cosine floor = base_lr * this
 
 
@@ -895,9 +895,8 @@ def compute_round_lr(comm_round: int, max_rounds: int, base_lr: float,
       Phase 2 — Flat   (WARMUP → FLAT_ROUNDS):    lr               (constant)
       Phase 3 — Cosine (FLAT_ROUNDS → max_rounds): lr → eta_min
 
-    FIX-2: FedProx (mu > 0) uses LR_FLAT_RATIO_FED (15%) instead of
-    LR_FLAT_RATIO (30%) so the cosine decay phase is longer, compensating
-    for the extra regularisation from the proximal term.
+    FIX-2: FedProx (mu > 0) previously used a shorter flat phase, but we 
+    now use 40% uniformly to allow the model to learn before decaying.
     """
     # FIX-2: choose flat-phase ratio based on whether FedProx is active
     flat_ratio  = LR_FLAT_RATIO_FED if mu > 0 else LR_FLAT_RATIO
