@@ -156,7 +156,7 @@ ACC_MIN_DELTA    = 0.05    # minimum improvement (%) to reset patience counter
 
 # Round-level LR schedule shared constants
 LR_WARMUP_ROUNDS  = 5      # linear warmup length (rounds)
-LR_FLAT_RATIO     = 0.40   # FedAvg flat-phase fraction of max_rounds
+LR_FLAT_RATIO     = 0.50   # FedAvg flat-phase fraction of max_rounds
 LR_FLAT_RATIO_FED = 0.50   # FedProx flat-phase fraction 
                            # Increased from 0.15 to 0.40 to avoid early starvation
 LR_ETA_MIN_RATIO  = 0.10   # cosine floor = base_lr * this
@@ -1015,24 +1015,52 @@ def main() -> None:
     # update can identify groups by name instead of by weight_decay value (which
     # is fragile if both groups ever share the same decay setting).
     def _make_optimizer(enc, cls):
-        enc_params = [p for p in enc.parameters() if p.requires_grad]
         cls_params = [p for p in cls.parameters() if p.requires_grad]
-        # Separate LR groups: encoder gets lr/10 to protect pre-trained features
-        # (matches centralized baseline).  Classifier gets full lr.
-        # Linear probe: encoder has requires_grad=False so enc_params is empty.
         param_groups = []
-        if enc_params:
-            param_groups.append({
-                "params":       enc_params,
-                "lr":           args.lr / 10.0,
-                "weight_decay": 0.03,
-                "group_name":   "encoder",
-            })
+        
+        # Layer-Wise Learning Rate Decay (LLRD) for encoder
+        if any(p.requires_grad for p in enc.parameters()):
+            # Count number of blocks to set decay factor
+            depth = max([int(n.split('.')[1]) for n, p in enc.named_parameters() if 'blocks.' in n and p.requires_grad] + [0]) + 1
+            llrd_decay = 0.75
+            
+            groups = {}
+            for name, param in enc.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if name.startswith('patch_embed'):
+                    layer_id = 0
+                elif name.startswith('blocks.'):
+                    layer_id = int(name.split('.')[1]) + 1
+                else:
+                    layer_id = depth + 1
+                
+                if layer_id not in groups:
+                    groups[layer_id] = []
+                groups[layer_id].append(param)
+            
+            # Base encoder LR (for top layer) is args.lr / 5.0 
+            base_enc_lr = args.lr / 5.0
+            
+            for layer_id in sorted(groups.keys()):
+                # layer depth+1 gets scale=1.0
+                scale = llrd_decay ** ((depth + 1) - layer_id)
+                param_groups.append({
+                    "params": groups[layer_id],
+                    "lr": base_enc_lr * scale,
+                    "weight_decay": 0.03,
+                    "group_name": f"encoder_l{layer_id}",
+                    "is_encoder": True,
+                    "scale": scale,
+                })
+
         param_groups.append({
             "params":       cls_params,
             "lr":           args.lr,
             "weight_decay": 0.05,
             "group_name":   "classifier",
+            "is_encoder":   False,
+            "scale":        1.0,
         })
         return AdamW(param_groups, betas=(0.9, 0.999))
 
@@ -1215,9 +1243,9 @@ def main() -> None:
         if PROBE_ROUNDS > 0 and comm_round < POST_PROBE_RAMP:
             # Bypass the double-warmup by scaling directly off the target base
             post_probe_scale = comm_round / max(POST_PROBE_RAMP - 1, 1)
-            enc_lr = (args.lr / 10.0) * post_probe_scale
+            enc_lr = (args.lr / 5.0) * post_probe_scale
         else:
-            enc_lr = (current_lr / 10.0)
+            enc_lr = (current_lr / 5.0)
 
         # ---- Snapshot global params (needed for FedProx and SCAFFOLD) ----
         global_params = None
@@ -1237,8 +1265,8 @@ def main() -> None:
 
             # Update round-level LR in-place via group_name tag.
             for pg in opt.param_groups:
-                if pg.get("group_name") == "encoder":
-                    pg["lr"] = enc_lr
+                if pg.get("is_encoder", False):
+                    pg["lr"] = enc_lr * pg.get("scale", 1.0)
                 else:  # "classifier"
                     pg["lr"] = cls_lr
 

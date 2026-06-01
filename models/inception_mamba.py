@@ -144,15 +144,18 @@ class InceptionBranch(nn.Module):
 
 
 class ChannelAttention(nn.Module):
-    """Global Channel Attention to filter multi-scale Inception features."""
+    """Dual-Pool Channel Attention to filter multi-scale Inception features."""
     def __init__(self, channels: int):
         super().__init__()
-        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
         self.conv = nn.Conv2d(channels, channels, kernel_size=1)
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        return x * self.sigmoid(self.conv(self.pool(x)))
+        avg_out = self.conv(self.avg_pool(x))
+        max_out = self.conv(self.max_pool(x))
+        return x * self.sigmoid(avg_out + max_out)
 
 
 # ======================================================================
