@@ -42,22 +42,20 @@ from utils.ckpt_compat import safe_torch_load
 def get_tta_augmentations(n_tta: int):
     """
     Returns a list of tensor→tensor augmentation functions.
-    Input tensors are already normalized [C, H, W].
-    n_tta controls how many augmentations to use (4 or 8).
+    Uses Deterministic Rotational TTA to preserve retinal features.
+    Max 4 passes: Original, 90°, 180°, 270°.
     """
     augs = [
         lambda x: x,                                      # 1. original
-        lambda x: torch.flip(x, dims=[2]),                # 2. horizontal flip
-        lambda x: torch.rot90(x, k=1, dims=[1, 2]),       # 3. 90°
-        lambda x: torch.rot90(x, k=2, dims=[1, 2]),       # 4. 180°
+        lambda x: torch.rot90(x, k=1, dims=[1, 2]),       # 2. 90°
+        lambda x: torch.rot90(x, k=2, dims=[1, 2]),       # 3. 180°
+        lambda x: torch.rot90(x, k=3, dims=[1, 2]),       # 4. 270°
     ]
-    if n_tta >= 8:
-        augs += [
-            lambda x: torch.flip(x, dims=[1]),            # 5. vertical flip
-            lambda x: torch.rot90(x, k=3, dims=[1, 2]),   # 6. 270°
-            lambda x: torch.clamp(x * 1.1, -3.0, 3.0),   # 7. brighter
-            lambda x: torch.clamp(x * 0.9, -3.0, 3.0),   # 8. darker
-        ]
+    
+    if n_tta > 4:
+        print(f"  [TTA] Warning: n_tta={n_tta} requested, but Rotational TTA only supports 4 passes. Clamping to 4.")
+        n_tta = 4
+        
     return augs[:n_tta]
 
 
