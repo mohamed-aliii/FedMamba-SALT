@@ -253,6 +253,16 @@ def parse_args() -> argparse.Namespace:
     args = p.parse_args()
     if args.data_path is None:
         p.error("--data_path is required (via CLI or YAML config)")
+
+    if args.use_mixup and args.use_focal_loss:
+        raise ValueError(
+            "Mathematical Conflict: Mixup generates soft interpolated targets, "
+            "while Focal Loss scales gradients assuming discrete, one-hot targets. "
+            "Using both simultaneously causes the minority Mixup component to receive "
+            "disproportionate focal amplification, destroying gradient stability. "
+            "Please enable only one."
+        )
+
     return args
 
 
