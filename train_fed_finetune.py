@@ -961,14 +961,56 @@ def main() -> None:
     # ------------------------------------------------------------------
     print("[1/4] Building data loaders...")
     train_transform = (
-        get_train_transform(dataset="retina") if not freeze_encoder
-        else get_eval_transform(dataset="retina")   # no augmentation for frozen encoder
+        get_train_transform(dataset=args.dataset) if not freeze_encoder  # CHANGE 1: Use args.dataset instead of hardcoded 'retina'
+        else get_eval_transform(dataset=args.dataset)   # CHANGE 1: Use args.dataset
     )
-    eval_transform = get_eval_transform(dataset="retina")
+    eval_transform = get_eval_transform(dataset=args.dataset)  # CHANGE 1: Use args.dataset
 
     client_loaders, dataset_sizes = build_client_dataloaders(args, train_transform)
     client_weights = compute_client_weights(dataset_sizes)
     print(f"  Client weights: {[f'{w:.3f}' for w in client_weights]}")
+
+    # CHANGE 1: Compute cls_weights that zeroes out mono-class clients for classifier aggregation
+    client_n_classes = []
+    cls_weights = []
+    excluded_clients = []
+    
+    for i, loader in enumerate(client_loaders):
+        ds = loader.dataset
+        if hasattr(ds, "targets"):
+            targets = ds.targets
+        elif hasattr(ds, "dataset") and hasattr(ds.dataset, "targets"):
+            targets = [ds.dataset.targets[idx] for idx in ds.indices]
+        else:
+            raw_ds = ds.dataset if hasattr(ds, "dataset") else ds
+            indices = list(ds.indices) if hasattr(ds, "indices") else range(len(raw_ds))
+            if hasattr(raw_ds, "targets"):
+                targets = [raw_ds.targets[idx] for idx in indices]
+            else:
+                targets = []
+                for _, lbl in loader:
+                    targets.extend(lbl.tolist())
+        
+        n_classes = len(set(targets))
+        client_n_classes.append(n_classes)
+        
+        if n_classes < 2:
+            cls_weights.append(0.0)
+            excluded_clients.append((i+1, client_weights[i]))
+        else:
+            cls_weights.append(client_weights[i])
+            
+    sum_cls = sum(cls_weights)
+    if sum_cls > 0:
+        cls_weights = [w / sum_cls for w in cls_weights]
+        if excluded_clients:
+            print(f"  [Classifier] Excluded {len(excluded_clients)} mono-class clients from aggregation:")
+            for cid, w in excluded_clients:
+                print(f"    - Client {cid} (original weight {w:.3f})")
+    else:
+        print("  WARNING: All clients have < 2 classes. Falling back to client_weights for classifier.")
+        cls_weights = list(client_weights)
+    print(f"  Class counts per client: {client_n_classes}")
 
     # FIX-12: compute balanced class weights from the actual federated label
     # distribution so build_criterion doesn't rely on the hardcoded [1.0, 2.0].
@@ -1032,7 +1074,7 @@ def main() -> None:
             # Count number of blocks to set decay factor
             # Use split('blocks.')[1] to handle prefixes like 'encoder.blocks.0.weight'
             depth = max([int(n.split('blocks.')[1].split('.')[0]) for n, p in enc.named_parameters() if 'blocks.' in n and p.requires_grad] + [0]) + 1
-            llrd_decay = 0.75
+            llrd_decay = 0.9  # CHANGE 2: Increased from 0.75 to 0.85 so early layers don't vanish
             
             groups = {}
             for name, param in enc.named_parameters():
@@ -1057,8 +1099,8 @@ def main() -> None:
                     groups[layer_id] = []
                 groups[layer_id].append(param)
             
-            # Base encoder LR (for top layer) is args.lr / 20.0 (prevents feature destruction) 
-            base_enc_lr = args.lr / 20.0
+            # Base encoder LR (for top layer) is args.lr / 5.0 (prevents feature destruction) 
+            base_enc_lr = args.lr / 5.0  # CHANGE 1: Increased from 20.0 to 5.0 to allow meaningful adaptation
             
             for layer_id in sorted(groups.keys()):
                 # layer depth+1 gets scale=1.0
@@ -1176,7 +1218,7 @@ def main() -> None:
                 probe_losses.append(loss)
                 probe_accs.append(tacc)
 
-            average_models(global_classifier, client_classifiers, client_weights)
+            average_models(global_classifier, client_classifiers, cls_weights)  # CHANGE 3: Use cls_weights in warm-start probe
             broadcast_global_to_clients(global_classifier, client_classifiers)
 
             avg_probe_acc = sum(
@@ -1260,10 +1302,10 @@ def main() -> None:
         # FIX-14: post-probe encoder damping
         if PROBE_ROUNDS > 0 and comm_round < POST_PROBE_RAMP:
             # Bypass the double-warmup by scaling directly off the target base
-            post_probe_scale = comm_round / max(POST_PROBE_RAMP - 1, 1)
-            enc_lr = (args.lr / 20.0) * post_probe_scale
+            post_probe_scale = 0.1 + 0.9 * (comm_round / max(POST_PROBE_RAMP - 1, 1))  # CHANGE 3: Starts at 10% instead of 0%
+            enc_lr = (args.lr / 5.0) * post_probe_scale  # CHANGE 1: Match _make_optimizer ratio (5.0)
         else:
-            enc_lr = (current_lr / 20.0)
+            enc_lr = (current_lr / 5.0)  # CHANGE 1: Match _make_optimizer ratio (5.0)
 
         # ---- Snapshot global params (needed for FedProx and SCAFFOLD) ----
         global_params = None
@@ -1323,7 +1365,7 @@ def main() -> None:
         # ---- Model aggregation ----
         average_models(global_encoder,    client_encoders,    client_weights,
                        server_momentum=server_momentum_enc)
-        average_models(global_classifier, client_classifiers, client_weights,
+        average_models(global_classifier, client_classifiers, cls_weights,  # CHANGE 2: Use cls_weights to ignore mono-class clients
                        server_momentum=server_momentum_cls)
 
         # ---- Broadcast back ----
