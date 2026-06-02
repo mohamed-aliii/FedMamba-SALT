@@ -136,3 +136,86 @@ def compute_client_weights(client_dataset_sizes: List[int]) -> List[float]:
     """
     total = sum(client_dataset_sizes)
     return [s / total for s in client_dataset_sizes]
+
+
+def average_classifier_class_wise(
+    global_classifier: nn.Module,
+    client_classifiers: List[nn.Module],
+    client_class_counts: List[Dict[int, int]],
+    cls_weights: List[float],
+    server_momentum: Optional[Dict[str, torch.Tensor]] = None,
+    beta: float = 0.9,
+) -> None:
+    """
+    Class-wise aggregation for the final classification layer to prevent 
+    catastrophic drift from mono-class clients.
+    Non-head layers are aggregated using cls_weights (sanitized) to prevent attention collapse.
+    """
+    global_state = global_classifier.state_dict()
+    n_clients = len(client_classifiers)
+    
+    # 1. Identify the final linear layer keys
+    final_weight_key = None
+    final_bias_key = None
+    for key in reversed(list(global_state.keys())):
+        if key.endswith('.weight') and global_state[key].dim() == 2:
+            final_weight_key = key
+            bias_k = key.replace('.weight', '.bias')
+            if bias_k in global_state:
+                final_bias_key = bias_k
+            break
+            
+    if not final_weight_key:
+        raise ValueError("Could not identify final linear layer weight in classifier state_dict.")
+
+    n_classes = global_state[final_weight_key].shape[0]
+
+    # Calculate total global samples per class to find the denominator
+    total_samples_per_class = torch.zeros(n_classes)
+    for counts in client_class_counts:
+        for cls_idx, count in counts.items():
+            total_samples_per_class[cls_idx] += count
+            
+    # Compute averaged weights in a temporary dictionary
+    averaged_state = OrderedDict()
+    for key in global_state:
+        averaged_state[key] = torch.zeros_like(global_state[key], dtype=torch.float32)
+
+    for i in range(n_clients):
+        client_state = client_classifiers[i].state_dict()
+        w = cls_weights[i]
+        
+        for key in global_state:
+            if key == final_weight_key or key == final_bias_key:
+                # Handled below per-class
+                continue
+            if w > 0:
+                averaged_state[key] += w * client_state[key].float()
+            
+        # Aggregate head per-class
+        for cls_idx in range(n_classes):
+            client_class_qty = client_class_counts[i].get(cls_idx, 0)
+            if total_samples_per_class[cls_idx] > 0 and client_class_qty > 0:
+                weight_ratio = client_class_qty / total_samples_per_class[cls_idx]
+                
+                # Weight
+                averaged_state[final_weight_key][cls_idx] += client_state[final_weight_key][cls_idx].float() * weight_ratio
+                # Bias
+                if final_bias_key:
+                    averaged_state[final_bias_key][cls_idx] += client_state[final_bias_key][cls_idx].float() * weight_ratio
+
+    if server_momentum is not None:
+        # FedAvgM: Server-side momentum update
+        for key in global_state:
+            if global_state[key].is_floating_point():
+                delta = averaged_state[key] - global_state[key]
+                server_momentum[key] = beta * server_momentum[key] + delta
+                global_state[key] = global_state[key] + server_momentum[key]
+            else:
+                global_state[key] = averaged_state[key]
+    else:
+        # Standard FedAvg
+        for key in global_state:
+            global_state[key] = averaged_state[key]
+
+    global_classifier.load_state_dict(global_state)

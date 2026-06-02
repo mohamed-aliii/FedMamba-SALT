@@ -118,6 +118,7 @@ from train_centralized import load_yaml_config, get_gpu_memory_mb
 from utils.ckpt_compat import safe_torch_load
 from utils.fedavg import (
     average_models, broadcast_global_to_clients, compute_client_weights,
+    average_classifier_class_wise,
 )
 from utils.scaffold import (
     init_control_variates, apply_scaffold_correction,
@@ -970,10 +971,8 @@ def main() -> None:
     client_weights = compute_client_weights(dataset_sizes)
     print(f"  Client weights: {[f'{w:.3f}' for w in client_weights]}")
 
-    # CHANGE 1: Compute cls_weights that zeroes out mono-class clients for classifier aggregation
-    client_n_classes = []
-    cls_weights = []
-    excluded_clients = []
+    # CHANGE 1: Compute client_class_counts for class-wise classifier aggregation
+    client_class_counts = []
     
     for i, loader in enumerate(client_loaders):
         ds = loader.dataset
@@ -991,9 +990,18 @@ def main() -> None:
                 for _, lbl in loader:
                     targets.extend(lbl.tolist())
         
-        n_classes = len(set(targets))
-        client_n_classes.append(n_classes)
-        
+        counts = {}
+        for t in targets:
+            counts[int(t)] = counts.get(int(t), 0) + 1
+        client_class_counts.append(counts)
+        print(f"  Client {i+1} class counts: {counts}")
+
+    # Compute cls_weights that zeroes out mono-class clients to protect Attention/LayerNorm
+    client_n_classes = [len(counts) for counts in client_class_counts]
+    cls_weights = []
+    excluded_clients = []
+    
+    for i, n_classes in enumerate(client_n_classes):
         if n_classes < 2:
             cls_weights.append(0.0)
             excluded_clients.append((i+1, client_weights[i]))
@@ -1004,13 +1012,12 @@ def main() -> None:
     if sum_cls > 0:
         cls_weights = [w / sum_cls for w in cls_weights]
         if excluded_clients:
-            print(f"  [Classifier] Excluded {len(excluded_clients)} mono-class clients from aggregation:")
+            print(f"  [Classifier] Excluded {len(excluded_clients)} mono-class clients from non-head aggregation:")
             for cid, w in excluded_clients:
                 print(f"    - Client {cid} (original weight {w:.3f})")
     else:
         print("  WARNING: All clients have < 2 classes. Falling back to client_weights for classifier.")
         cls_weights = list(client_weights)
-    print(f"  Class counts per client: {client_n_classes}")
 
     # FIX-12: compute balanced class weights from the actual federated label
     # distribution so build_criterion doesn't rely on the hardcoded [1.0, 2.0].
@@ -1218,7 +1225,9 @@ def main() -> None:
                 probe_losses.append(loss)
                 probe_accs.append(tacc)
 
-            average_models(global_classifier, client_classifiers, cls_weights)  # CHANGE 3: Use cls_weights in warm-start probe
+            average_classifier_class_wise(
+                global_classifier, client_classifiers, client_class_counts, cls_weights
+            )  # CHANGE 3: Use class-wise aggregation for probe
             broadcast_global_to_clients(global_classifier, client_classifiers)
 
             avg_probe_acc = sum(
@@ -1365,8 +1374,10 @@ def main() -> None:
         # ---- Model aggregation ----
         average_models(global_encoder,    client_encoders,    client_weights,
                        server_momentum=server_momentum_enc)
-        average_models(global_classifier, client_classifiers, cls_weights,  # CHANGE 2: Use cls_weights to ignore mono-class clients
-                       server_momentum=server_momentum_cls)
+        average_classifier_class_wise(
+            global_classifier, client_classifiers, client_class_counts, cls_weights,
+            server_momentum=server_momentum_cls
+        )  # CHANGE 2: Use class-wise aggregation for the classifier head
 
         # ---- Broadcast back ----
         broadcast_global_to_clients(global_encoder,    client_encoders)
