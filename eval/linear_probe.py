@@ -61,7 +61,7 @@ IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
 # Fed-MAE baseline for context
-FEDMAE_BASELINE = 81.93  # % accuracy, centralized baseline, Retina
+FEDMAE_BASELINE = {"retina": 81.93, "covidfl": 91.47}
 
 # Early stopping for fine-tuning
 FINETUNE_PATIENCE = 30  # stop if val_acc doesn't improve for this many epochs
@@ -86,6 +86,8 @@ def parse_args() -> argparse.Namespace:
                    help="Dataset root (must contain train/ and test/ subdirs)")
     p.add_argument("--num_classes", type=int, required=True,
                    help="Number of classification classes")
+    p.add_argument("--dataset", type=str, default="retina",
+                   help="Dataset name (e.g. retina, covidfl) to control baseline and TTA behavior")
     p.add_argument("--output_dir", type=str, default="eval_results",
                    help="Directory for confusion matrix PNG and logs")
     p.add_argument("--epochs", type=int, default=50)
@@ -150,43 +152,64 @@ def get_train_transform(dataset: str = "retina") -> transforms.Compose:
     """
     mean = RETINA_MEAN if dataset == "retina" else IMAGENET_MEAN
     std = RETINA_STD if dataset == "retina" else IMAGENET_STD
-    return transforms.Compose([
-        transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomVerticalFlip(p=0.3),
-        transforms.RandomRotation(degrees=15),
-        transforms.ColorJitter(
-            brightness=0.1, contrast=0.15, saturation=0.08, hue=0.01,
-        ),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=mean, std=std),
-    ])
+    
+    if dataset == "covidfl":
+        # Chest X-Rays: No vertical flips, minimal rotation, safe cropping
+        return transforms.Compose([
+            transforms.RandomResizedCrop(224, scale=(0.9, 1.0)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomRotation(degrees=10),
+            transforms.ColorJitter(brightness=0.1, contrast=0.1),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std),
+        ])
+    else:
+        # Retina: 
+        return transforms.Compose([
+            transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.3),
+            transforms.RandomRotation(degrees=15),
+            transforms.ColorJitter(
+                brightness=0.1, contrast=0.15, saturation=0.08, hue=0.01,
+            ),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std),
+        ])
+
+
+def get_normalization_stats(dataset: str):
+    if dataset == "retina":
+        return RETINA_MEAN, RETINA_STD
+    return IMAGENET_MEAN, IMAGENET_STD
 
 
 def get_tta_transforms(dataset: str = "retina") -> list:
     """
     Returns a list of transforms for Test-Time Augmentation.
-    Each transform produces a slightly different view of the same image.
-    Final prediction = average of softmax probabilities across all views.
+    Each transform produces a slightly different view of the same image.    Final prediction = average of softmax probabilities across all views.
+    Uses Deterministic Rotational TTA to preserve retinal features.
+    Standard TTA (cropping/scaling) hurts accuracy.
     """
-    mean = RETINA_MEAN if dataset == "retina" else IMAGENET_MEAN
-    std = RETINA_STD if dataset == "retina" else IMAGENET_STD
+    mean, std = get_normalization_stats(dataset)
     base = [transforms.Resize(256), transforms.CenterCrop(224)]
     norm = [transforms.ToTensor(), transforms.Normalize(mean=mean, std=std)]
 
+    dataset_key = dataset.lower().replace("_", "-")
+    if dataset_key in {"covid", "covid-fl", "covidfl"}:
+        # Chest X-rays are not rotationally invariant; allow flip only
+        tta_list = [
+            transforms.Compose(base + norm),
+            transforms.Compose(base + [transforms.RandomHorizontalFlip(p=1.0)] + norm),
+        ]
+        return tta_list
+
+    # Deterministic Rotational TTA
     tta_list = [
-        # 1. Clean center crop (same as eval)
         transforms.Compose(base + norm),
-        # 2. Horizontal flip
-        transforms.Compose(base + [transforms.RandomHorizontalFlip(p=1.0)] + norm),
-        # 3. Vertical flip
-        transforms.Compose(base + [transforms.RandomVerticalFlip(p=1.0)] + norm),
-        # 4. Slight rotation
-        transforms.Compose([transforms.Resize(256), transforms.CenterCrop(240),
-                            transforms.RandomRotation(degrees=10),
-                            transforms.CenterCrop(224)] + norm),
-        # 5. Slightly larger crop
-        transforms.Compose([transforms.Resize(288), transforms.CenterCrop(224)] + norm),
+        transforms.Compose(base + [transforms.RandomRotation(degrees=(90, 90))] + norm),
+        transforms.Compose(base + [transforms.RandomRotation(degrees=(180, 180))] + norm),
+        transforms.Compose(base + [transforms.RandomRotation(degrees=(270, 270))] + norm),
     ]
     return tta_list
 
@@ -1587,8 +1610,8 @@ def main() -> None:
     # -------------------------------------------------------------------
     # Data (full dataset — subsetting happens per-run)
     # -------------------------------------------------------------------
-    eval_transform = get_eval_transform(dataset="retina")
-    train_transform = get_train_transform(dataset="retina") if args.mode == "full_finetune" else eval_transform
+    eval_transform = get_eval_transform(dataset=args.dataset)
+    train_transform = get_train_transform(dataset=args.dataset) if args.mode == "full_finetune" else eval_transform
 
     train_ds = RetinaDataset(
         data_path=args.data_path,
@@ -1681,20 +1704,26 @@ def main() -> None:
     # Baseline comparison reminder
     # -------------------------------------------------------------------
     top1 = result["accuracy"]
+    baseline = FEDMAE_BASELINE.get(args.dataset.lower().replace("-", "").replace("_", ""), None)
+
     print("\n" + "-" * 60)
     print("  BASELINE COMPARISON NOTE:")
-    print(f"    Centralized MAE baseline on Retina: ~{FEDMAE_BASELINE:.2f}%")
-    print("    (full fine-tuning, centralized setting)")
-    print()
-    if args.mode == "linear_probe":
-        print("    Linear probing is a DIAGNOSTIC -- it measures representation")
-        print("    quality but is NOT an apples-to-apples comparison.")
-        print("    For a fair comparison, also run with --mode full_finetune.")
+    if baseline is not None:
+        print(f"    Centralized MAE baseline on {args.dataset}: ~{baseline:.2f}%")
+        print("    (full fine-tuning, centralized setting)\n")
+        
+        if args.mode == "linear_probe":
+            print("    Linear probing is a DIAGNOSTIC -- it measures representation")
+            print("    quality but is NOT an apples-to-apples comparison.")
+            print("    For a fair comparison, also run with --mode full_finetune.")
+        else:
+            print(f"    Your full fine-tune result: {top1:.2f}% vs baseline: {baseline:.2f}%")
+            diff = top1 - baseline
+            sign = "+" if diff >= 0 else ""
+            print(f"    Delta: {sign}{diff:.2f}%")
     else:
-        print(f"    Your full fine-tune result: {top1:.2f}% vs baseline: {FEDMAE_BASELINE:.2f}%")
-        diff = top1 - FEDMAE_BASELINE
-        sign = "+" if diff >= 0 else ""
-        print(f"    Delta: {sign}{diff:.2f}%")
+        print(f"    No centralized baseline available for dataset: {args.dataset}")
+        print(f"    Your result: {top1:.2f}%")
     print("-" * 60)
 
 

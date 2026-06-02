@@ -60,6 +60,7 @@ from utils.ckpt_compat import safe_torch_load
 from utils.fedavg import (
     average_models, broadcast_global_to_clients, compute_client_weights,
 )
+from utils.data_splits import discover_client_split_csvs
 
 
 # ======================================================================
@@ -85,6 +86,8 @@ def parse_args() -> argparse.Namespace:
     # Data
     parser.add_argument("--data_path", type=str, default=None,
                         help="Root of the dataset (e.g. data/Retina)")
+    parser.add_argument("--dataset", type=str, default="retina",
+                        help="Dataset preset for transforms: retina or covidfl")
     parser.add_argument("--teacher_ckpt", type=str,
                         default="data/ckpts/mae_vit_base.pth")
 
@@ -140,20 +143,15 @@ def build_client_dataloaders(args) -> list:
     Build one DataLoader per client using the split CSVs.
 
     Path convention (matches SSL-FL):
-        data_path/5_clients/split_1/client_1.csv
-        data_path/5_clients/split_1/client_2.csv
-        ...
+        data_path/{n_clients}_clients/{split_type}/*.csv
     """
     loaders = []
     dataset_sizes = []
+    split_csvs = discover_client_split_csvs(
+        args.data_path, args.n_clients, args.split_type,
+    )
 
-    for client_id in range(1, args.n_clients + 1):
-        # Construct the CSV path relative to data_path
-        split_csv = os.path.join(
-            f"{args.n_clients}_clients", args.split_type,
-            f"client_{client_id}.csv",
-        )
-
+    for client_id, split_csv in enumerate(split_csvs, start=1):
         base_ds = RetinaDataset(
             data_path=args.data_path,
             phase="train",
@@ -163,8 +161,9 @@ def build_client_dataloaders(args) -> list:
 
         dual_ds = DualViewDataset(
             base_ds,
-            teacher_transform=get_teacher_transform(dataset="retina"),
-            student_transform=get_student_transform(dataset="retina"),
+            teacher_transform=get_teacher_transform(dataset=args.dataset),
+            student_transform=get_student_transform(dataset=args.dataset),
+            dataset=args.dataset,
         )
 
         loader = DataLoader(
@@ -179,7 +178,7 @@ def build_client_dataloaders(args) -> list:
 
         loaders.append(loader)
         dataset_sizes.append(len(base_ds))
-        print(f"  Client {client_id}: {len(base_ds)} images, "
+        print(f"  Client {client_id} ({os.path.basename(split_csv)}): {len(base_ds)} images, "
               f"{len(loader)} batches")
 
     return loaders, dataset_sizes
@@ -336,6 +335,7 @@ def main():
     print(f"  FedMamba-SALT: Federated Pre-training ({algo_name})")
     print("=" * 55)
     print(f"  Split:      {args.split_type}")
+    print(f"  Dataset:    {args.dataset}")
     print(f"  Clients:    {args.n_clients}")
     print(f"  Rounds:     {args.max_rounds}")
     print(f"  E_epoch:    {args.E_epoch}")

@@ -123,6 +123,7 @@ from utils.scaffold import (
     init_control_variates, apply_scaffold_correction,
     compute_control_variate_update, update_server_control_variate,
 )
+from utils.data_splits import discover_client_split_csvs
 
 # Reuse shared components from the linear probe script
 from eval.linear_probe import (
@@ -182,6 +183,8 @@ def parse_args() -> argparse.Namespace:
     # Data
     p.add_argument("--data_path", type=str, default=None,
                    help="Dataset root (SSL-FL format with client CSVs)")
+    p.add_argument("--dataset", type=str, default="retina",
+                   help="Dataset name (e.g. retina, covidfl) to control baseline and TTA behavior")
     p.add_argument("--num_classes", type=int, required=True,
                    help="Number of classification classes")
 
@@ -268,11 +271,17 @@ def build_client_dataloaders(args, train_transform) -> tuple:
     loaders = []
     dataset_sizes = []
 
-    for client_id in range(1, args.n_clients + 1):
-        split_csv = os.path.join(
-            f"{args.n_clients}_clients", args.split_type,
-            f"client_{client_id}.csv",
+    split_csvs = discover_client_split_csvs(
+        args.data_path, args.n_clients, args.split_type
+    )
+
+    if len(split_csvs) != args.n_clients:
+        raise ValueError(
+            f"Expected {args.n_clients} clients, but found {len(split_csvs)} "
+            f"CSV files in {args.data_path}/{args.n_clients}_clients/{args.split_type}"
         )
+
+    for client_id, split_csv in enumerate(split_csvs, start=1):
 
         ds = RetinaDataset(
             data_path=args.data_path,
@@ -1048,8 +1057,8 @@ def main() -> None:
                     groups[layer_id] = []
                 groups[layer_id].append(param)
             
-            # Base encoder LR (for top layer) is args.lr / 5.0 
-            base_enc_lr = args.lr / 5.0
+            # Base encoder LR (for top layer) is args.lr / 20.0 (prevents feature destruction) 
+            base_enc_lr = args.lr / 20.0
             
             for layer_id in sorted(groups.keys()):
                 # layer depth+1 gets scale=1.0
@@ -1252,9 +1261,9 @@ def main() -> None:
         if PROBE_ROUNDS > 0 and comm_round < POST_PROBE_RAMP:
             # Bypass the double-warmup by scaling directly off the target base
             post_probe_scale = comm_round / max(POST_PROBE_RAMP - 1, 1)
-            enc_lr = (args.lr / 5.0) * post_probe_scale
+            enc_lr = (args.lr / 20.0) * post_probe_scale
         else:
-            enc_lr = (current_lr / 5.0)
+            enc_lr = (current_lr / 20.0)
 
         # ---- Snapshot global params (needed for FedProx and SCAFFOLD) ----
         global_params = None

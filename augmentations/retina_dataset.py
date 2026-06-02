@@ -1,17 +1,18 @@
 """
-augmentations/retina_dataset.py -- Retina dataset loader for SSL-FL format.
+augmentations/retina_dataset.py -- SSL-FL image dataset loader.
 
-The SSL-FL Retina dataset uses a custom format:
-  - Images are stored as .npy files in ``data/Retina/train/`` and
-    ``data/Retina/test/``
+The SSL-FL datasets use a shared metadata format:
+  - Images are stored in ``train/`` and ``test/``. Retina uses .npy arrays;
+    COVID-FL and other image datasets use standard image files.
   - Labels are stored in ``data/Retina/labels.csv`` as ``filename,class_id``
   - Train/test splits are defined by CSV files listing filenames:
     ``data/Retina/central/train.csv`` (centralized split) or
     ``data/Retina/5_clients/split_*/client_*.csv`` (federated splits)
 
 This module provides :class:`RetinaDataset` which loads images from
-a split CSV, maps labels from ``labels.csv``, and converts .npy arrays
-to PIL Images for compatibility with torchvision transforms.
+a split CSV, maps labels from ``labels.csv``, and converts arrays/images
+to PIL Images for compatibility with torchvision transforms. The class name
+is retained for backward compatibility with the existing training scripts.
 """
 
 import os
@@ -57,7 +58,7 @@ def _resize_array(img: np.ndarray, size: int) -> np.ndarray:
 
 class RetinaDataset(Dataset):
     """
-    Dataset loader for SSL-FL Retina format.
+    Dataset loader for SSL-FL image classification format.
 
     Each item returns ``(PIL.Image, int_label)``, compatible with
     :class:`DualViewDataset` and torchvision transforms.
@@ -71,6 +72,7 @@ class RetinaDataset(Dataset):
             For centralized: ``'train.csv'``; for federated: ``'client_1.csv'``.
         transform: Optional torchvision transform to apply.
         resize_to: Resize .npy images to this size (default 256 per SSL-FL).
+            Standard image files are left to torchvision transforms.
     """
 
     def __init__(
@@ -92,7 +94,7 @@ class RetinaDataset(Dataset):
         if not os.path.isfile(labels_path):
             raise FileNotFoundError(
                 f"labels.csv not found at: {labels_path}\n"
-                f"Download the Retina dataset and ensure labels.csv exists."
+                f"Download the SSL-FL dataset and ensure labels.csv exists."
             )
         self.labels = {}
         with open(labels_path, "r") as f:
@@ -101,11 +103,23 @@ class RetinaDataset(Dataset):
                 if not line:
                     continue
                 parts = line.split(",")
-                self.labels[parts[0]] = int(float(parts[1]))
+                if len(parts) < 2:
+                    continue
+                try:
+                    self.labels[parts[0]] = int(float(parts[1]))
+                except ValueError:
+                    # Skip a possible CSV header.
+                    continue
 
         # --- Load split file ---
         if split_type == "central":
-            split_path = os.path.join(data_path, split_type, split_csv)
+            # Some SSL-FL releases keep train.csv/test.csv at the dataset root,
+            # while the local Retina notebooks use central/train.csv.
+            candidates = [
+                os.path.join(data_path, split_type, split_csv),
+                os.path.join(data_path, split_csv),
+            ]
+            split_path = next((p for p in candidates if os.path.isfile(p)), candidates[0])
         else:
             # e.g. data/Retina/5_clients/split_1/client_1.csv
             split_path = os.path.join(data_path, split_csv)
@@ -143,12 +157,20 @@ class RetinaDataset(Dataset):
         for attempt in range(max_retries):
             idx = index % len(self.img_paths) if attempt == 0 else random.randint(0, len(self.img_paths) - 1)
             fname = self.img_paths[idx]
-            path = os.path.join(self.data_path, self.phase, fname)
+            path = fname if os.path.isabs(fname) else os.path.join(self.data_path, self.phase, fname)
+            if not os.path.exists(path):
+                alt = os.path.join(self.data_path, fname)
+                if os.path.exists(alt):
+                    path = alt
 
             try:
-                # Load .npy and resize
-                img = np.load(path)
-                img = _resize_array(img, self.resize_to)
+                if Path(path).suffix.lower() == ".npy":
+                    # Load .npy and resize
+                    img = np.load(path)
+                    img = _resize_array(img, self.resize_to)
+                else:
+                    pil_img = Image.open(path).convert("RGB")
+                    img = np.asarray(pil_img)
             except (ValueError, Exception) as e:
                 warnings.warn(
                     f"[RetinaDataset] Corrupt file skipped: {fname} ({e})",

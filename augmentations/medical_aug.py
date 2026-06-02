@@ -39,6 +39,14 @@ RETINA_MEAN = [0.5007, 0.5010, 0.5019]
 RETINA_STD = [0.0342, 0.0535, 0.0484]
 
 
+def get_normalization_stats(dataset: str = "imagenet") -> tuple[list, list]:
+    """Return normalization stats for the supported medical datasets."""
+    key = dataset.lower().replace("_", "-")
+    if key == "retina":
+        return RETINA_MEAN, RETINA_STD
+    return IMAGENET_MEAN, IMAGENET_STD
+
+
 # ======================================================================
 # Custom transform: additive Gaussian noise
 # ======================================================================
@@ -78,8 +86,7 @@ def get_teacher_transform(dataset: str = "imagenet") -> transforms.Compose:
     Args:
         dataset: ``'imagenet'`` or ``'retina'`` to select normalization stats.
     """
-    mean = RETINA_MEAN if dataset == "retina" else IMAGENET_MEAN
-    std = RETINA_STD if dataset == "retina" else IMAGENET_STD
+    mean, std = get_normalization_stats(dataset)
     return transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(mean=mean, std=std),
@@ -100,8 +107,18 @@ def get_student_transform(dataset: str = "imagenet") -> transforms.Compose:
     Args:
         dataset: ``'imagenet'`` or ``'retina'`` to select normalization stats.
     """
-    mean = RETINA_MEAN if dataset == "retina" else IMAGENET_MEAN
-    std = RETINA_STD if dataset == "retina" else IMAGENET_STD
+    mean, std = get_normalization_stats(dataset)
+    key = dataset.lower().replace("_", "-")
+    if key in {"covid", "covid-fl", "covidfl"}:
+        return transforms.Compose([
+            transforms.ColorJitter(hue=0.05, saturation=0.05),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 0.4)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std),
+            AddGaussianNoise(std=0.01),
+        ])
+
     return transforms.Compose([
         transforms.ColorJitter(
             brightness=0.1,
@@ -145,17 +162,20 @@ class DualViewDataset(Dataset):
         base_dataset: Dataset,
         teacher_transform: Optional[Callable] = None,
         student_transform: Optional[Callable] = None,
+        dataset: str = "retina",
     ):
         self.base_dataset = base_dataset
+        dataset_key = dataset.lower().replace("_", "-")
+        crop_scale = (0.4, 1.0) if dataset_key in {"covid", "covid-fl", "covidfl"} else (0.85, 1.0)
         
         # Shared spatial transform to ensure alignment for dense distillation
         self.shared_spatial = transforms.Compose([
-            transforms.RandomResizedCrop(224, scale=(0.85, 1.0)),
+            transforms.RandomResizedCrop(224, scale=crop_scale),
             transforms.RandomHorizontalFlip(p=0.5),
         ])
         
-        self.teacher_transform = teacher_transform or get_teacher_transform()
-        self.student_transform = student_transform or get_student_transform()
+        self.teacher_transform = teacher_transform or get_teacher_transform(dataset)
+        self.student_transform = student_transform or get_student_transform(dataset)
 
     def __len__(self) -> int:
         return len(self.base_dataset)  # type: ignore[arg-type]

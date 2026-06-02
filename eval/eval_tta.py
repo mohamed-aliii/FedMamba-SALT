@@ -39,12 +39,25 @@ from utils.ckpt_compat import safe_torch_load
 # ──────────────────────────────────────────────
 # TTA augmentations (tensor-level, no PIL needed)
 # ──────────────────────────────────────────────
-def get_tta_augmentations(n_tta: int):
+def get_tta_augmentations(n_tta: int, dataset: str = "retina"):
     """
     Returns a list of tensor→tensor augmentation functions.
     Uses Deterministic Rotational TTA to preserve retinal features.
     Max 4 passes: Original, 90°, 180°, 270°.
     """
+    dataset_key = dataset.lower().replace("_", "-")
+    if dataset_key in {"covid", "covid-fl", "covidfl"}:
+        augs = [
+            lambda x: x,
+            lambda x: torch.flip(x, dims=[2]),
+        ]
+        if n_tta > len(augs):
+            print(
+                f"  [TTA] Warning: n_tta={n_tta} requested, but COVID-FL TTA "
+                f"uses {len(augs)} chest-X-ray-safe passes. Clamping."
+            )
+        return augs[: min(n_tta, len(augs))]
+
     augs = [
         lambda x: x,                                      # 1. original
         lambda x: torch.rot90(x, k=1, dims=[1, 2]),       # 2. 90°
@@ -228,6 +241,8 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt",       type=str, required=True,  help="Path to ckpt_best_finetune.pth")
     p.add_argument("--data_path",  type=str, required=True,  help="Dataset root")
+    p.add_argument("--dataset",    type=str, default="retina",
+                   help="Dataset preset for transforms/TTA: retina or covidfl")
     p.add_argument("--num_classes",type=int, default=2)
     p.add_argument("--split_type", type=str, default="split_1",
                    help="Training split label for logging only; test.csv is used for evaluation")
@@ -257,7 +272,7 @@ def main():
     print(f"  Device     : {args.device}")
 
     # ── Dataset ──
-    transform = get_eval_transform()
+    transform = get_eval_transform(args.dataset)
     test_dataset = RetinaDataset(
         data_path=args.data_path,
         phase="test",
@@ -273,11 +288,11 @@ def main():
 
     # ── Model ──
     encoder, classifier = build_model(args.ckpt, args.num_classes, args.device)
-    augmentations = get_tta_augmentations(args.n_tta)
+    augmentations = get_tta_augmentations(args.n_tta, args.dataset)
 
     # ── Baseline (no TTA) ──
     print(f"\n  Running baseline (no TTA)...")
-    base_augs  = get_tta_augmentations(1)
+    base_augs  = get_tta_augmentations(1, args.dataset)
     base_probs, labels = predict_with_tta(encoder, classifier, test_loader, base_augs, args.device)
     base_preds = base_probs.argmax(axis=1)
     base_acc   = (base_preds == labels).mean() * 100

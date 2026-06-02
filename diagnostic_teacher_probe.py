@@ -358,7 +358,7 @@ def main():
         print("\n  *** CRITICAL: Teacher features are NOT linearly separable! ***")
         print("  This means distillation CANNOT produce linearly separable features.")
         print("  The linear probe will always be ~50% regardless of distillation quality.")
-        print("  The 81.93% baseline was achieved by FINE-TUNING the full ViT,")
+        print("  The published baseline was achieved by FINE-TUNING the full ViT,")
         print("  not by linear probing frozen features.")
     
     print(f"{'='*60}")
