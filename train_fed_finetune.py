@@ -598,7 +598,8 @@ def local_train_one_round(
                 # FedProx proximal term — kept separate so logged loss is
                 # pure task loss (was total_loss += loss which inflated
                 # client losses by the proximal penalty).
-                if global_params is not None and args.mu > 0:
+                use_fedprox = (args.algo == "fedprox") and (args.mu > 0)
+                if global_params is not None and use_fedprox:
                     loss = task_loss + fedprox_penalty(
                         encoder, classifier, global_params, args.mu,
                     )
@@ -1280,6 +1281,8 @@ def main() -> None:
 
     # Initialize SCAFFOLD control variates (only used when algo=scaffold)
     use_scaffold = (args.algo == "scaffold")
+    use_fedprox = (args.algo == "fedprox") and (args.mu > 0)
+    use_fedavgm = (args.algo == "fedavgm")
     SCAFFOLD_WARMUP = 10  # plain FedAvg for first 10 rounds (LR warmup + post-probe ramp)
     c_global = None
     c_clients = None
@@ -1318,7 +1321,7 @@ def main() -> None:
 
         # ---- Snapshot global params (needed for FedProx and SCAFFOLD) ----
         global_params = None
-        if args.mu > 0 or use_scaffold:
+        if use_fedprox or use_scaffold:
             global_params = snapshot_global_params(global_encoder, global_classifier)
 
         client_losses    = []
@@ -1350,7 +1353,7 @@ def main() -> None:
             loss, tacc, accumulated_grads = local_train_one_round(
                 enc, cls, client_loaders[cid], opt, scl,
                 criterion, args,
-                global_params if (args.mu > 0 and not use_scaffold) else None,
+                global_params if use_fedprox else None,
                 freeze_encoder,
                 comm_round=comm_round,
                 scaffold_state=scaffold_state,
@@ -1372,7 +1375,7 @@ def main() -> None:
             update_server_control_variate(c_global, all_delta_c, args.n_clients)
 
         # ---- Model aggregation ----
-        average_models(global_encoder,    client_encoders,    client_weights,
+        average_models(global_encoder,    client_encoders,    cls_weights,
                        server_momentum=server_momentum_enc)
         average_classifier_class_wise(
             global_classifier, client_classifiers, client_class_counts, cls_weights,
