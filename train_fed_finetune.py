@@ -1109,8 +1109,8 @@ def main() -> None:
                     groups[layer_id] = []
                 groups[layer_id].append(param)
             
-            # Base encoder LR (for top layer) is args.lr / 5.0 (prevents feature destruction) 
-            base_enc_lr = args.lr / 5.0  # CHANGE 1: Increased from 20.0 to 5.0 to allow meaningful adaptation
+            # Base encoder LR (for top layer) is args.lr / 50.0 (prevents feature destruction) 
+            base_enc_lr = args.lr / 50.0  # CHANGE 1: Hard-capped to 50.0 to prevent representation tear
             
             for layer_id in sorted(groups.keys()):
                 # layer depth+1 gets scale=1.0
@@ -1317,9 +1317,9 @@ def main() -> None:
         if PROBE_ROUNDS > 0 and comm_round < POST_PROBE_RAMP:
             # Bypass the double-warmup by scaling directly off the target base
             post_probe_scale = 0.1 + 0.9 * (comm_round / max(POST_PROBE_RAMP - 1, 1))  # CHANGE 3: Starts at 10% instead of 0%
-            enc_lr = (args.lr / 5.0) * post_probe_scale  # CHANGE 1: Match _make_optimizer ratio (5.0)
+            enc_lr = (args.lr / 50.0) * post_probe_scale  # CHANGE 1: Match _make_optimizer ratio (50.0)
         else:
-            enc_lr = (current_lr / 5.0)  # CHANGE 1: Match _make_optimizer ratio (5.0)
+            enc_lr = (current_lr / 50.0)  # CHANGE 1: Match _make_optimizer ratio (50.0)
 
         # ---- Snapshot global params (needed for FedProx and SCAFFOLD) ----
         global_params = None
