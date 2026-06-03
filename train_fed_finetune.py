@@ -44,7 +44,7 @@ Bug fixes applied (see inline FIX comments):
          for FedProx (15 % vs 30 %), as the docstring always claimed.
   FIX-3  CrossEntropyLoss label_smoothing is disabled when --use_mixup is
          active to prevent double-smoothing of already-soft Mixup targets.
-  FIX-4  try_resume now saves and restores optimizer + scaler state so that
+  FIX-4  try_resume now saves and restores optimizer state so that
          AdamW momentum buffers are preserved across resume boundaries.
   FIX-5  feat_dim is derived from the actual encoder output at build time
          instead of being hardcoded to 768, fixing shape mismatches for
@@ -503,7 +503,6 @@ def local_train_one_round(
     classifier: nn.Module,
     loader: DataLoader,
     optimizer,
-    scaler,
     criterion: nn.Module,
     args,
     global_params: dict | None,
@@ -540,7 +539,7 @@ def local_train_one_round(
     Returns:
         avg_loss (float), train_acc (float), accumulated_grads (dict|None)
     """
-    _device_type = "cuda" if "cuda" in args.device else "cpu"
+
 
     total_loss = 0.0
     correct = 0
@@ -587,39 +586,36 @@ def local_train_one_round(
 
             optimizer.zero_grad()
 
-            with torch.amp.autocast(_device_type, enabled=("cuda" in args.device)):
-                # Always use return_patches=False for the raw encoder path.
-                # PatchEncoderWrapper ignores kwargs and calls encoder(x, return_patches=True)
-                # internally, so the classifier receives the right tensor shape in both modes.
-                if isinstance(encoder, PatchEncoderWrapper):
-                    features = encoder(images)
-                else:
-                    features = encoder(images, return_patches=False)
+            # Pure FP32 forward pass (AMP removed)
+            # Always use return_patches=False for the raw encoder path.
+            # PatchEncoderWrapper ignores kwargs and calls encoder(x, return_patches=True)
+            # internally, so the classifier receives the right tensor shape in both modes.
+            if isinstance(encoder, PatchEncoderWrapper):
+                features = encoder(images)
+            else:
+                features = encoder(images, return_patches=False)
 
-                logits = classifier(features)
+            logits = classifier(features)
 
-                if args.use_mixup:
-                    task_loss = mixup_criterion(
-                        criterion, logits, targets_a, targets_b, lam,
-                    )
-                else:
-                    task_loss = criterion(logits, labels)
+            if args.use_mixup:
+                task_loss = mixup_criterion(
+                    criterion, logits, targets_a, targets_b, lam,
+                )
+            else:
+                task_loss = criterion(logits, labels)
 
-                # FedProx proximal term — kept separate so logged loss is
-                # pure task loss (was total_loss += loss which inflated
-                # client losses by the proximal penalty).
-                use_fedprox = (args.mu > 0.0)
-                if global_params is not None and use_fedprox:
-                    loss = task_loss + fedprox_penalty(
-                        encoder, classifier, global_params, args.mu,
-                    )
-                else:
-                    loss = task_loss
+            # FedProx proximal term — kept separate so logged loss is
+            # pure task loss (was total_loss += loss which inflated
+            # client losses by the proximal penalty).
+            use_fedprox = (args.mu > 0.0)
+            if global_params is not None and use_fedprox:
+                loss = task_loss + fedprox_penalty(
+                    encoder, classifier, global_params, args.mu,
+                )
+            else:
+                loss = task_loss
 
-            scaler.scale(loss).backward()
-
-            # Always unscale before gradient accumulation / SCAFFOLD / clipping
-            scaler.unscale_(optimizer)
+            loss.backward()
 
             # Accumulate TRUE RAW gradients for AdamW-safe SCAFFOLD
             if accumulated_grads is not None:
@@ -644,8 +640,7 @@ def local_train_one_round(
                 ]
                 torch.nn.utils.clip_grad_norm_(active, max_norm=args.grad_clip)
 
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
 
             # Log only the task loss, not task + FedProx penalty.
             total_loss += task_loss.item() * images.size(0)
@@ -757,12 +752,12 @@ def evaluate_global(
 def save_checkpoint(
     encoder, classifier,
     comm_round, val_acc, output_dir, name,
-    optimizers=None, scalers=None,
+    optimizers=None,
 ) -> None:
     """
-    Save model weights plus optional optimizer/scaler state.
+    Save model weights plus optional optimizer state.
 
-    FIX-4: optimizers and scalers are persisted in the latest checkpoint
+    FIX-4: optimizers are persisted in the latest checkpoint
     so that AdamW momentum buffers survive a resume boundary.
     Periodic and best checkpoints omit optimizer state (too large) and
     are used only for weight loading after training completes.
@@ -777,19 +772,17 @@ def save_checkpoint(
     }
     if optimizers is not None:
         payload["optimizer_states"] = [opt.state_dict() for opt in optimizers]
-    if scalers is not None:
-        payload["scaler_states"] = [scl.state_dict() for scl in scalers]
     torch.save(payload, path)
 
 
 def try_resume(
     output_dir, encoder, classifier, device,
-    optimizers=None, scalers=None,
+    optimizers=None,
 ) -> tuple:
     """
     Resume from ckpt_latest.pth if present. Returns (start_round, best_acc).
 
-    FIX-4: also restores optimizer and scaler state when available so
+    FIX-4: also restores optimizer state when available so
     that AdamW momentum buffers are not discarded on resume.
     """
     latest = os.path.join(output_dir, "ckpt_latest.pth")
@@ -822,16 +815,6 @@ def try_resume(
             print("[RESUME] Optimizer states restored.")
         else:
             print("[RESUME] WARNING: optimizer count mismatch — skipping optimizer restore.")
-
-    # FIX-4: restore scaler state
-    if scalers is not None and "scaler_states" in ckpt:
-        scl_states = ckpt["scaler_states"]
-        if len(scl_states) == len(scalers):
-            for scl, state in zip(scalers, scl_states):
-                scl.load_state_dict(state)
-            print("[RESUME] Scaler states restored.")
-        else:
-            print("[RESUME] WARNING: scaler count mismatch — skipping scaler restore.")
 
     start = ckpt["comm_round"] + 1
     print(f"[RESUME] Resuming from round {start}")
@@ -1138,19 +1121,12 @@ def main() -> None:
         _make_optimizer(client_encoders[i], client_classifiers[i])
         for i in range(args.n_clients)
     ]
-    client_scalers = [
-        torch.amp.GradScaler(
-            "cuda" if "cuda" in args.device else "cpu",
-            enabled=("cuda" in args.device),
-        )
-        for _ in range(args.n_clients)
-    ]
 
-    # FIX-4: pass optimizers and scalers into try_resume so momentum
+    # FIX-4: pass optimizers into try_resume so momentum
     # buffers survive a resume boundary
     start_round, best_acc = try_resume(
         args.output_dir, global_encoder, global_classifier, args.device,
-        optimizers=client_optimizers, scalers=client_scalers,
+        optimizers=client_optimizers,
     )
 
     criterion = build_criterion(args, args.device)
@@ -1201,13 +1177,6 @@ def main() -> None:
             )
             for cls in client_classifiers
         ]
-        probe_scalers = [
-            torch.amp.GradScaler(
-                "cuda" if "cuda" in args.device else "cpu",
-                enabled=("cuda" in args.device),
-            )
-            for _ in range(args.n_clients)
-        ]
 
         for probe_round in range(PROBE_ROUNDS):
             probe_losses = []
@@ -1219,7 +1188,7 @@ def main() -> None:
                 loss, tacc, _ = local_train_one_round(
                     client_encoders[cid], client_classifiers[cid],
                     client_loaders[cid],
-                    probe_optimizers[cid], probe_scalers[cid],
+                    probe_optimizers[cid],
                     criterion, args,
                     global_params=None,
                     freeze_encoder=True,
@@ -1335,7 +1304,6 @@ def main() -> None:
             enc   = client_encoders[cid]
             cls   = client_classifiers[cid]
             opt   = client_optimizers[cid]
-            scl   = client_scalers[cid]
 
             # Update round-level LR in-place via group_name tag.
             for pg in opt.param_groups:
@@ -1353,7 +1321,7 @@ def main() -> None:
                 scaffold_state = (c_global, c_clients[cid])
 
             loss, tacc, accumulated_grads = local_train_one_round(
-                enc, cls, client_loaders[cid], opt, scl,
+                enc, cls, client_loaders[cid], opt,
                 criterion, args,
                 global_params if use_fedprox else None,
                 freeze_encoder,
@@ -1420,13 +1388,12 @@ def main() -> None:
         else:
             rounds_no_improve += 1
 
-        # FIX-4: save optimizer + scaler state in the latest checkpoint only
+        # FIX-4: save optimizer state in the latest checkpoint only
         save_checkpoint(
             global_encoder, global_classifier,
             comm_round, val_acc,
             args.output_dir, "ckpt_latest.pth",
             optimizers=client_optimizers,
-            scalers=client_scalers,
         )
         if (comm_round + 1) % args.save_every == 0:
             name = f"ckpt_round_{comm_round + 1:04d}.pth"

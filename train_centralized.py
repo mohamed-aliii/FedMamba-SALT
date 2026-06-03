@@ -466,7 +466,6 @@ def train_one_epoch(
     projector: nn.Module,
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
-    scaler: torch.amp.GradScaler,
     device: str,
     global_params: dict = None,
     mu: float = 0.0,
@@ -502,45 +501,36 @@ def train_one_epoch(
         student_view = student_view.to(device, non_blocking=True)
         device_type = "cuda" if "cuda" in str(device) else "cpu"
 
-        # ----- Mixed Precision Forward Pass -----
-        with torch.amp.autocast(device_type=device_type, enabled=True):
-            # Teacher embedding (frozen, no gradient)
-            with torch.no_grad():
-                t_emb = teacher(teacher_view, return_patches=True)            # (B, 196, 768)
+        # ----- Pure FP32 Forward Pass -----
+        # Teacher embedding (frozen, no gradient)
+        with torch.no_grad():
+            t_emb = teacher(teacher_view, return_patches=True)            # (B, 196, 768)
 
-            # Student embedding with Internal Latent Masking (50% tokens dropped)
-            s_emb = student(student_view, return_patches=True, mask_ratio=mask_ratio)                # (B, 196, 768)
-            
-            # Projection head
-            s_proj = projector(s_emb)                                        # (B, 196, 768)
+        # Student embedding with Internal Latent Masking (50% tokens dropped)
+        s_emb = student(student_view, return_patches=True, mask_ratio=mask_ratio)                # (B, 196, 768)
+        
+        # Projection head
+        s_proj = projector(s_emb)                                        # (B, 196, 768)
 
-            # SALT loss (Cosine distillation + encoder variance guard)
-            loss, align_loss, var_loss = salt_loss(s_proj, t_emb, s_emb)
+        # SALT loss (Cosine distillation + encoder variance guard)
+        loss, align_loss, var_loss = salt_loss(s_proj, t_emb, s_emb)
 
-            # FedProx proximal term (only when mu > 0)
-            # CRITICAL: computed OUTSIDE autocast in fp32 to prevent fp16
-            # overflow. With 45M params, squared diffs accumulate to values
-            # that exceed fp16 max (65504), causing NaN at round 3-10.
-            # FIX BUG 4: Use `device_type` variable (not hardcoded 'cuda') so
-            # this branch works correctly on CPU as well as CUDA.
-            if mu > 0 and global_params is not None:
-                prox = torch.tensor(0.0, device=device, dtype=torch.float32)
-                with torch.amp.autocast(device_type, enabled=False):
-                    for name, param in student.named_parameters():
-                        if param.requires_grad and name in global_params:
-                            prox = prox + (
-                                param.float() - global_params[name].detach().float()
-                            ).pow(2).sum()
-                    for name, param in projector.named_parameters():
-                        if param.requires_grad and f"proj.{name}" in global_params:
-                            prox = prox + (
-                                param.float() - global_params[f"proj.{name}"].detach().float()
-                            ).pow(2).sum()
-                loss = loss.float() + (mu / 2.0) * prox
+        # FedProx proximal term (only when mu > 0)
+        if mu > 0 and global_params is not None:
+            prox = torch.tensor(0.0, device=device, dtype=torch.float32)
+            for name, param in student.named_parameters():
+                if param.requires_grad and name in global_params:
+                    prox = prox + (
+                        param.float() - global_params[name].detach().float()
+                    ).pow(2).sum()
+            for name, param in projector.named_parameters():
+                if param.requires_grad and f"proj.{name}" in global_params:
+                    prox = prox + (
+                        param.float() - global_params[f"proj.{name}"].detach().float()
+                    ).pow(2).sum()
+            loss = loss.float() + (mu / 2.0) * prox
 
         # ----- Collapse diagnostics (both encoder and projector) -----
-        # Compute on Global Average Pooled embeddings to ignore intra-image spatial variance
-        # and masking artifacts, giving a true measure of global representation collapse.
         _s_emb_diag = s_emb.detach().mean(dim=1) if s_emb.dim() == 3 else s_emb.detach()
         _s_proj_diag = s_proj.detach().mean(dim=1) if s_proj.dim() == 3 else s_proj.detach()
         _t_emb_diag = t_emb.detach().mean(dim=1) if t_emb.dim() == 3 else t_emb.detach()
@@ -549,29 +539,24 @@ def train_one_epoch(
         proj_std = embedding_std(_s_proj_diag)
         t_std = embedding_std(_t_emb_diag)
 
-        # ----- Backward pass with Dynamic Loss Scaling -----
+        # ----- Backward pass -----
         optimizer.zero_grad()
-        scaler.scale(loss).backward()
+        loss.backward()
         
-        # Unscale before clipping
-        scaler.unscale_(optimizer)
         if grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(
                 list(student.parameters()) + list(projector.parameters()),
                 max_norm=grad_clip,
             )
 
-        # FIX BUG 5: Capture grad norm AFTER unscale but BEFORE zero_grad,
-        # so gradients are actually present. This replaces the stale post-loop
-        # debug block in train_fedavg.py that always printed 0.0.
+        # Capture grad norm AFTER backward but BEFORE step
         total_norm = 0.0
         for p in list(student.parameters()) + list(projector.parameters()):
             if p.grad is not None:
                 total_norm += p.grad.data.norm(2).item() ** 2
         total_norm = total_norm ** 0.5
         
-        scaler.step(optimizer)
-        scaler.update()
+        optimizer.step()
 
         # ----- Accumulate metrics -----
         total_loss += loss.item()
@@ -715,13 +700,7 @@ def main() -> None:
           f"collapse strikes={COLLAPSE_STRIKES_MAX}")
     print(f"{'='*55}\n")
 
-    # ----- Automated Mixed Precision -----
-    # SCHEDULER FIX 5: Derive device_type from args.device so GradScaler
-    # doesn't pass "cuda" as the device string when running on CPU.
-    # torch.amp.GradScaler("cuda", ...) emits warnings on CPU in PyTorch 2.1+
-    # even when enabled=False, because the device string is validated first.
-    _device_type = "cuda" if "cuda" in args.device else "cpu"
-    scaler = torch.amp.GradScaler(_device_type, enabled=(args.device == "cuda"))
+    # ----- Pure FP32 (AMP removed) -----
 
     # Reset peak GPU memory counter for accurate per-run tracking
     if torch.cuda.is_available():
@@ -741,7 +720,7 @@ def main() -> None:
         t0 = time.time()
 
         avg_loss, avg_align, avg_var, avg_enc_std, avg_proj_std, avg_t_std = train_one_epoch(
-            teacher, student, projector, dataloader, optimizer, scaler, args.device,
+            teacher, student, projector, dataloader, optimizer, args.device,
             mask_ratio=args.mask_ratio,
             grad_clip=args.grad_clip,  # SCHEDULER FIX 1: use CLI-controlled value
         )

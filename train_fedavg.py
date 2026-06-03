@@ -242,7 +242,7 @@ def snapshot_global_params(student, projector):
 def save_fed_checkpoint(
     global_student, global_projector,
     comm_round, loss, output_dir, name,
-    optimizer_states=None, scaler_states=None,
+    optimizer_states=None,
 ):
     """Save a federated training checkpoint."""
     os.makedirs(output_dir, exist_ok=True)
@@ -256,8 +256,6 @@ def save_fed_checkpoint(
     }
     if optimizer_states is not None:
         ckpt["optimizer_states"] = optimizer_states
-    if scaler_states is not None:
-        ckpt["scaler_states"] = scaler_states
     torch.save(ckpt, path)
 
 
@@ -279,12 +277,10 @@ def try_resume_fed(output_dir, global_student, global_projector, device):
     extra = {}
     if "optimizer_states" in ckpt:
         extra["optimizer_states"] = ckpt["optimizer_states"]
-    if "scaler_states" in ckpt:
-        extra["scaler_states"] = ckpt["scaler_states"]
 
     print(f"[RESUME] Resuming from round {start_round}")
     if extra:
-        print(f"[RESUME] Optimizer/scaler states found — will restore.")
+        print(f"[RESUME] Optimizer states found — will restore.")
     else:
         print(f"[RESUME] No optimizer states in checkpoint — will use 3-round LR warmup.")
     return start_round, extra
@@ -396,13 +392,9 @@ def main():
     broadcast_global_to_clients(global_projector, client_projectors)
 
     # ------------------------------------------------------------------
-    # SCHEDULER FIX A: Create one persistent optimizer + scaler per client.
+    # SCHEDULER FIX A: Create one persistent optimizer per client.
     # Previously these were re-created every round, discarding AdamW's m/v
-    # momentum buffers. A fresh optimizer at low LR (late cosine phase)
-    # spends most of the E_epoch local steps rebuilding momentum from zero,
-    # making the cosine decay largely ineffective. Persisting the optimizer
-    # lets momentum accumulate across rounds so late-round LR reductions
-    # actually produce the precision fine-tuning they are supposed to.
+    # momentum buffers.
     # ------------------------------------------------------------------
     client_optimizers = [
         AdamW(
@@ -414,14 +406,8 @@ def main():
         )
         for i in range(args.n_clients)
     ]
-    # One scaler per client — AMP state (scale factor, growth tracker) is
-    # now also preserved across rounds, avoiding scale resets every round.
-    client_scalers = [
-        torch.amp.GradScaler("cuda", enabled=(args.device == "cuda"))
-        for _ in range(args.n_clients)
-    ]
 
-    # ----- Restore optimizer/scaler states from resume checkpoint -----
+    # ----- Restore optimizer states from resume checkpoint -----
     if resume_state.get("optimizer_states"):
         opt_states = resume_state["optimizer_states"]
         if len(opt_states) == len(client_optimizers):
@@ -430,14 +416,6 @@ def main():
             print("[RESUME] Optimizer states restored.")
         else:
             print("[RESUME] WARNING: optimizer count mismatch — skipping optimizer restore.")
-    if resume_state.get("scaler_states"):
-        sc_states = resume_state["scaler_states"]
-        if len(sc_states) == len(client_scalers):
-            for i, state in enumerate(sc_states):
-                client_scalers[i].load_state_dict(state)
-            print("[RESUME] Scaler states restored.")
-        else:
-            print("[RESUME] WARNING: scaler count mismatch — skipping scaler restore.")
 
     # ----- Metrics logger -----
     logger = FedMetricsLogger(args.output_dir, args.n_clients)
@@ -531,7 +509,6 @@ def main():
             client_projector = client_projectors[client_id]
             client_loader    = client_loaders[client_id]
             optimizer        = client_optimizers[client_id]
-            scaler           = client_scalers[client_id]
 
             # SCHEDULER FIX A (continued): Update LR in-place on the
             # persistent optimizer rather than creating a new one.
@@ -547,7 +524,7 @@ def main():
             for local_epoch in range(args.E_epoch):
                 metrics = train_one_epoch(
                     teacher, client_student, client_projector,
-                    client_loader, optimizer, scaler, args.device,
+                    client_loader, optimizer, args.device,
                     global_params=global_params,
                     mu=args.mu,
                     mask_ratio=current_mask_ratio,
@@ -654,7 +631,6 @@ def main():
             global_student, global_projector,
             comm_round, round_loss, args.output_dir, "ckpt_latest.pth",
             optimizer_states=[opt.state_dict() for opt in client_optimizers],
-            scaler_states=[sc.state_dict() for sc in client_scalers],
         )
 
         if (comm_round + 1) % args.save_every == 0:

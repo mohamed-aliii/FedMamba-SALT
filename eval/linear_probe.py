@@ -38,7 +38,7 @@ import torch.nn.functional as F
 from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, TensorDataset, Subset
-from torch.amp import autocast, GradScaler
+
 from torchvision import transforms
 import torchvision.transforms.functional as TF
 from tqdm import tqdm
@@ -661,10 +661,8 @@ def train_finetune(
     print(f"  Early stopping patience: {FINETUNE_PATIENCE} epochs")
     total_start = time.time()
     
-    # FIX BUG 3: derive device_type from device string so GradScaler and
-    # autocast work correctly on "cuda:0", "cuda:1", and CPU alike.
+    # FIX BUG 3: derive device_type from device string.
     _device_type = "cuda" if "cuda" in device else "cpu"
-    scaler = torch.amp.GradScaler(_device_type, enabled=("cuda" in device))
 
     for epoch in range(epochs):
         epoch_start = time.time()
@@ -700,25 +698,23 @@ def train_finetune(
 
             optimizer.zero_grad()  # FIX BUG 2: zero_grad before forward, not after backward
 
-            with autocast(device_type=_device_type, enabled=("cuda" in device)):
-                # FIX BUG 1: return_patches=False forces GAP output (B, embed_dim),
-                # not patch tokens (B, 196, embed_dim). Without this the classifier
-                # receives a 3D tensor, produces garbage logits, and loss goes NaN
-                # after warmup ends and the encoder starts receiving gradients.
-                features = encoder(images, return_patches=False)
-                logits = classifier(features)
-                loss = mixup_criterion(criterion, logits, targets_a, targets_b, lam)
+            # Pure FP32 forward pass (AMP removed)
+            # FIX BUG 1: return_patches=False forces GAP output (B, embed_dim),
+            # not patch tokens (B, 196, embed_dim). Without this the classifier
+            # receives a 3D tensor, produces garbage logits, and loss goes NaN
+            # after warmup ends and the encoder starts receiving gradients.
+            features = encoder(images, return_patches=False)
+            logits = classifier(features)
+            loss = mixup_criterion(criterion, logits, targets_a, targets_b, lam)
 
-            scaler.scale(loss).backward()
+            loss.backward()
             
-            scaler.unscale_(optimizer)
             # FIX BUG 3: only clip params that are actually being trained;
             # clipping frozen encoder params dilutes the effective norm during warmup.
             active_params = [p for p in all_params if p.requires_grad]
             torch.nn.utils.clip_grad_norm_(active_params, max_norm=1.0)
             
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
 
             total_loss += loss.item() * images.size(0)
             # For accuracy tracking, use the dominant label
