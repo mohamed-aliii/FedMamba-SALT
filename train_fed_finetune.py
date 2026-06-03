@@ -608,7 +608,7 @@ def local_train_one_round(
                 # FedProx proximal term — kept separate so logged loss is
                 # pure task loss (was total_loss += loss which inflated
                 # client losses by the proximal penalty).
-                use_fedprox = (args.algo == "fedprox") and (args.mu > 0)
+                use_fedprox = (args.mu > 0.0)
                 if global_params is not None and use_fedprox:
                     loss = task_loss + fedprox_penalty(
                         encoder, classifier, global_params, args.mu,
@@ -1283,7 +1283,7 @@ def main() -> None:
 
     # Initialize SCAFFOLD control variates (only used when algo=scaffold)
     use_scaffold = (args.algo == "scaffold")
-    use_fedprox = (args.algo == "fedprox") and (args.mu > 0)
+    use_fedprox = (args.mu > 0.0)
     use_fedavgm = (args.algo == "fedavgm")
     SCAFFOLD_WARMUP = 10  # plain FedAvg for first 10 rounds (LR warmup + post-probe ramp)
     c_global = None
