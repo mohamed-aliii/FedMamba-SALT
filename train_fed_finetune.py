@@ -1008,27 +1008,19 @@ def main() -> None:
         print(f"  Client {i+1} class counts: {counts}")
 
     # Compute cls_weights that zeroes out mono-class clients to protect Attention/LayerNorm
-    client_n_classes = [len(counts) for counts in client_class_counts]
-    cls_weights = []
-    excluded_clients = []
+    cls_weights = np.array(client_weights, copy=True)
+    mono_clients = []
+    for i, c in enumerate(client_class_counts):
+        if len(c) < 2:
+            mono_clients.append(i)
+            cls_weights[i] = 0.0
+
+    # CRITICAL FIX: Renormalize the remaining weights to sum to 1.0
+    if len(mono_clients) > 0:
+        print(f"  [Classifier] Excluded {len(mono_clients)} mono-class clients from aggregation...")
+        cls_weights = cls_weights / cls_weights.sum()  # <--- THIS PREVENTS THE DECAY
     
-    for i, n_classes in enumerate(client_n_classes):
-        if n_classes < 2:
-            cls_weights.append(0.0)
-            excluded_clients.append((i+1, client_weights[i]))
-        else:
-            cls_weights.append(client_weights[i])
-            
-    sum_cls = sum(cls_weights)
-    if sum_cls > 0:
-        cls_weights = [w / sum_cls for w in cls_weights]
-        if excluded_clients:
-            print(f"  [Classifier] Excluded {len(excluded_clients)} mono-class clients from non-head aggregation:")
-            for cid, w in excluded_clients:
-                print(f"    - Client {cid} (original weight {w:.3f})")
-    else:
-        print("  WARNING: All clients have < 2 classes. Falling back to client_weights for classifier.")
-        cls_weights = list(client_weights)
+    cls_weights = cls_weights.tolist()
 
     # FIX-12: compute balanced class weights from the actual federated label
     # distribution so build_criterion doesn't rely on the hardcoded [1.0, 2.0].
