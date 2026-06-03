@@ -253,15 +253,23 @@ class FocalLoss(nn.Module):
         self.label_smoothing = label_smoothing
 
     def forward(self, inputs, targets):
-        # Calculate standard cross entropy (with label smoothing and class weights)
+        # 1. Calculate standard cross entropy (with label smoothing and class weights)
         ce_loss = F.cross_entropy(
             inputs, targets, weight=self.weight, 
             label_smoothing=self.label_smoothing, reduction='none'
         )
-        # pt is the probability of the target class
-        pt = torch.exp(-ce_loss)
-        # Apply the focal modulating factor (1 - pt)^gamma
-        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        
+        # 2. Get the TRUE probability of the target class. 
+        # (DO NOT use exp(-ce_loss) because class weights and smoothing mathematically distort it).
+        probs = torch.softmax(inputs, dim=1)
+        pt = probs.gather(1, targets.view(-1, 1)).squeeze(1)
+        
+        # 3. Apply the focal modulating factor (1 - pt)^gamma.
+        # CRITICAL: Clamp the base to 1e-5 to prevent NaN gradients in PyTorch's 
+        # FP16 autocast when pt == 1.0 (which evaluates to 0.0 ** gamma).
+        focal_term = (torch.clamp(1 - pt, min=1e-5) ** self.gamma)
+        
+        focal_loss = focal_term * ce_loss
         return focal_loss.mean()
 
 
