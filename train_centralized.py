@@ -54,6 +54,7 @@ from models.inception_mamba import InceptionMambaEncoder
 from models.vit_teacher import FrozenViTTeacher
 from objectives.salt_loss import ProjectionHead, embedding_std, salt_loss
 from utils.ckpt_compat import safe_torch_load
+from utils.teacher_stats import compute_teacher_embedding_stats, teacher_stats_summary
 
 # ======================================================================
 # Constants
@@ -97,7 +98,9 @@ class MetricsLogger:
     """
 
     COLUMNS = [
-        "epoch", "loss", "student_std", "teacher_std", "lr",
+        "epoch", "loss", "student_std", "teacher_std", "salt_norm_mode",
+        "salt_teacher_std_mean", "salt_teacher_std_min", "salt_teacher_std_max",
+        "salt_teacher_target_finite", "salt_student_centered_finite", "lr",
         "epoch_time_s", "gpu_mem_allocated_mb", "gpu_mem_reserved_mb",
         "gpu_mem_peak_mb",
     ]
@@ -112,7 +115,11 @@ class MetricsLogger:
 
     def log(self, epoch: int, loss: float, student_std: float,
             teacher_std: float, lr: float, epoch_time: float,
-            gpu_mem: dict) -> None:
+            gpu_mem: dict, salt_stats: dict | None = None) -> None:
+        salt_stats = salt_stats or {}
+        teacher_std_stats = salt_stats.get("teacher_std", {})
+        teacher_target_stats = salt_stats.get("teacher_target", {})
+        student_centered_stats = salt_stats.get("student_centered", {})
         with open(self.path, "a", newline="") as f:
             writer = csv.writer(f)
             writer.writerow([
@@ -120,6 +127,12 @@ class MetricsLogger:
                 f"{loss:.6f}",
                 f"{student_std:.6f}",
                 f"{teacher_std:.6f}",
+                salt_stats.get("salt_norm_mode", ""),
+                f"{teacher_std_stats.get('mean', 0.0):.6f}",
+                f"{teacher_std_stats.get('min', 0.0):.6f}",
+                f"{teacher_std_stats.get('max', 0.0):.6f}",
+                f"{teacher_target_stats.get('finite', 0.0):.3f}",
+                f"{student_centered_stats.get('finite', 0.0):.3f}",
                 f"{lr:.2e}",
                 f"{epoch_time:.1f}",
                 f"{gpu_mem['gpu_mem_allocated_mb']:.1f}",
@@ -177,6 +190,10 @@ def parse_args() -> argparse.Namespace:
         help="Root of an ImageFolder dataset (must contain a train/ subdirectory)",
     )
     parser.add_argument(
+        "--dataset", type=str, default="retina",
+        help="Dataset preset for transforms: retina or covidfl",
+    )
+    parser.add_argument(
         "--teacher_ckpt", type=str, default="data/ckpts/mae_vit_base.pth",
         help="Path to the MAE ViT-B/16 teacher checkpoint",
     )
@@ -201,6 +218,18 @@ def parse_args() -> argparse.Namespace:
     # with no way to override it at runtime.
     parser.add_argument("--grad_clip",    type=float, default=0.5,
                         help="Max gradient norm for clipping. 0 = disabled.")
+    parser.add_argument(
+        "--salt_norm_mode", type=str, default="batch",
+        choices=["batch", "instance", "global_teacher"],
+        help="SALT normalization mode. batch preserves current behavior.",
+    )
+    parser.add_argument(
+        "--teacher_stats_max_batches", type=int, default=0,
+        help=(
+            "Maximum batches for global teacher-stat computation. "
+            "0 uses the full training split."
+        ),
+    )
 
     # ------------------------------------------------------------------
     # Two-pass parsing: extract --config first, load YAML, set defaults
@@ -254,11 +283,12 @@ def build_dataloader(args: argparse.Namespace) -> DataLoader:
         split_csv="train.csv",
     )
 
-    # Wrap with dual-view transforms using Retina normalization
+    # Wrap with dual-view transforms using the selected medical preset.
     dual_ds = DualViewDataset(
         base_ds,
-        teacher_transform=get_teacher_transform(dataset="retina"),
-        student_transform=get_student_transform(dataset="retina"),
+        teacher_transform=get_teacher_transform(dataset=args.dataset),
+        student_transform=get_student_transform(dataset=args.dataset),
+        dataset=args.dataset,
     )
 
     loader = DataLoader(
@@ -272,6 +302,7 @@ def build_dataloader(args: argparse.Namespace) -> DataLoader:
     )
 
     print(f"Dataset: {len(base_ds)} images from {args.data_path}")
+    print(f"Preset: {args.dataset}")
     print(f"DataLoader: {len(loader)} batches of {args.batch_size}")
     return loader
 
@@ -471,6 +502,8 @@ def train_one_epoch(
     mu: float = 0.0,
     mask_ratio: float = 0.5,
     grad_clip: float = 0.5,
+    salt_norm_mode: str = "batch",
+    teacher_stats: dict | None = None,
 ) -> tuple:
     """
     Run one epoch of SALT training.
@@ -493,6 +526,13 @@ def train_one_epoch(
     total_enc_std = 0.0
     total_proj_std = 0.0
     total_t_std = 0.0
+    salt_stats_accum = {
+        "teacher_std_mean": 0.0,
+        "teacher_std_min": 0.0,
+        "teacher_std_max": 0.0,
+        "teacher_target_finite": 0.0,
+        "student_centered_finite": 0.0,
+    }
     n_batches = 0
 
     pbar = tqdm(dataloader, desc="  Batches", leave=False, ncols=90)
@@ -512,8 +552,13 @@ def train_one_epoch(
         # Projection head
         s_proj = projector(s_emb)                                        # (B, 196, 768)
 
-        # SALT loss (Cosine distillation + encoder variance guard)
-        loss, align_loss, var_loss = salt_loss(s_proj, t_emb, s_emb)
+        # SALT loss with selected normalization mode.
+        loss, align_loss, var_loss, salt_stats = salt_loss(
+            s_proj, t_emb, s_emb,
+            norm_mode=salt_norm_mode,
+            teacher_stats=teacher_stats,
+            return_stats=True,
+        )
 
         # FedProx proximal term (only when mu > 0)
         if mu > 0 and global_params is not None:
@@ -565,6 +610,11 @@ def train_one_epoch(
         total_enc_std += enc_std
         total_proj_std += proj_std
         total_t_std += t_std
+        salt_stats_accum["teacher_std_mean"] += salt_stats["teacher_std"]["mean"]
+        salt_stats_accum["teacher_std_min"] += salt_stats["teacher_std"]["min"]
+        salt_stats_accum["teacher_std_max"] += salt_stats["teacher_std"]["max"]
+        salt_stats_accum["teacher_target_finite"] += salt_stats["teacher_target"]["finite"]
+        salt_stats_accum["student_centered_finite"] += salt_stats["student_centered"]["finite"]
         n_batches += 1
 
         pbar.set_postfix(
@@ -580,8 +630,22 @@ def train_one_epoch(
     avg_enc_std = total_enc_std / max(1, n_batches)
     avg_proj_std = total_proj_std / max(1, n_batches)
     avg_t_std = total_t_std / max(1, n_batches)
+    avg_salt_stats = {
+        "salt_norm_mode": salt_norm_mode,
+        "teacher_std": {
+            "mean": salt_stats_accum["teacher_std_mean"] / max(1, n_batches),
+            "min": salt_stats_accum["teacher_std_min"] / max(1, n_batches),
+            "max": salt_stats_accum["teacher_std_max"] / max(1, n_batches),
+        },
+        "teacher_target": {
+            "finite": salt_stats_accum["teacher_target_finite"] / max(1, n_batches),
+        },
+        "student_centered": {
+            "finite": salt_stats_accum["student_centered_finite"] / max(1, n_batches),
+        },
+    }
 
-    return avg_loss, avg_align, avg_var, avg_enc_std, avg_proj_std, avg_t_std
+    return avg_loss, avg_align, avg_var, avg_enc_std, avg_proj_std, avg_t_std, avg_salt_stats
 
 
 # ======================================================================
@@ -600,6 +664,8 @@ def main() -> None:
     print(f"  Warmup:     {WARMUP_EPOCHS} epochs (lr/10 -> lr)")
     print(f"  eta_min:    {args.lr * 0.01:.1e} (lr*0.01, cosine floor)")
     print(f"  Grad clip:  {args.grad_clip}")
+    print(f"  Dataset:    {args.dataset}")
+    print(f"  SALT norm:  {args.salt_norm_mode}")
     print(f"  Output:     {args.output_dir}")
     print()
 
@@ -607,6 +673,25 @@ def main() -> None:
     dataloader = build_dataloader(args)
     teacher, student, projector = build_models(args)
     optimizer, scheduler = build_optimizer_and_scheduler(student, projector, args)
+
+    teacher_stats = None
+    if args.salt_norm_mode == "global_teacher":
+        print("[Teacher stats] Computing fixed global teacher mean/std...")
+        teacher_stats = compute_teacher_embedding_stats(
+            teacher, [dataloader], args.device,
+            max_batches=args.teacher_stats_max_batches,
+        )
+        stats_path = os.path.join(args.output_dir, "teacher_stats.pth")
+        os.makedirs(args.output_dir, exist_ok=True)
+        torch.save(teacher_stats, stats_path)
+        summary = teacher_stats_summary(teacher_stats)
+        print(
+            "  [Teacher stats] "
+            f"count={summary['count']} batches={summary['batches']} "
+            f"std_mean={summary['std_mean']:.6f} "
+            f"std_min={summary['std_min']:.6f} "
+            f"std_max={summary['std_max']:.6f}"
+        )
 
     # ----- Resume from checkpoint if available -----
     start_epoch, avg_loss = try_resume(
@@ -719,10 +804,15 @@ def main() -> None:
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
 
-        avg_loss, avg_align, avg_var, avg_enc_std, avg_proj_std, avg_t_std = train_one_epoch(
+        (
+            avg_loss, avg_align, avg_var, avg_enc_std,
+            avg_proj_std, avg_t_std, salt_stats,
+        ) = train_one_epoch(
             teacher, student, projector, dataloader, optimizer, args.device,
             mask_ratio=args.mask_ratio,
             grad_clip=args.grad_clip,  # SCHEDULER FIX 1: use CLI-controlled value
+            salt_norm_mode=args.salt_norm_mode,
+            teacher_stats=teacher_stats,
         )
 
         # --- NaN safety ---
@@ -745,6 +835,7 @@ def main() -> None:
             f"enc_std={avg_enc_std:.4f}  "
             f"proj_std={avg_proj_std:.4f}  "
             f"t_std={avg_t_std:.4f}  "
+            f"salt_tstd={salt_stats['teacher_std']['mean']:.4f}  "
             f"lr={current_lr:.2e}  "
             f"time={elapsed:.1f}s  "
             f"gpu={gpu_mem['gpu_mem_allocated_mb']:.0f}MB"
@@ -753,7 +844,7 @@ def main() -> None:
         # ----- Log to CSV -----
         metrics_logger.log(
             epoch, avg_loss, avg_enc_std, avg_t_std,
-            current_lr, elapsed, gpu_mem,
+            current_lr, elapsed, gpu_mem, salt_stats,
         )
 
         # ----- Collapse warning (on ENCODER output, not projector) -----

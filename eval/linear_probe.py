@@ -246,30 +246,47 @@ class FocalLoss(nn.Module):
     Focal Loss: Down-weights well-classified "easy" examples to focus 100% of 
     the gradient on hard, borderline examples. Extremely useful for class imbalance.
     """
-    def __init__(self, weight=None, gamma=2.0, label_smoothing=0.0):
+    def __init__(self, weight=None, gamma=2.0, label_smoothing=0.0, eps=1e-6):
         super().__init__()
         self.weight = weight
         self.gamma = gamma
         self.label_smoothing = label_smoothing
+        self.eps = eps
 
     def forward(self, inputs, targets):
-        # 1. Calculate standard cross entropy (with label smoothing and class weights)
-        ce_loss = F.cross_entropy(
-            inputs, targets, weight=self.weight, 
-            label_smoothing=self.label_smoothing, reduction='none'
-        )
-        
-        # 2. Get the TRUE probability of the target class. 
-        # (DO NOT use exp(-ce_loss) because class weights and smoothing mathematically distort it).
-        probs = torch.softmax(inputs, dim=1)
+        if inputs.dim() != 2:
+            raise ValueError(f"FocalLoss expects logits shaped (B, C), got {tuple(inputs.shape)}")
+        if not torch.isfinite(inputs).all():
+            raise FloatingPointError("FocalLoss received non-finite logits.")
+
+        log_probs = F.log_softmax(inputs, dim=1)
+        probs = log_probs.exp()
+        num_classes = inputs.size(1)
+
+        if self.label_smoothing > 0:
+            smooth = float(self.label_smoothing)
+            if not 0.0 <= smooth < 1.0:
+                raise ValueError("label_smoothing must be in [0, 1).")
+            with torch.no_grad():
+                target_dist = torch.full_like(log_probs, smooth / num_classes)
+                target_dist.scatter_(
+                    1, targets.view(-1, 1),
+                    1.0 - smooth + (smooth / num_classes),
+                )
+            per_class_loss = -target_dist * log_probs
+            if self.weight is not None:
+                per_class_loss = per_class_loss * self.weight.view(1, -1)
+            ce_loss = per_class_loss.sum(dim=1)
+        else:
+            ce_loss = F.nll_loss(
+                log_probs, targets, weight=self.weight, reduction="none",
+            )
+
         pt = probs.gather(1, targets.view(-1, 1)).squeeze(1)
-        
-        # 3. Apply the focal modulating factor (1 - pt)^gamma.
-        # CRITICAL: Clamp the base to 1e-5 to prevent NaN gradients in PyTorch's 
-        # FP16 autocast when pt == 1.0 (which evaluates to 0.0 ** gamma).
-        focal_term = (torch.clamp(1 - pt, min=1e-5) ** self.gamma)
-        
+        focal_term = torch.clamp(1.0 - pt, min=self.eps).pow(self.gamma)
         focal_loss = focal_term * ce_loss
+        if not torch.isfinite(focal_loss).all():
+            raise FloatingPointError("FocalLoss produced a non-finite loss.")
         return focal_loss.mean()
 
 
@@ -1098,6 +1115,7 @@ def evaluate_finetune(
     num_classes: int,
     device: str,
     class_names: list = None,
+    dataset: str = "retina",
 ) -> tuple:
     """Evaluate fine-tuned encoder + classifier on a DataLoader.
 
@@ -1112,40 +1130,36 @@ def evaluate_finetune(
     all_preds = []
     all_labels = []
     all_probs = []
+    dataset_key = dataset.lower().replace("_", "-")
 
     for images, labels in tqdm(dataloader, desc="  Evaluating", leave=False):
         images = images.to(device, non_blocking=True)
-        
-        # --- Hardware Test-Time Augmentation (TTA) ---
-        # Evaluate multiple spatial views and average the softmax probabilities.
-        # Vertical flips are medically invalid for retinal fundus images (destroys spatial priors).
-        # We use a robust 5-Crop Ensemble: Original + H-Flip + 5% Zoom + Rot(+10) + Rot(-10)
-        
-        # 1. Original
-        probs_orig = torch.softmax(classifier(encoder(images)), dim=1)
-        
-        # 2. Horizontal Flip
-        img_hflip = torch.flip(images, dims=[3])
-        probs_hflip = torch.softmax(classifier(encoder(img_hflip)), dim=1)
-        
-        # 3. Zoom (Crop 95% of center and resize back)
-        B, C, H, W = images.shape
-        crop_h, crop_w = int(H * 0.95), int(W * 0.95)
-        start_y, start_x = (H - crop_h) // 2, (W - crop_w) // 2
-        img_zoom = images[:, :, start_y:start_y+crop_h, start_x:start_x+crop_w]
-        img_zoom = F.interpolate(img_zoom, size=(H, W), mode='bilinear', align_corners=False)
-        probs_zoom = torch.softmax(classifier(encoder(img_zoom)), dim=1)
 
-        # 4. Rotate +10 degrees
-        img_rot_pos = TF.rotate(images, angle=10)
-        probs_rot_pos = torch.softmax(classifier(encoder(img_rot_pos)), dim=1)
+        def _probs(x: torch.Tensor) -> torch.Tensor:
+            logits = classifier(encoder(x))
+            if not torch.isfinite(logits).all():
+                raise FloatingPointError("evaluate_finetune produced non-finite logits.")
+            probs = torch.softmax(logits, dim=1)
+            if not torch.isfinite(probs).all():
+                raise FloatingPointError("evaluate_finetune produced non-finite probabilities.")
+            return probs
 
-        # 5. Rotate -10 degrees
-        img_rot_neg = TF.rotate(images, angle=-10)
-        probs_rot_neg = torch.softmax(classifier(encoder(img_rot_neg)), dim=1)
-        
-        # Average probabilities across all 5 views
-        probs = (probs_orig + probs_hflip + probs_zoom + probs_rot_pos + probs_rot_neg) / 5.0
+        # Dataset-aware tensor-level TTA. COVID chest X-rays are not rotation
+        # invariant, so keep only identity + horizontal flip.
+        probs_list = [_probs(images)]
+        probs_list.append(_probs(torch.flip(images, dims=[3])))
+
+        if dataset_key not in {"covid", "covid-fl", "covidfl"}:
+            B, C, H, W = images.shape
+            crop_h, crop_w = int(H * 0.95), int(W * 0.95)
+            start_y, start_x = (H - crop_h) // 2, (W - crop_w) // 2
+            img_zoom = images[:, :, start_y:start_y+crop_h, start_x:start_x+crop_w]
+            img_zoom = F.interpolate(img_zoom, size=(H, W), mode='bilinear', align_corners=False)
+            probs_list.append(_probs(img_zoom))
+            probs_list.append(_probs(TF.rotate(images, angle=10)))
+            probs_list.append(_probs(TF.rotate(images, angle=-10)))
+
+        probs = torch.stack(probs_list, dim=0).mean(dim=0)
         
         all_preds.append(probs.argmax(dim=1).cpu())
         all_labels.append(labels)
@@ -1523,6 +1537,7 @@ def run_evaluation(
         top1, per_class, cm, all_probs, all_labels = evaluate_finetune(
             encoder, classifier, test_loader,
             args.num_classes, args.device, class_names,
+            dataset=args.dataset,
         )
 
         from sklearn.metrics import roc_auc_score
@@ -1563,6 +1578,7 @@ def run_evaluation(
         top1, per_class, cm, all_probs, all_labels = evaluate_finetune(
             encoder, classifier, test_loader,
             args.num_classes, args.device, class_names,
+            dataset=args.dataset,
         )
 
         # AUC & ROC

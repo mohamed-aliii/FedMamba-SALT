@@ -19,10 +19,60 @@ Reference:
 
 import copy
 from collections import OrderedDict
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+
+
+def find_final_linear_keys(state_dict: Dict[str, torch.Tensor]) -> Tuple[str, Optional[str]]:
+    """Return the final linear weight/bias keys from a classifier state_dict."""
+    final_weight_key = None
+    final_bias_key = None
+    for key in reversed(list(state_dict.keys())):
+        if key.endswith(".weight") and state_dict[key].dim() == 2:
+            final_weight_key = key
+            bias_key = key.replace(".weight", ".bias")
+            if bias_key in state_dict:
+                final_bias_key = bias_key
+            break
+    if final_weight_key is None:
+        raise ValueError("Could not identify final linear layer weight in classifier state_dict.")
+    return final_weight_key, final_bias_key
+
+
+def classifier_head_diagnostics(classifier: nn.Module) -> Dict[str, List[float]]:
+    """Return row-wise weight norms and bias values for the final classifier head."""
+    state = classifier.state_dict()
+    final_weight_key, final_bias_key = find_final_linear_keys(state)
+    weight = state[final_weight_key].detach().float()
+    diag = {
+        "final_weight_key": [final_weight_key],
+        "row_weight_norms": weight.norm(dim=1).cpu().tolist(),
+    }
+    if final_bias_key is not None:
+        bias = state[final_bias_key].detach().float()
+        diag["final_bias_key"] = [final_bias_key]
+        diag["row_biases"] = bias.cpu().tolist()
+        diag["bias_abs_mean"] = [bias.abs().mean().item()]
+    else:
+        diag["final_bias_key"] = []
+        diag["row_biases"] = []
+        diag["bias_abs_mean"] = [0.0]
+    return diag
+
+
+def model_update_norm(global_model: nn.Module, client_model: nn.Module) -> float:
+    """L2 norm of a client's floating-point update relative to the global model."""
+    global_state = global_model.state_dict()
+    client_state = client_model.state_dict()
+    total = torch.tensor(0.0)
+    for key, global_value in global_state.items():
+        if key not in client_state or not global_value.is_floating_point():
+            continue
+        delta = client_state[key].detach().float().cpu() - global_value.detach().float().cpu()
+        total += delta.pow(2).sum()
+    return total.sqrt().item()
 
 
 def average_models(
@@ -124,16 +174,21 @@ def proximal_loss(
     return (mu / 2.0) * penalty
 
 
-def compute_client_weights(client_dataset_sizes: List[int]) -> List[float]:
+def compute_client_weights(client_dataset_sizes: List[int], strategy: str = "size") -> List[float]:
     """
-    Compute FedAvg aggregation weights proportional to dataset size.
+    Compute FedAvg aggregation weights.
 
     Args:
         client_dataset_sizes: List of N integers (number of samples per client).
+        strategy: 'size' for proportional weighting, 'equal' for uniform weighting.
 
     Returns:
         List of N floats summing to 1.0.
     """
+    n_clients = len(client_dataset_sizes)
+    if strategy == "equal":
+        return [1.0 / n_clients for _ in range(n_clients)]
+        
     total = sum(client_dataset_sizes)
     return [s / total for s in client_dataset_sizes]
 
@@ -143,35 +198,37 @@ def average_classifier_class_wise(
     client_classifiers: List[nn.Module],
     client_class_counts: List[Dict[int, int]],
     cls_weights: List[float],
+    shared_weights: Optional[List[float]] = None,
     server_momentum: Optional[Dict[str, torch.Tensor]] = None,
     beta: float = 0.9,
 ) -> None:
     """
-    Class-wise aggregation for the final classification layer to prevent 
-    catastrophic drift from mono-class clients.
-    Non-head layers are aggregated using cls_weights (sanitized) to prevent attention collapse.
+    Class-wise aggregation for the final classification layer to prevent
+    catastrophic drift from clients that do not contain all classes.
+
+    Args:
+        cls_weights: Per-client weights used only for final class rows. A row
+            receives contributions from clients that contain that class,
+            normalized by per-class sample counts.
+        shared_weights: Optional per-client weights for non-final classifier
+            layers. Defaults to cls_weights to preserve the previous behavior.
     """
     global_state = global_classifier.state_dict()
     n_clients = len(client_classifiers)
     
     # 1. Identify the final linear layer keys
-    final_weight_key = None
-    final_bias_key = None
-    for key in reversed(list(global_state.keys())):
-        if key.endswith('.weight') and global_state[key].dim() == 2:
-            final_weight_key = key
-            bias_k = key.replace('.weight', '.bias')
-            if bias_k in global_state:
-                final_bias_key = bias_k
-            break
-            
-    if not final_weight_key:
-        raise ValueError("Could not identify final linear layer weight in classifier state_dict.")
+    final_weight_key, final_bias_key = find_final_linear_keys(global_state)
 
     n_classes = global_state[final_weight_key].shape[0]
+    if shared_weights is None:
+        shared_weights = cls_weights
+    if len(shared_weights) != n_clients:
+        raise ValueError("shared_weights length must match client_classifiers length.")
 
     # Calculate total global samples per class to find the denominator
-    total_samples_per_class = torch.zeros(n_classes)
+    total_samples_per_class = torch.zeros(
+        n_classes, device=global_state[final_weight_key].device,
+    )
     for counts in client_class_counts:
         for cls_idx, count in counts.items():
             total_samples_per_class[cls_idx] += count
@@ -179,17 +236,38 @@ def average_classifier_class_wise(
     # Compute averaged weights in a temporary dictionary
     averaged_state = OrderedDict()
     for key in global_state:
-        averaged_state[key] = torch.zeros_like(global_state[key], dtype=torch.float32)
+        if key == final_weight_key or key == final_bias_key:
+            # Preserve rows for classes absent from every participating client.
+            averaged_state[key] = global_state[key].detach().float().clone()
+        elif global_state[key].is_floating_point():
+            averaged_state[key] = torch.zeros_like(global_state[key], dtype=torch.float32)
+        else:
+            averaged_state[key] = global_state[key].clone()
+
+    present_classes = total_samples_per_class > 0
+    averaged_state[final_weight_key][present_classes] = 0.0
+    if final_bias_key:
+        averaged_state[final_bias_key][present_classes] = 0.0
+
+    shared_total = float(sum(shared_weights))
+    normalized_shared_weights = (
+        [float(w) / shared_total for w in shared_weights]
+        if shared_total > 0 else [0.0 for _ in shared_weights]
+    )
+    if shared_total <= 0:
+        for key in global_state:
+            if key != final_weight_key and key != final_bias_key and global_state[key].is_floating_point():
+                averaged_state[key] = global_state[key].detach().float().clone()
 
     for i in range(n_clients):
         client_state = client_classifiers[i].state_dict()
-        w = cls_weights[i]
+        w = normalized_shared_weights[i]
         
         for key in global_state:
             if key == final_weight_key or key == final_bias_key:
                 # Handled below per-class
                 continue
-            if w > 0:
+            if w > 0 and global_state[key].is_floating_point():
                 averaged_state[key] += w * client_state[key].float()
             
         # Aggregate head per-class

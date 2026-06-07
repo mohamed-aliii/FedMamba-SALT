@@ -83,6 +83,7 @@ class RetinaDataset(Dataset):
         split_csv: str = "train.csv",
         transform: Optional[Callable] = None,
         resize_to: int = 256,
+        label_map: Optional[dict] = None,
     ):
         self.data_path = data_path
         self.phase = phase
@@ -106,7 +107,10 @@ class RetinaDataset(Dataset):
                 if len(parts) < 2:
                     continue
                 try:
-                    self.labels[parts[0]] = int(float(parts[1]))
+                    raw_label = int(float(parts[1]))
+                    if label_map is not None:
+                        raw_label = label_map.get(raw_label, raw_label)
+                    self.labels[parts[0]] = raw_label
                 except ValueError:
                     # Skip a possible CSV header.
                     continue

@@ -162,6 +162,63 @@ def test_loss_is_order_one() -> bool:
     return passed
 
 
+def test_salt_modes_finite_on_edge_batches() -> bool:
+    """SALT modes should stay finite on mixed, mono-style, and low-variance batches."""
+    modes = ["batch", "instance", "global_teacher"]
+    cases = []
+
+    torch.manual_seed(7)
+    cases.append((
+        "mixed",
+        torch.randn(BATCH, DIM, requires_grad=True),
+        torch.randn(BATCH, DIM),
+        torch.randn(BATCH, DIM),
+    ))
+
+    mono_teacher = torch.ones(BATCH, DIM) * 0.5
+    cases.append((
+        "mono",
+        (mono_teacher + torch.randn(BATCH, DIM) * 0.01).requires_grad_(True),
+        mono_teacher,
+        torch.randn(BATCH, DIM),
+    ))
+
+    low_var_teacher = torch.ones(BATCH, DIM) * 2.0 + torch.randn(BATCH, DIM) * 1e-8
+    cases.append((
+        "low_var",
+        torch.randn(BATCH, DIM, requires_grad=True),
+        low_var_teacher,
+        torch.randn(BATCH, DIM) * 1e-4,
+    ))
+
+    all_ok = True
+    for mode in modes:
+        for case_name, student_proj, teacher_emb, student_emb in cases:
+            student_proj = student_proj.detach().clone().requires_grad_(True)
+            teacher_stats = None
+            if mode == "global_teacher":
+                teacher_stats = {
+                    "mean": teacher_emb.mean(dim=0),
+                    "std": teacher_emb.std(dim=0, unbiased=False).clamp_min(1e-6),
+                }
+            loss, _, _, stats = salt_loss(
+                student_proj, teacher_emb, student_emb=student_emb,
+                norm_mode=mode, teacher_stats=teacher_stats,
+                return_stats=True,
+            )
+            loss.backward()
+            ok = (
+                torch.isfinite(loss).item()
+                and student_proj.grad is not None
+                and torch.isfinite(student_proj.grad).all().item()
+                and stats["teacher_std"]["finite"] == 1.0
+            )
+            all_ok = all_ok and ok
+            tag = "PASS" if ok else "FAIL"
+            print(f"  [{tag}] SALT mode={mode} case={case_name} loss={loss.item():.4f}")
+    return all_ok
+
+
 def test_embedding_std_healthy() -> bool:
     embeddings = torch.randn(BATCH, DIM)
     std = embedding_std(embeddings)
@@ -202,6 +259,7 @@ if __name__ == "__main__":
         test_embedding_std_healthy(),
         test_embedding_std_collapsed(),
         test_loss_is_order_one(),
+        test_salt_modes_finite_on_edge_batches(),
     ]
 
     all_results = core_results + bonus_results
@@ -209,7 +267,7 @@ if __name__ == "__main__":
     n_core = sum(core_results)
     n_bonus = sum(bonus_results)
     print(f"  Core:  {n_core}/7 passed")
-    print(f"  Bonus: {n_bonus}/3 passed")
+    print(f"  Bonus: {n_bonus}/4 passed")
     print(f"  Total: {n_core + n_bonus}/{len(all_results)} passed")
     if n_core == 7:
         print("  [OK] All core tests PASSED -- loss function is ready.")

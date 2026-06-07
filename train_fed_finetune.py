@@ -93,6 +93,7 @@ Reference:
 import argparse
 import copy
 import csv
+import json
 import math
 import os
 import sys
@@ -118,7 +119,7 @@ from train_centralized import load_yaml_config, get_gpu_memory_mb
 from utils.ckpt_compat import safe_torch_load
 from utils.fedavg import (
     average_models, broadcast_global_to_clients, compute_client_weights,
-    average_classifier_class_wise,
+    average_classifier_class_wise, classifier_head_diagnostics, model_update_norm,
 )
 from utils.scaffold import (
     init_control_variates, apply_scaffold_correction,
@@ -153,14 +154,13 @@ from eval.linear_probe import (
 # the main() print block always stay in sync.
 # ======================================================================
 METRICS_FILENAME = "fed_finetune_metrics.csv"
-LOSS_PATIENCE    = 20      # early stop if global val_acc doesn't improve
+LOSS_PATIENCE    = 30      # early stop if global val_acc doesn't improve
 ACC_MIN_DELTA    = 0.05    # minimum improvement (%) to reset patience counter
 
 # Round-level LR schedule shared constants
-LR_WARMUP_ROUNDS  = 5      # linear warmup length (rounds)
-LR_FLAT_RATIO     = 0.50   # FedAvg flat-phase fraction of max_rounds
-LR_FLAT_RATIO_FED = 0.50   # FedProx flat-phase fraction 
-                           # Increased from 0.15 to 0.40 to avoid early starvation
+LR_WARMUP_ROUNDS  = 5      # linear warmup length, capped by max_rounds
+LR_FLAT_RATIO     = 0.0    # No flat phase — cosine decay starts immediately (matches SSL-FL)
+LR_FLAT_RATIO_FED = 0.0    # No flat phase — cosine decay starts immediately (matches SSL-FL)
 LR_ETA_MIN_RATIO  = 0.10   # cosine floor = base_lr * this
 
 
@@ -207,6 +207,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--algo", type=str, default="scaffold",
                    choices=["scaffold", "fedavgm", "fedprox", "fedavg"],
                    help="Federated algorithm: scaffold (default), fedavgm, fedprox, fedavg")
+    p.add_argument(
+        "--aggregation_mode", type=str, default="mono_exclusion",
+        choices=["mono_exclusion", "full_encoder", "class_head_only"],
+        help=(
+            "Aggregation evidence mode. mono_exclusion preserves the current "
+            "behavior; full_encoder aggregates the encoder with all client "
+            "weights while classifier shared layers use sanitized weights; "
+            "class_head_only aggregates shared classifier layers with all "
+            "clients and the final head class-wise."
+        ),
+    )
 
     # Training hyper-parameters
     p.add_argument("--batch_size", type=int, default=64,
@@ -242,6 +253,35 @@ def parse_args() -> argparse.Namespace:
         "--use_focal_loss", action="store_true",
         help="Use Focal Loss instead of weighted cross-entropy",
     )
+    p.add_argument("--focal_gamma", type=float, default=2.0)
+    p.add_argument(
+        "--focal_use_class_weights", action="store_true",
+        help="Explicitly apply balanced class weights inside FocalLoss.",
+    )
+    p.add_argument(
+        "--focal_label_smoothing", type=float, default=0.0,
+        help="Explicit label smoothing for FocalLoss. Keep 0 unless tested.",
+    )
+    p.add_argument(
+        "--layer_decay", type=float, default=0.9,
+        help="Layer-wise LR decay factor for the encoder (0.75-0.95). "
+             "Lower values preserve bottom layers more aggressively.",
+    )
+    p.add_argument(
+        "--label_smoothing", type=float, default=0.1,
+        help="Label smoothing factor for CrossEntropyLoss. "
+             "0.1 is standard for noisy medical datasets.",
+    )
+    p.add_argument(
+        "--disable_class_weights", action="store_true",
+        help="Disable balanced class weighting. Recommended for highly non-IID "
+             "federated setups where minority classes cause extreme gradient scaling.",
+    )
+    p.add_argument(
+        "--client_weighting", type=str, choices=["size", "equal"], default="size",
+        help="Aggregation weighting strategy. 'size' weights by dataset size. "
+             "'equal' prevents large datasets from dominating pathological non-IID distributions.",
+    )
 
     # Two-pass config loading
     known, _ = p.parse_known_args()
@@ -251,6 +291,7 @@ def parse_args() -> argparse.Namespace:
         p.set_defaults(**{k: v for k, v in yaml_dict.items() if k in valid_keys})
 
     args = p.parse_args()
+
     if args.data_path is None:
         p.error("--data_path is required (via CLI or YAML config)")
 
@@ -261,6 +302,18 @@ def parse_args() -> argparse.Namespace:
             "Using both simultaneously causes the minority Mixup component to receive "
             "disproportionate focal amplification, destroying gradient stability. "
             "Please enable only one."
+        )
+
+    args.use_fedprox = args.mu > 0.0
+    if args.algo == "fedprox" and not args.use_fedprox:
+        raise ValueError("--algo fedprox requires --mu > 0.")
+    if args.algo == "fedavg" and args.use_fedprox:
+        print("  [config] --mu > 0 with --algo fedavg: treating run as FedProx.")
+        args.algo = "fedprox"
+    if args.use_focal_loss and args.focal_label_smoothing > 0 and not args.focal_use_class_weights:
+        print(
+            "  [criterion] Focal label smoothing is explicitly enabled without "
+            "class weights."
         )
 
     return args
@@ -292,6 +345,8 @@ def build_client_dataloaders(args, train_transform) -> tuple:
             f"CSV files in {args.data_path}/{args.n_clients}_clients/{args.split_type}"
         )
 
+    label_map = getattr(args, '_label_map', None)
+
     for client_id, split_csv in enumerate(split_csvs, start=1):
 
         ds = RetinaDataset(
@@ -300,6 +355,7 @@ def build_client_dataloaders(args, train_transform) -> tuple:
             split_type="federated",
             split_csv=split_csv,
             transform=train_transform,
+            label_map=label_map,
         )
 
         # Stratified label scarcity
@@ -462,12 +518,11 @@ def build_criterion(args, device: str) -> nn.Module:
 
     if args._class_weights_np is not None:
         cw = args._class_weights_np
-        # If the dataset is near-balanced (max weight / min weight < 1.5),
-        # class weighting does more harm than good — the optimizer chases a
-        # 2-3% imbalance signal that is dwarfed by batch noise, causing the
-        # loss surface to oscillate. Use uniform weights instead.
         imbalance_ratio = float(np.max(cw) / np.min(cw))
-        if imbalance_ratio < 1.5:
+        if getattr(args, 'disable_class_weights', False):
+            print(f"  [criterion] Class weights disabled via CLI. Using uniform weights.")
+            cw = np.ones(args.num_classes)
+        elif imbalance_ratio < 1.5:
             print(f"  [criterion] Data near-balanced (ratio={imbalance_ratio:.2f}) "
                   f"→ using uniform class weights (no penalty).")
             cw = np.ones(args.num_classes)
@@ -485,17 +540,30 @@ def build_criterion(args, device: str) -> nn.Module:
     class_weights = torch.tensor(cw, dtype=torch.float32, device=device)
 
     if args.use_focal_loss:
-        # Re-enabled smoothing=0.05 even with mixup to match centralized baseline
-        smoothing = 0.05
-        return FocalLoss(weight=class_weights, gamma=2.0, label_smoothing=smoothing)
+        focal_weight = class_weights if args.focal_use_class_weights else None
+        if focal_weight is None:
+            print("  [criterion] FocalLoss active with uniform alpha (no class weights).")
+        else:
+            print("  [criterion] FocalLoss active with explicit class weights.")
+        if args.focal_label_smoothing > 0:
+            print(
+                f"  [criterion] FocalLoss label_smoothing="
+                f"{args.focal_label_smoothing:.3f} explicitly enabled."
+            )
+        return FocalLoss(
+            weight=focal_weight,
+            gamma=args.focal_gamma,
+            label_smoothing=args.focal_label_smoothing,
+        )
 
     # FIX-3 + FIX-9: ce_smoothing is now actually passed to CrossEntropyLoss.
-    # Re-enabled smoothing=0.05 even with mixup to match centralized baseline.
-    ce_smoothing = 0.05
+    ce_smoothing = getattr(args, 'label_smoothing', 0.1)
+    if args.use_mixup:
+        ce_smoothing = 0.0  # Mixup already produces soft targets
+        print("  [criterion] Mixup active — disabling label smoothing.")
+    print(f"  [criterion] Label smoothing: {ce_smoothing}")
     return nn.CrossEntropyLoss(weight=class_weights, label_smoothing=ce_smoothing)
 
-
-# ======================================================================
 # Local fine-tuning for one client, one round
 # ======================================================================
 def local_train_one_round(
@@ -596,6 +664,14 @@ def local_train_one_round(
                 features = encoder(images, return_patches=False)
 
             logits = classifier(features)
+            if not torch.isfinite(features).all():
+                raise FloatingPointError(
+                    f"Client training produced non-finite features at round {comm_round + 1}."
+                )
+            if not torch.isfinite(logits).all():
+                raise FloatingPointError(
+                    f"Client training produced non-finite logits at round {comm_round + 1}."
+                )
 
             if args.use_mixup:
                 task_loss = mixup_criterion(
@@ -603,17 +679,25 @@ def local_train_one_round(
                 )
             else:
                 task_loss = criterion(logits, labels)
+            if not torch.isfinite(task_loss):
+                raise FloatingPointError(
+                    f"Client training produced non-finite task loss at round {comm_round + 1}."
+                )
 
             # FedProx proximal term — kept separate so logged loss is
             # pure task loss (was total_loss += loss which inflated
             # client losses by the proximal penalty).
-            use_fedprox = (args.mu > 0.0)
+            use_fedprox = getattr(args, "use_fedprox", args.mu > 0.0)
             if global_params is not None and use_fedprox:
                 loss = task_loss + fedprox_penalty(
                     encoder, classifier, global_params, args.mu,
                 )
             else:
                 loss = task_loss
+            if not torch.isfinite(loss):
+                raise FloatingPointError(
+                    f"Client training produced non-finite total loss at round {comm_round + 1}."
+                )
 
             loss.backward()
 
@@ -692,22 +776,27 @@ def evaluate_global(
     unweighted CE which understated loss on hard minority-class samples.
 
     Returns:
-        (val_acc %, val_loss, auc)
+        (val_acc %, weighted_val_ce, auc, diagnostics)
     """
-    from sklearn.metrics import roc_auc_score
+    from sklearn.metrics import (
+        balanced_accuracy_score, precision_recall_fscore_support,
+        roc_auc_score,
+    )
 
     encoder.eval()
     classifier.eval()
-    # FIX-6: weighted CE to match training criterion
-    criterion = nn.CrossEntropyLoss(
-        weight=class_weights.to(device), reduction="mean",
-    )
+    eval_weights = class_weights.to(device)
 
     correct = 0
     total = 0
-    total_loss = 0.0
+    weighted_loss_sum = 0.0
+    weighted_loss_den = 0.0
+    unweighted_loss_sum = 0.0
+    feature_norm_sum = 0.0
+    feature_std_sum = 0.0
     all_probs = []
     all_labels = []
+    all_preds = []
 
     for images, labels in loader:
         images = images.to(device, non_blocking=True)
@@ -719,18 +808,44 @@ def evaluate_global(
             features = encoder(images, return_patches=False)
 
         logits = classifier(features)
-        total_loss += criterion(logits, labels).item()
+        if not torch.isfinite(features).all():
+            raise FloatingPointError("evaluate_global produced non-finite encoder features.")
+        if not torch.isfinite(logits).all():
+            raise FloatingPointError("evaluate_global produced non-finite logits.")
+
+        weighted_loss = F.cross_entropy(
+            logits, labels, weight=eval_weights, reduction="sum",
+        )
+        unweighted_loss = F.cross_entropy(logits, labels, reduction="sum")
+        if not torch.isfinite(weighted_loss) or not torch.isfinite(unweighted_loss):
+            raise FloatingPointError("evaluate_global produced non-finite CE loss.")
+
+        weighted_loss_sum += weighted_loss.item()
+        weighted_loss_den += eval_weights[labels].sum().item()
+        unweighted_loss_sum += unweighted_loss.item()
         probs = torch.softmax(logits, dim=1)
-        correct += (logits.argmax(dim=1) == labels).sum().item()
+        if not torch.isfinite(probs).all():
+            raise FloatingPointError("evaluate_global produced non-finite probabilities.")
+
+        preds = logits.argmax(dim=1)
+        correct += (preds == labels).sum().item()
         total += labels.size(0)
+        feature_diag = features.detach()
+        if feature_diag.dim() == 3:
+            feature_diag = feature_diag.mean(dim=1)
+        feature_norm_sum += feature_diag.float().norm(dim=1).sum().item()
+        feature_std_sum += feature_diag.float().std(dim=0, unbiased=False).mean().item() * labels.size(0)
         all_probs.append(probs.cpu())
         all_labels.append(labels.cpu())
+        all_preds.append(preds.cpu())
 
     val_acc  = 100.0 * correct / max(total, 1)
-    val_loss = total_loss / max(len(loader), 1)
+    val_loss = weighted_loss_sum / max(weighted_loss_den, 1e-12)
+    unweighted_loss = unweighted_loss_sum / max(total, 1)
 
     all_probs_np  = torch.cat(all_probs).numpy()
     all_labels_np = torch.cat(all_labels).numpy()
+    all_preds_np = torch.cat(all_preds).numpy()
 
     try:
         if num_classes == 2:
@@ -743,7 +858,30 @@ def evaluate_global(
     except ValueError:
         auc = 0.0
 
-    return val_acc, val_loss, auc
+    labels_range = list(range(num_classes))
+    _, recall, f1, support = precision_recall_fscore_support(
+        all_labels_np, all_preds_np,
+        labels=labels_range,
+        zero_division=0,
+    )
+    try:
+        balanced_acc = balanced_accuracy_score(all_labels_np, all_preds_np)
+    except ValueError:
+        balanced_acc = 0.0
+
+    pred_hist = np.bincount(all_preds_np, minlength=num_classes).astype(int).tolist()
+    diagnostics = {
+        "unweighted_val_loss": unweighted_loss,
+        "balanced_acc": float(balanced_acc),
+        "per_class_recall": recall.astype(float).tolist(),
+        "per_class_f1": f1.astype(float).tolist(),
+        "per_class_support": support.astype(int).tolist(),
+        "prediction_hist": pred_hist,
+        "feature_norm_mean": feature_norm_sum / max(total, 1),
+        "feature_std_mean": feature_std_sum / max(total, 1),
+    }
+
+    return val_acc, val_loss, auc, diagnostics
 
 
 # ======================================================================
@@ -826,7 +964,12 @@ def try_resume(
 # ======================================================================
 class FedFinetuneLogger:
     BASE_COLS = [
-        "round", "val_acc", "val_loss", "auc",
+        "round", "val_acc", "val_loss_weighted", "val_loss_unweighted",
+        "balanced_acc", "auc",
+        "prediction_hist", "per_class_recall", "per_class_f1",
+        "feature_norm_mean", "feature_std_mean",
+        "head_weight_norms", "head_biases",
+        "encoder_update_norms", "classifier_update_norms",
         "enc_lr", "cls_lr", "round_time_s", "gpu_mb",
     ]
 
@@ -838,11 +981,25 @@ class FedFinetuneLogger:
                 csv.writer(f).writerow(cols)
 
     def log(self, comm_round, val_acc, val_loss, auc,
-            enc_lr, cls_lr, round_time, gpu_mb, client_losses):
+            enc_lr, cls_lr, round_time, gpu_mb, client_losses,
+            eval_diag, head_diag, encoder_update_norms, classifier_update_norms):
         with open(self.path, "a", newline="") as f:
             row = [
                 comm_round + 1,
-                f"{val_acc:.2f}", f"{val_loss:.6f}", f"{auc:.4f}",
+                f"{val_acc:.2f}",
+                f"{val_loss:.6f}",
+                f"{eval_diag.get('unweighted_val_loss', 0.0):.6f}",
+                f"{eval_diag.get('balanced_acc', 0.0):.6f}",
+                f"{auc:.4f}",
+                json.dumps(eval_diag.get("prediction_hist", [])),
+                json.dumps(eval_diag.get("per_class_recall", [])),
+                json.dumps(eval_diag.get("per_class_f1", [])),
+                f"{eval_diag.get('feature_norm_mean', 0.0):.6f}",
+                f"{eval_diag.get('feature_std_mean', 0.0):.6f}",
+                json.dumps(head_diag.get("row_weight_norms", [])),
+                json.dumps(head_diag.get("row_biases", [])),
+                json.dumps(encoder_update_norms),
+                json.dumps(classifier_update_norms),
                 f"{enc_lr:.2e}", f"{cls_lr:.2e}",
                 f"{round_time:.1f}", f"{gpu_mb:.0f}",
             ] + [f"{cl:.6f}" for cl in client_losses]
@@ -886,37 +1043,46 @@ def collect_all_labels(client_loaders) -> np.ndarray:
 
 
 
-# FIX-2: mu is now actually used to select the flat-phase ratio so that
-# FedProx gets a shorter flat phase (15% vs 30%) and more cosine budget,
-# as the original docstring always claimed but never implemented.
+# FIX-2: mu is now actually used to select the flat-phase ratio.
 # FIX-7: uses module-level constants so main() print block stays in sync.
 # ======================================================================
+def get_round_lr_phase_lengths(max_rounds: int, mu: float) -> tuple[int, int, int]:
+    """Return bounded ``(warmup, flat, cosine)`` round counts."""
+    total_rounds = max(1, int(max_rounds))
+    warmup_rounds = min(LR_WARMUP_ROUNDS, total_rounds)
+    remaining_rounds = max(0, total_rounds - warmup_rounds)
+
+    flat_ratio = LR_FLAT_RATIO_FED if mu > 0 else LR_FLAT_RATIO
+    flat_rounds = min(remaining_rounds, int(remaining_rounds * flat_ratio))
+    cosine_rounds = remaining_rounds - flat_rounds
+    return warmup_rounds, flat_rounds, cosine_rounds
+
+
 def compute_round_lr(comm_round: int, max_rounds: int, base_lr: float,
                      mu: float) -> float:
     """
-    Three-phase LR schedule:
-      Phase 1 — Warmup (0 → LR_WARMUP_ROUNDS):   lr/WARMUP_ROUNDS → lr  (linear)
-      Phase 2 — Flat   (WARMUP → FLAT_ROUNDS):    lr               (constant)
-      Phase 3 — Cosine (FLAT_ROUNDS → max_rounds): lr → eta_min
-
-    FIX-2: FedProx (mu > 0) previously used a shorter flat phase, but we 
-    now use 40% uniformly to allow the model to learn before decaying.
+    Three-phase LR schedule with phase lengths capped to ``max_rounds``:
+      Phase 1: linear warmup to ``base_lr``.
+      Phase 2: flat at ``base_lr``.
+      Phase 3: cosine decay to ``eta_min``.
     """
-    # FIX-2: choose flat-phase ratio based on whether FedProx is active
-    flat_ratio  = LR_FLAT_RATIO_FED if mu > 0 else LR_FLAT_RATIO
-    FLAT_ROUNDS = LR_WARMUP_ROUNDS + int(max_rounds * flat_ratio)
-    eta_min     = base_lr * LR_ETA_MIN_RATIO
+    warmup_rounds, flat_rounds, cosine_rounds = get_round_lr_phase_lengths(
+        max_rounds, mu,
+    )
+    flat_end = warmup_rounds + flat_rounds
+    eta_min = base_lr * LR_ETA_MIN_RATIO
 
-    if comm_round < LR_WARMUP_ROUNDS:
-        return base_lr * (comm_round + 1) / LR_WARMUP_ROUNDS
-    elif comm_round < FLAT_ROUNDS:
+    if comm_round < warmup_rounds:
+        return base_lr * (comm_round + 1) / max(warmup_rounds, 1)
+    elif comm_round < flat_end:
         return base_lr
-    else:
-        t_cur   = comm_round - FLAT_ROUNDS
-        T_decay = max(1, max_rounds - FLAT_ROUNDS)
-        return eta_min + 0.5 * (base_lr - eta_min) * (
-            1 + math.cos(math.pi * t_cur / T_decay)
-        )
+    elif cosine_rounds <= 1:
+        return eta_min
+
+    t_cur = min(comm_round - flat_end, cosine_rounds - 1)
+    return eta_min + 0.5 * (base_lr - eta_min) * (
+        1 + math.cos(math.pi * t_cur / (cosine_rounds - 1))
+    )
 
 
 # ======================================================================
@@ -925,6 +1091,8 @@ def compute_round_lr(comm_round: int, max_rounds: int, base_lr: float,
 def main() -> None:
     args = parse_args()
     algo_name = args.algo.upper()
+    if args.use_fedprox and args.algo != "fedprox":
+        algo_name = f"{algo_name}+FEDPROX"
     mode_label = (
         "Federated Full Fine-tune" if args.mode == "federated_finetune"
         else "Federated Linear Probe"
@@ -943,12 +1111,24 @@ def main() -> None:
     print(f"  E_epoch:        {args.E_epoch}")
     print(f"  Algorithm:      {args.algo}")
     print(f"  mu (FedProx):   {args.mu}")
+    print(f"  FedProx active: {args.use_fedprox}")
+    print(f"  Aggregation:    {args.aggregation_mode}")
     print(f"  Batch size:     {args.batch_size}")
     print(f"  LR:             {args.lr}")
     print(f"  Label fraction: {args.label_fraction:.0%}")
     print(f"  Mixup:          {args.use_mixup}")
     print(f"  Focal Loss:     {args.use_focal_loss}")
+    print(f"  Layer decay:    {args.layer_decay}")
+    print(f"  Label smooth:   {args.label_smoothing}")
     print(f"  Output:         {args.output_dir}")
+
+    # ------------------------------------------------------------------
+    # 2-class COVID-FL label mapping
+    # ------------------------------------------------------------------
+    args._label_map = None
+    if args.dataset == 'covidfl' and args.num_classes == 2:
+        args._label_map = {0: 0, 1: 0, 2: 1}
+        print(f"  [2-CLASS] Mapping labels: Normal(0)->0, Pneumonia(1)->0, COVID(2)->1")
     print()
 
     # ------------------------------------------------------------------
@@ -962,7 +1142,7 @@ def main() -> None:
     eval_transform = get_eval_transform(dataset=args.dataset)  # CHANGE 1: Use args.dataset
 
     client_loaders, dataset_sizes = build_client_dataloaders(args, train_transform)
-    client_weights = compute_client_weights(dataset_sizes)
+    client_weights = compute_client_weights(dataset_sizes, strategy=args.client_weighting)
     print(f"  Client weights: {[f'{w:.3f}' for w in client_weights]}")
 
     # CHANGE 1: Compute client_class_counts for class-wise classifier aggregation
@@ -1001,9 +1181,74 @@ def main() -> None:
     # CRITICAL FIX: Renormalize the remaining weights to sum to 1.0
     if len(mono_clients) > 0:
         print(f"  [Classifier] Excluded {len(mono_clients)} mono-class clients from aggregation...")
-        cls_weights = cls_weights / cls_weights.sum()  # <--- THIS PREVENTS THE DECAY
+        if cls_weights.sum() > 0:
+            cls_weights = cls_weights / cls_weights.sum()  # <--- THIS PREVENTS THE DECAY
+        else:
+            print("  [Classifier] WARNING: every client is mono-class; preserving full client weights.")
+            cls_weights = np.array(client_weights, copy=True)
     
     cls_weights = cls_weights.tolist()
+
+    # ------------------------------------------------------------------
+    # Auto-detect: if mono-class clients hold >50% of ANY class, the
+    # mono_exclusion policy would discard the majority of that class's
+    # encoder learning. Switch to full_encoder automatically.
+    # ------------------------------------------------------------------
+    if args.aggregation_mode == "mono_exclusion" and len(mono_clients) > 0:
+        all_class_totals = {}
+        mono_class_totals = {}
+        for i, counts in enumerate(client_class_counts):
+            for cls_idx, count in counts.items():
+                all_class_totals[cls_idx] = all_class_totals.get(cls_idx, 0) + count
+                if i in mono_clients:
+                    mono_class_totals[cls_idx] = mono_class_totals.get(cls_idx, 0) + count
+
+        dominated = []
+        for cls_idx in sorted(all_class_totals):
+            total = all_class_totals[cls_idx]
+            mono_count = mono_class_totals.get(cls_idx, 0)
+            if total > 0 and mono_count / total > 0.50:
+                dominated.append((cls_idx, mono_count, total))
+
+        if dominated:
+            print("  [AUTO-DETECT] Mono-class clients hold >50% of data for:")
+            for cls_idx, mono_count, total in dominated:
+                pct = 100.0 * mono_count / total
+                print(f"    Class {cls_idx}: {mono_count}/{total} samples "
+                      f"({pct:.1f}%) from mono-class clients")
+
+            # If ALL classes are dominated by mono-class clients, excluding
+            # them from the classifier leaves only a tiny, biased subset.
+            # Switch to class_head_only so the classifier also sees all clients.
+            if len(dominated) == args.num_classes:
+                print("  [AUTO-DETECT] ALL classes dominated by mono-class clients!")
+                print("  [AUTO-DETECT] Overriding aggregation_mode: "
+                      "mono_exclusion -> class_head_only")
+                print("  [AUTO-DETECT] Both encoder AND classifier aggregate "
+                      "ALL clients; final head is class-wise (safe)")
+                args.aggregation_mode = "class_head_only"
+            else:
+                print("  [AUTO-DETECT] Overriding aggregation_mode: "
+                      "mono_exclusion -> full_encoder")
+                print("  [AUTO-DETECT] Encoder aggregates ALL clients; "
+                      "classifier shared layers still exclude mono-class (safe)")
+                args.aggregation_mode = "full_encoder"
+
+    if args.aggregation_mode == "mono_exclusion":
+        encoder_agg_weights = cls_weights
+        classifier_shared_weights = cls_weights
+    elif args.aggregation_mode == "full_encoder":
+        encoder_agg_weights = client_weights
+        classifier_shared_weights = cls_weights
+    elif args.aggregation_mode == "class_head_only":
+        encoder_agg_weights = client_weights
+        classifier_shared_weights = client_weights
+    else:
+        raise ValueError(f"Unknown aggregation_mode={args.aggregation_mode}")
+    print(f"  Aggregation mode: {args.aggregation_mode}")
+    print(f"    Encoder weights:           {[f'{w:.3f}' for w in encoder_agg_weights]}")
+    print(f"    Classifier shared weights: {[f'{w:.3f}' for w in classifier_shared_weights]}")
+    print(f"    Class-wise head weights:   per-class sample counts")
 
     # FIX-12: compute balanced class weights from the actual federated label
     # distribution so build_criterion doesn't rely on the hardcoded [1.0, 2.0].
@@ -1027,6 +1272,7 @@ def main() -> None:
         split_type="central",
         split_csv="test.csv",
         transform=eval_transform,
+        label_map=getattr(args, '_label_map', None),
     )
     class_names = test_ds.classes
     test_loader = DataLoader(
@@ -1067,7 +1313,7 @@ def main() -> None:
             # Count number of blocks to set decay factor
             # Use split('blocks.')[1] to handle prefixes like 'encoder.blocks.0.weight'
             depth = max([int(n.split('blocks.')[1].split('.')[0]) for n, p in enc.named_parameters() if 'blocks.' in n and p.requires_grad] + [0]) + 1
-            llrd_decay = 0.9  # CHANGE 2: Increased from 0.75 to 0.85 so early layers don't vanish
+            llrd_decay = args.layer_decay
             
             groups = {}
             for name, param in enc.named_parameters():
@@ -1093,7 +1339,7 @@ def main() -> None:
                 groups[layer_id].append(param)
             
             # Base encoder LR (for top layer) is args.lr / 50.0 (prevents feature destruction) 
-            base_enc_lr = args.lr / 50.0  # CHANGE 1: Hard-capped to 50.0 to prevent representation tear
+            base_enc_lr = args.lr / 100.0  # Conservative: prevent pre-trained feature destruction
             
             for layer_id in sorted(groups.keys()):
                 # layer depth+1 gets scale=1.0
@@ -1163,7 +1409,7 @@ def main() -> None:
     # then fine-tune" curriculum in transfer learning.
     # Skipped on resume (start_round > 0) and in linear_probe mode.
     # ------------------------------------------------------------------
-    PROBE_ROUNDS = 0 if freeze_encoder else 3
+    PROBE_ROUNDS = 0 if freeze_encoder else 10
 
     if PROBE_ROUNDS > 0 and start_round == 0:
         print(f"\n  [Warm-start] Freezing encoder for {PROBE_ROUNDS} head-only "
@@ -1198,7 +1444,8 @@ def main() -> None:
                 probe_accs.append(tacc)
 
             average_classifier_class_wise(
-                global_classifier, client_classifiers, client_class_counts, cls_weights
+                global_classifier, client_classifiers, client_class_counts,
+                cls_weights, shared_weights=classifier_shared_weights,
             )  # CHANGE 3: Use class-wise aggregation for probe
             broadcast_global_to_clients(global_classifier, client_classifiers)
 
@@ -1219,23 +1466,32 @@ def main() -> None:
     # ------------------------------------------------------------------
     # FIX-7: derive schedule description from module-level constants so
     # it always matches what compute_round_lr actually computes.
-    flat_ratio_used = LR_FLAT_RATIO_FED if args.mu > 0 else LR_FLAT_RATIO
-    _flat_r = LR_WARMUP_ROUNDS + int(args.max_rounds * flat_ratio_used)
+    _warmup_r, _flat_len, _cosine_len = get_round_lr_phase_lengths(
+        args.max_rounds, args.mu,
+    )
+    _schedule_label = ""
+    if args.use_fedprox:
+        _schedule_label = (
+            " [FedProx short-flat]"
+            if LR_FLAT_RATIO_FED < LR_FLAT_RATIO else " [FedProx]"
+        )
 
     print(f"[4/4] Starting federated fine-tuning from round {start_round}...")
     print(f"  Round-level LR schedule (classifier / encoder):")
-    print(f"    warmup={LR_WARMUP_ROUNDS}r | flat={_flat_r - LR_WARMUP_ROUNDS}r "
-          f"| cosine={args.max_rounds - _flat_r}r "
+    print(f"    warmup={_warmup_r}r | flat={_flat_len}r "
+          f"| cosine={_cosine_len}r "
           f"| eta_min={args.lr * LR_ETA_MIN_RATIO:.1e}"
-          + (" [FedProx short-flat]" if args.mu > 0 else ""))
+          + _schedule_label)
     print(f"    classifier: {args.lr:.1e} → {args.lr * LR_ETA_MIN_RATIO:.1e}")
-    print(f"    encoder:    {args.lr/10.0:.1e} → {args.lr/10.0 * LR_ETA_MIN_RATIO:.1e}")
+    print(f"    encoder:    {args.lr/100.0:.1e} → {args.lr/100.0 * LR_ETA_MIN_RATIO:.1e}")
     print(f"  Early stopping: no improvement for {LOSS_PATIENCE} rounds "
           f"(threshold >{ACC_MIN_DELTA:.2f}%)")
     print("=" * 60)
 
     # best_acc is populated by try_resume() so we don't overwrite previous best
     best_round        = None   # FIX-8: None signals "no improvement yet"
+    # FIX-15: on resume, reset patience so the model isn't immediately killed
+    # by the LR schedule jumping back to the flat phase.
     rounds_no_improve = 0
     history = {
         "round": [], "val_acc": [], "val_loss": [],
@@ -1252,7 +1508,7 @@ def main() -> None:
 
     # Initialize SCAFFOLD control variates (only used when algo=scaffold)
     use_scaffold = (args.algo == "scaffold")
-    use_fedprox = (args.mu > 0.0)
+    use_fedprox = args.use_fedprox
     use_fedavgm = (args.algo == "fedavgm")
     SCAFFOLD_WARMUP = 10  # plain FedAvg for first 10 rounds (LR warmup + post-probe ramp)
     c_global = None
@@ -1264,31 +1520,17 @@ def main() -> None:
         print(f"  [SCAFFOLD] Initialized control variates for {args.n_clients} clients")
         print(f"  [SCAFFOLD] Corrections activate at round {SCAFFOLD_WARMUP} (after LR warmup)")
 
-    # FIX-14: after the warm-start probe the classifier is oriented but the
-    # encoder has been frozen. Applying full enc_lr immediately in round 1
-    # disrupts the head's learned direction (train_acc regresses ~4% vs probe).
-    # Solution: add an extra per-round encoder damping factor that starts at
-    # POST_PROBE_FACTOR and linearly reaches 1.0 after POST_PROBE_RAMP rounds.
-    # This is multiplicative on top of the normal round-level schedule so the
-    # two warmup mechanisms compose cleanly.
-    POST_PROBE_FACTOR = 0.1   # encoder starts at 10% of its scheduled LR
-    POST_PROBE_RAMP   = 5     # reaches 100% by round 5
+    # Encoder LR: use lr/100 as base — much more conservative than lr/50
+    # to prevent destroying pre-trained features that already give 81%.
+    ENC_LR_RATIO = 100.0
 
     for comm_round in range(start_round, args.max_rounds):
         round_start = time.time()
 
         # ---- Compute current LR ----
         current_lr = compute_round_lr(comm_round, args.max_rounds, args.lr, args.mu)
-        # Encoder gets lr/5; classifier gets full lr (mirrors _make_optimizer)
         cls_lr = current_lr
-
-        # FIX-14: post-probe encoder damping
-        if PROBE_ROUNDS > 0 and comm_round < POST_PROBE_RAMP:
-            # Bypass the double-warmup by scaling directly off the target base
-            post_probe_scale = 0.1 + 0.9 * (comm_round / max(POST_PROBE_RAMP - 1, 1))  # CHANGE 3: Starts at 10% instead of 0%
-            enc_lr = (args.lr / 50.0) * post_probe_scale  # CHANGE 1: Match _make_optimizer ratio (50.0)
-        else:
-            enc_lr = (current_lr / 50.0)  # CHANGE 1: Match _make_optimizer ratio (50.0)
+        enc_lr = current_lr / ENC_LR_RATIO
 
         # ---- Snapshot global params (needed for FedProx and SCAFFOLD) ----
         global_params = None
@@ -1344,24 +1586,32 @@ def main() -> None:
         if scaffold_active and all_delta_c:
             update_server_control_variate(c_global, all_delta_c, args.n_clients)
 
+        encoder_update_norms = [
+            model_update_norm(global_encoder, client_encoders[i])
+            for i in range(args.n_clients)
+        ]
+        classifier_update_norms = [
+            model_update_norm(global_classifier, client_classifiers[i])
+            for i in range(args.n_clients)
+        ]
+
         # ---- Model aggregation ----
-        average_models(global_encoder,    client_encoders,    cls_weights,
+        average_models(global_encoder,    client_encoders,    encoder_agg_weights,
                        server_momentum=server_momentum_enc)
-        average_classifier_class_wise(
-            global_classifier, client_classifiers, client_class_counts, cls_weights,
-            server_momentum=server_momentum_cls
-        )  # CHANGE 2: Use class-wise aggregation for the classifier head
+        average_models(global_classifier, client_classifiers, classifier_shared_weights,
+                       server_momentum=server_momentum_cls)
 
         # ---- Broadcast back ----
         broadcast_global_to_clients(global_encoder,    client_encoders)
         broadcast_global_to_clients(global_classifier, client_classifiers)
 
         # ---- Global evaluation ----
-        val_acc, val_loss, val_auc = evaluate_global(
+        val_acc, val_loss, val_auc, eval_diag = evaluate_global(
             global_encoder, global_classifier,
             test_loader, args.device, args.num_classes,
             eval_class_weights,         # FIX-6: pass weights
         )
+        head_diag = classifier_head_diagnostics(global_classifier)
 
         round_time = time.time() - round_start
         gpu_mb     = get_gpu_memory_mb()["gpu_mem_allocated_mb"]
@@ -1414,6 +1664,7 @@ def main() -> None:
         logger.log(
             comm_round, val_acc, val_loss, val_auc,
             enc_lr, cls_lr, round_time, gpu_mb, client_losses,
+            eval_diag, head_diag, encoder_update_norms, classifier_update_norms,
         )
 
         # ---- Console output ----
@@ -1427,7 +1678,8 @@ def main() -> None:
         print(
             f"  Round [{comm_round + 1:3d}/{args.max_rounds}]  "
             f"train_acc={avg_train_acc:.2f}%  val={val_acc:.2f}%  auc={val_auc:.4f}  "
-            f"val_loss={val_loss:.4f}  "
+            f"val_loss={val_loss:.4f}/{eval_diag['unweighted_val_loss']:.4f}  "
+            f"bal={eval_diag['balanced_acc']:.3f}  pred={eval_diag['prediction_hist']}  "
             f"enc_lr={enc_lr:.1e}  cls_lr={cls_lr:.1e}  "
             f"time={round_time:.1f}s  {client_loss_str}{marker}"
         )
@@ -1462,6 +1714,7 @@ def main() -> None:
     top1, per_class, cm, all_probs, all_labels = evaluate_finetune(
         global_encoder, global_classifier,
         test_loader, args.num_classes, args.device, class_names,
+        dataset=args.dataset,
     )
 
     # AUC on TTA predictions

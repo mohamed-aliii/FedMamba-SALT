@@ -162,7 +162,7 @@ class DualViewDataset(Dataset):
         base_dataset: Dataset,
         teacher_transform: Optional[Callable] = None,
         student_transform: Optional[Callable] = None,
-        dataset: str = "retina",
+        dataset: str = "imagenet",
     ):
         self.base_dataset = base_dataset
         dataset_key = dataset.lower().replace("_", "-")

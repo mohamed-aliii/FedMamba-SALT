@@ -35,6 +35,7 @@ Reference:
 import argparse
 import copy
 import csv
+import json
 import math
 import os
 import sys
@@ -59,8 +60,10 @@ from train_centralized import (
 from utils.ckpt_compat import safe_torch_load
 from utils.fedavg import (
     average_models, broadcast_global_to_clients, compute_client_weights,
+    model_update_norm,
 )
 from utils.data_splits import discover_client_split_csvs
+from utils.teacher_stats import compute_teacher_embedding_stats, teacher_stats_summary
 
 
 # ======================================================================
@@ -120,6 +123,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--mask_ratio", type=float, default=0.5,
                         help="Internal latent masking ratio for student")
+    parser.add_argument(
+        "--salt_norm_mode", type=str, default="batch",
+        choices=["batch", "instance", "global_teacher"],
+        help="SALT normalization mode. batch preserves current behavior.",
+    )
+    parser.add_argument(
+        "--teacher_stats_max_batches", type=int, default=0,
+        help=(
+            "Maximum batches for global teacher-stat computation. "
+            "0 uses every client batch."
+        ),
+    )
 
     # Two-pass config loading (same pattern as train_centralized.py)
     known, _ = parser.parse_known_args()
@@ -295,7 +310,11 @@ class FedMetricsLogger:
     # columns regardless of n_clients, causing mismatches for any other client count.
     # The per-instance __init__ now builds the full column list dynamically.
     BASE_COLUMNS = [
-        "round", "avg_loss", "avg_enc_std", "lr",
+        "round", "avg_loss", "avg_enc_std", "avg_teacher_std",
+        "salt_norm_mode", "salt_teacher_std_mean", "salt_teacher_std_min",
+        "salt_teacher_std_max", "salt_teacher_target_finite",
+        "salt_student_centered_finite", "student_update_norms",
+        "projector_update_norms", "lr",
         "round_time_s", "gpu_mb",
     ]
 
@@ -310,14 +329,49 @@ class FedMetricsLogger:
             with open(self.path, "w", newline="") as f:
                 csv.writer(f).writerow(cols)
 
-    def log(self, round_num, avg_loss, avg_enc_std, lr,
-            round_time, gpu_mb, client_losses):
+    def log(self, round_num, avg_loss, avg_enc_std, avg_teacher_std, lr,
+            round_time, gpu_mb, client_losses, salt_stats,
+            student_update_norms, projector_update_norms):
+        teacher_std = salt_stats.get("teacher_std", {})
+        teacher_target = salt_stats.get("teacher_target", {})
+        student_centered = salt_stats.get("student_centered", {})
         with open(self.path, "a", newline="") as f:
             row = [
                 round_num + 1, f"{avg_loss:.6f}", f"{avg_enc_std:.4f}",
+                f"{avg_teacher_std:.4f}",
+                salt_stats.get("salt_norm_mode", ""),
+                f"{teacher_std.get('mean', 0.0):.6f}",
+                f"{teacher_std.get('min', 0.0):.6f}",
+                f"{teacher_std.get('max', 0.0):.6f}",
+                f"{teacher_target.get('finite', 0.0):.3f}",
+                f"{student_centered.get('finite', 0.0):.3f}",
+                json.dumps(student_update_norms),
+                json.dumps(projector_update_norms),
                 f"{lr:.2e}", f"{round_time:.1f}", f"{gpu_mb:.0f}",
             ] + [f"{cl:.6f}" for cl in client_losses]
             csv.writer(f).writerow(row)
+
+
+def _weighted_salt_stats(stats_list, weights):
+    if not stats_list:
+        return {}
+    out = {
+        "salt_norm_mode": stats_list[0].get("salt_norm_mode", ""),
+        "teacher_std": {},
+        "teacher_target": {},
+        "student_centered": {},
+    }
+    for section, keys in {
+        "teacher_std": ["mean", "min", "max"],
+        "teacher_target": ["finite"],
+        "student_centered": ["finite"],
+    }.items():
+        for key in keys:
+            out[section][key] = sum(
+                float(w) * float(stats.get(section, {}).get(key, 0.0))
+                for stats, w in zip(stats_list, weights)
+            )
+    return out
 
 
 # ======================================================================
@@ -339,6 +393,7 @@ def main():
     print(f"  Batch size: {args.batch_size}")
     print(f"  LR:         {args.lr}")
     print(f"  Grad clip:  {args.grad_clip}")
+    print(f"  SALT norm:  {args.salt_norm_mode}")
     print(f"  Device:     {args.device}")
     print(f"  Output:     {args.output_dir}")
     print()
@@ -354,6 +409,25 @@ def main():
 
     print("[2/4] Building models...")
     teacher, global_student, global_projector = build_models(args)
+
+    teacher_stats = None
+    if args.salt_norm_mode == "global_teacher":
+        print("[Teacher stats] Computing fixed global teacher mean/std across clients...")
+        teacher_stats = compute_teacher_embedding_stats(
+            teacher, client_loaders, args.device,
+            max_batches=args.teacher_stats_max_batches,
+        )
+        stats_path = os.path.join(args.output_dir, "teacher_stats.pth")
+        os.makedirs(args.output_dir, exist_ok=True)
+        torch.save(teacher_stats, stats_path)
+        summary = teacher_stats_summary(teacher_stats)
+        print(
+            "  [Teacher stats] "
+            f"count={summary['count']} batches={summary['batches']} "
+            f"std_mean={summary['std_mean']:.6f} "
+            f"std_min={summary['std_min']:.6f} "
+            f"std_max={summary['std_max']:.6f}"
+        )
 
     # ----- Resume -----
     start_round, resume_state = try_resume_fed(
@@ -452,6 +526,8 @@ def main():
         round_start = time.time()
         client_losses = []
         client_enc_stds = []
+        client_t_stds = []
+        client_salt_stats = []
 
         # Snapshot global params for FedProx (before any client trains)
         if args.mu > 0:
@@ -529,12 +605,27 @@ def main():
                     mu=args.mu,
                     mask_ratio=current_mask_ratio,
                     grad_clip=args.grad_clip,
+                    salt_norm_mode=args.salt_norm_mode,
+                    teacher_stats=teacher_stats,
                 )
                 avg_loss = metrics[0]
                 avg_enc_std = metrics[3]
+                avg_t_std = metrics[5]
+                salt_stats = metrics[6]
 
             client_losses.append(avg_loss)
             client_enc_stds.append(avg_enc_std)
+            client_t_stds.append(avg_t_std)
+            client_salt_stats.append(salt_stats)
+
+        student_update_norms = [
+            model_update_norm(global_student, client_students[i])
+            for i in range(args.n_clients)
+        ]
+        projector_update_norms = [
+            model_update_norm(global_projector, client_projectors[i])
+            for i in range(args.n_clients)
+        ]
 
         # ----- FedAvg aggregation -----
         average_models(global_student, client_students, client_weights)
@@ -552,6 +643,10 @@ def main():
         round_enc_std = sum(
             w * s for w, s in zip(client_weights, client_enc_stds)
         )
+        round_t_std = sum(
+            w * s for w, s in zip(client_weights, client_t_stds)
+        )
+        round_salt_stats = _weighted_salt_stats(client_salt_stats, client_weights)
         round_time = time.time() - round_start
         gpu = get_gpu_memory_mb()
 
@@ -614,6 +709,8 @@ def main():
             f"  Round [{comm_round + 1:3d}/{args.max_rounds}]  "
             f"loss={round_loss:.4f}  "
             f"enc_std={round_enc_std:.4f}  "
+            f"t_std={round_t_std:.4f}  "
+            f"salt_tstd={round_salt_stats.get('teacher_std', {}).get('mean', 0.0):.4f}  "
             f"lr={current_lr:.2e}  "
             f"time={round_time:.1f}s  "
             f"{client_loss_str}"
@@ -621,9 +718,10 @@ def main():
         )
 
         logger.log(
-            comm_round, round_loss, round_enc_std,
+            comm_round, round_loss, round_enc_std, round_t_std,
             current_lr,
             round_time, gpu["gpu_mem_allocated_mb"], client_losses,
+            round_salt_stats, student_update_norms, projector_update_norms,
         )
 
         # ----- Save checkpoint -----

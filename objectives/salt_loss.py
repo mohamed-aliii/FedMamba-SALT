@@ -40,6 +40,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+SALT_NORM_MODES = ("batch", "instance", "global_teacher")
+
 
 # ======================================================================
 # Projection Head (BYOL-style 3-layer MLP)
@@ -84,7 +86,7 @@ def variance_loss(
     Per-dimension variance penalty to prevent encoder collapse.
     Applied to the RAW encoder output (before the projection head).
     """
-    s_std = encoder_embeddings.std(dim=0)
+    s_std = encoder_embeddings.std(dim=0, unbiased=False)
     return F.relu(target_std - s_std).mean()
 
 
@@ -126,6 +128,90 @@ def covariance_loss(embeddings: torch.Tensor) -> torch.Tensor:
     return off_diag / (D * D)
 
 
+def _canonical_norm_mode(norm_mode: str) -> str:
+    mode = norm_mode.lower().replace("-", "_")
+    aliases = {
+        "global": "global_teacher",
+        "global_stats": "global_teacher",
+        "teacher_global": "global_teacher",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in SALT_NORM_MODES:
+        raise ValueError(
+            f"Unknown SALT norm_mode={norm_mode!r}. "
+            f"Expected one of {SALT_NORM_MODES}."
+        )
+    return mode
+
+
+def _broadcast_stat(stat: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Broadcast a saved teacher statistic to ``target`` shape."""
+    stat = stat.to(device=target.device, dtype=target.dtype)
+    while stat.dim() < target.dim():
+        stat = stat.unsqueeze(0)
+    return stat
+
+
+def _finite_summary(tensor: torch.Tensor) -> dict:
+    values = tensor.detach().float()
+    finite = torch.isfinite(values)
+    if not finite.any():
+        return {
+            "mean": float("nan"),
+            "std": float("nan"),
+            "min": float("nan"),
+            "max": float("nan"),
+            "finite": 0.0,
+        }
+    values = values[finite]
+    return {
+        "mean": values.mean().item(),
+        "std": values.std(unbiased=False).item(),
+        "min": values.min().item(),
+        "max": values.max().item(),
+        "finite": finite.float().mean().item(),
+    }
+
+
+def _salt_normalize(
+    student_proj: torch.Tensor,
+    teacher_emb: torch.Tensor,
+    norm_mode: str,
+    teacher_stats: dict | None,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return student residuals, teacher targets, and teacher std tensor."""
+    mode = _canonical_norm_mode(norm_mode)
+
+    if mode == "batch":
+        # Modified behavior to prevent non-IID local batch mean from destroying class boundaries.
+        # We now use LayerNorm-style (instance-level) centering over features (dim=-1).
+        t_centered = teacher_emb - teacher_emb.mean(dim=-1, keepdim=True)
+        s_centered = student_proj - student_proj.mean(dim=-1, keepdim=True)
+        t_std = t_centered.std(dim=-1, keepdim=True, unbiased=False).clamp_min(eps)
+        return s_centered, t_centered / t_std, t_std
+
+    if mode == "instance":
+        # Evidence-gated option: no cross-sample batch statistics.
+        t_centered = teacher_emb - teacher_emb.mean(dim=-1, keepdim=True)
+        s_centered = student_proj - student_proj.mean(dim=-1, keepdim=True)
+        t_std = t_centered.std(dim=-1, keepdim=True, unbiased=False).clamp_min(eps)
+        return s_centered, t_centered / t_std, t_std
+
+    if teacher_stats is None or "mean" not in teacher_stats or "std" not in teacher_stats:
+        raise ValueError(
+            "SALT norm_mode='global_teacher' requires teacher_stats with "
+            "'mean' and 'std' tensors."
+        )
+
+    t_mean = _broadcast_stat(teacher_stats["mean"], teacher_emb)
+    t_std = _broadcast_stat(teacher_stats["std"], teacher_emb).clamp_min(eps)
+    t_target = (teacher_emb - t_mean) / t_std
+    # Avoid local batch-stat leakage on the student side in this mode.
+    s_centered = student_proj - student_proj.mean(dim=-1, keepdim=True)
+    return s_centered, t_target, t_std
+
+
 # ======================================================================
 # SALT loss function (Centered & Standardised MSE Distillation)
 # ======================================================================
@@ -135,6 +221,10 @@ def salt_loss(
     student_emb: torch.Tensor = None,
     lambda_var: float = 1.0,
     lambda_cov: float = 0.04,
+    norm_mode: str = "batch",
+    teacher_stats: dict | None = None,
+    eps: float = 1e-6,
+    return_stats: bool = False,
 ) -> tuple:
     """
     Centered & Standardised MSE Distillation for FedMamba-SALT.
@@ -159,9 +249,19 @@ def salt_loss(
         student_emb:  ``(B, D)`` or ``(B, N, D)`` raw encoder output (before proj head).
         lambda_var:   Weight for the variance penalty.
         lambda_cov:   Weight for the covariance penalty.
+        norm_mode:    ``batch`` keeps the current SALT behavior; ``instance``
+                      normalizes per sample/token over features; ``global_teacher``
+                      uses fixed teacher mean/std statistics supplied via
+                      ``teacher_stats``.
+        teacher_stats: Dict with ``mean`` and ``std`` tensors for global-teacher
+                       mode. Dense patch stats may be shaped ``(N, D)`` or
+                       ``(1, N, D)``.
+        eps:          Minimum teacher std for division.
+        return_stats: If True, append a diagnostics dict to the return tuple.
 
     Returns:
-        Tuple of ``(total_loss, align_loss, var_loss)``.
+        Tuple of ``(total_loss, align_loss, var_loss)``. If ``return_stats`` is
+        True, returns ``(total_loss, align_loss, var_loss, stats)``.
     """
     # --- Handle dense patch distillation (B, N, D) -> (B*N, D) ---
     # For variance_loss we need image-level features (GAP of patches)
@@ -174,16 +274,13 @@ def salt_loss(
     # --- Detach the teacher ---
     teacher_emb = teacher_emb.detach()
 
-    # --- Center both across the batch dimension (dim=0) ---
-    # If inputs are (B, N, D), this subtracts the patch-specific mean across the batch.
-    # This isolates patient-to-patient variance and removes massive spatial variance.
-    t_centered = teacher_emb - teacher_emb.mean(dim=0, keepdim=True)
-    s_centered = student_proj - student_proj.mean(dim=0, keepdim=True)
-
-    # --- Standardise teacher residuals ---
-    # t_centered now only contains inter-patient variance.
-    t_std = t_centered.std(dim=0, keepdim=True) + 1e-6  # FIX: strictly across batch dimension
-    t_target = t_centered / t_std
+    s_centered, t_target, t_std = _salt_normalize(
+        student_proj=student_proj,
+        teacher_emb=teacher_emb,
+        norm_mode=norm_mode,
+        teacher_stats=teacher_stats,
+        eps=eps,
+    )
 
     # --- Flatten for MSE alignment and Covariance penalty if dense distillation ---
     if s_centered.dim() == 3:
@@ -214,6 +311,28 @@ def salt_loss(
     # --- Total loss ---
     total_loss = total_align + (lambda_var * var_loss_val)
 
+    if not torch.isfinite(total_loss):
+        stats = {
+            "salt_norm_mode": _canonical_norm_mode(norm_mode),
+            "teacher_std": _finite_summary(t_std),
+            "teacher_target": _finite_summary(t_target_f32),
+            "student_centered": _finite_summary(s_centered_f32),
+        }
+        raise FloatingPointError(f"SALT produced a non-finite loss: {stats}")
+
+    if return_stats:
+        stats = {
+            "salt_norm_mode": _canonical_norm_mode(norm_mode),
+            "teacher_std": _finite_summary(t_std),
+            "teacher_target": _finite_summary(t_target_f32),
+            "student_centered": _finite_summary(s_centered_f32),
+            "encoder_embedding": (
+                _finite_summary(student_emb_for_var)
+                if student_emb_for_var is not None else None
+            ),
+        }
+        return total_loss, total_align, var_loss_val, stats
+
     return total_loss, total_align, var_loss_val
 
 
@@ -237,5 +356,4 @@ def embedding_std(embeddings: torch.Tensor) -> float:
     """
     if embeddings.dim() == 3:
         embeddings = embeddings.flatten(0, 1)
-    return embeddings.std(dim=0).mean().item()
-
+    return embeddings.std(dim=0, unbiased=False).mean().item()
