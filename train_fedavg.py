@@ -596,8 +596,8 @@ def main():
             for pg in optimizer.param_groups:
                 pg["lr"] = current_lr
 
-            # Curriculum Masking: Start at 10%, increment by 10% every 50 rounds, cap at target mask_ratio
-            current_mask_ratio = min(args.mask_ratio, 0.10 + 0.10 * (comm_round // 50))
+            # Curriculum Masking: Start at 10%, increment by 10% every 10 rounds, cap at target mask_ratio
+            current_mask_ratio = min(args.mask_ratio, 0.10 + 0.10 * (comm_round // 10))
 
             # Local E epochs
             for local_epoch in range(args.E_epoch):
