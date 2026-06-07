@@ -402,7 +402,13 @@ def load_encoder(ckpt_path: str, device: str, freeze: bool) -> InceptionMambaEnc
 
     print(f"[Encoder] Detected architecture: embed_dim={embed_dim}, depth={depth}")
 
-    encoder = InceptionMambaEncoder()
+    encoder = InceptionMambaEncoder(
+        patch_size=4,             # Standard CNN embedding
+        depths=[2, 2, 4, 2],      # 4 stages ensures hierarchical downsampling
+        dims=[96, 192, 384, 768], # Feature pyramid matching the 4 stages
+        out_dim=768,              # Must match ViT-B/16 representation dimension
+        drop_path_rate=0.1
+    )
 
     encoder.load_state_dict(state_dict)
     print(f"[Encoder] Loaded weights from: {ckpt_path}")

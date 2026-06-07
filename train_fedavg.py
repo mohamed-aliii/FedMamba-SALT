@@ -212,7 +212,13 @@ def build_models(args):
 
     # The student uses the restored 4-stage hierarchical InceptionMambaEncoder.
     # It outputs a (B, 768) GAP vector to distill from the frozen ViT's CLS token.
-    student = InceptionMambaEncoder().to(args.device)
+    student = InceptionMambaEncoder(
+        patch_size=4,             # Standard CNN embedding
+        depths=[2, 2, 4, 2],      # 4 stages ensures hierarchical downsampling
+        dims=[96, 192, 384, 768], # Feature pyramid matching the 4 stages
+        out_dim=768,              # Must match ViT-B/16 representation dimension
+        drop_path_rate=0.1
+    ).to(args.device)
 
     projector = ProjectionHead(
         in_dim=768, hidden_dim=2048, out_dim=768,

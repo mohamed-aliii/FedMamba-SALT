@@ -322,10 +322,15 @@ def build_models(args: argparse.Namespace):
         )
     teacher = FrozenViTTeacher(ckpt_path=args.teacher_ckpt).to(args.device)
 
-    # Student: paper-aligned InceptionMamba block, adapted for SALT.
-    # We use 16x16 patches and no patch merging to preserve the 196-token
-    # ViT-B/16 grid, then project each token to the teacher's 768-dim space.
-    student = InceptionMambaEncoder().to(args.device)
+    # Student: Restored 4-stage hierarchical InceptionMambaEncoder.
+    # It outputs a (B, 768) GAP vector to distill from the frozen ViT's CLS token.
+    student = InceptionMambaEncoder(
+        patch_size=4,             # Standard CNN embedding
+        depths=[2, 2, 4, 2],      # 4 stages ensures hierarchical downsampling
+        dims=[96, 192, 384, 768], # Feature pyramid matching the 4 stages
+        out_dim=768,              # Must match ViT-B/16 representation dimension
+        drop_path_rate=0.1
+    ).to(args.device)
 
 
     # Projection head: BYOL-style MLP (LayerNorm, federated-safe)
