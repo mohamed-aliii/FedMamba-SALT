@@ -119,7 +119,7 @@ from train_centralized import load_yaml_config, get_gpu_memory_mb
 from utils.ckpt_compat import safe_torch_load
 from utils.fedavg import (
     average_models, broadcast_global_to_clients, compute_client_weights,
-    average_classifier_class_wise, classifier_head_diagnostics, model_update_norm,
+    classifier_head_diagnostics, model_update_norm,
 )
 from utils.scaffold import (
     init_control_variates, apply_scaffold_correction,
@@ -1443,10 +1443,9 @@ def main() -> None:
                 probe_losses.append(loss)
                 probe_accs.append(tacc)
 
-            average_classifier_class_wise(
-                global_classifier, client_classifiers, client_class_counts,
-                cls_weights, shared_weights=classifier_shared_weights,
-            )  # CHANGE 3: Use class-wise aggregation for probe
+            average_models(
+                global_classifier, client_classifiers, classifier_shared_weights
+            )
             broadcast_global_to_clients(global_classifier, client_classifiers)
 
             avg_probe_acc = sum(
