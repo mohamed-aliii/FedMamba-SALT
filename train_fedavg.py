@@ -210,9 +210,8 @@ def build_models(args):
         )
     teacher = FrozenViTTeacher(ckpt_path=args.teacher_ckpt).to(args.device)
 
-    # InceptionMamba block from Huang et al. is kept, while the outer scaffold
-    # is adapted for SALT: 16x16 patches, no patch merging, 196 dense tokens,
-    # and a 768-dim output to match the frozen MAE ViT-B/16 teacher.
+    # The student uses the restored 4-stage hierarchical InceptionMambaEncoder.
+    # It outputs a (B, 768) GAP vector to distill from the frozen ViT's CLS token.
     student = InceptionMambaEncoder().to(args.device)
 
     projector = ProjectionHead(

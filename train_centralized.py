@@ -542,13 +542,13 @@ def train_one_epoch(
         # ----- Pure FP32 Forward Pass -----
         # Teacher embedding (frozen, no gradient)
         with torch.no_grad():
-            t_emb = teacher(teacher_view, return_patches=True)            # (B, 196, 768)
+            t_emb = teacher(teacher_view, return_patches=False)            # (B, 768)
 
         # Student embedding with Internal Latent Masking (50% tokens dropped)
-        s_emb = student(student_view, return_patches=True, mask_ratio=mask_ratio)                # (B, 196, 768)
+        s_emb = student(student_view, return_patches=False, mask_ratio=mask_ratio)                # (B, 768)
         
         # Projection head
-        s_proj = projector(s_emb)                                        # (B, 196, 768)
+        s_proj = projector(s_emb)                                        # (B, 768)
 
         # SALT loss with selected normalization mode.
         loss, align_loss, var_loss, salt_stats = salt_loss(
