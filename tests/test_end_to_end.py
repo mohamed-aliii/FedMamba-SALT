@@ -50,9 +50,7 @@ def test_end_to_end() -> bool:
 
     print("  [1/8] Instantiating models...")
     teacher = FrozenViTTeacher.for_testing().to(DEVICE)
-    student = InceptionMambaEncoder(
-        patch_size=16, embed_dim=256, depth=4, out_dim=768,
-    ).to(DEVICE)
+    student = InceptionMambaEncoder().to(DEVICE)
     projector = ProjectionHead(
         in_dim=768, hidden_dim=2048, out_dim=768,
     ).to(DEVICE)

@@ -325,9 +325,7 @@ def build_models(args: argparse.Namespace):
     # Student: paper-aligned InceptionMamba block, adapted for SALT.
     # We use 16x16 patches and no patch merging to preserve the 196-token
     # ViT-B/16 grid, then project each token to the teacher's 768-dim space.
-    student = InceptionMambaEncoder(
-        patch_size=16, embed_dim=448, depth=6, out_dim=768,
-    ).to(args.device)
+    student = InceptionMambaEncoder().to(args.device)
 
 
     # Projection head: BYOL-style MLP (LayerNorm, federated-safe)

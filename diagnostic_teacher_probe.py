@@ -266,9 +266,7 @@ def main():
         
         print(f"  [Encoder] Detected architecture: embed_dim={embed_dim}, depth={depth}")
         
-        encoder = InceptionMambaEncoder(
-            patch_size=16, embed_dim=embed_dim, depth=depth, out_dim=768,
-        )
+        encoder = InceptionMambaEncoder()
         encoder.load_state_dict(state_dict)
         encoder = encoder.to(device)
         encoder.eval()

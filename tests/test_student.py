@@ -41,12 +41,7 @@ def _count_trainable(model: torch.nn.Module) -> int:
 
 def _build_encoder() -> InceptionMambaEncoder:
     """Build the same encoder configuration used by training and the notebook."""
-    return InceptionMambaEncoder(
-        patch_size=PATCH_SIZE,
-        embed_dim=EMBED_DIM,
-        depth=DEPTH,
-        out_dim=OUT_DIM,
-    ).to(DEVICE)
+    return InceptionMambaEncoder().to(DEVICE)
 
 
 # =====================================================================

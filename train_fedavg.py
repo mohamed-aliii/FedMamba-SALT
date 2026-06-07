@@ -213,9 +213,7 @@ def build_models(args):
     # InceptionMamba block from Huang et al. is kept, while the outer scaffold
     # is adapted for SALT: 16x16 patches, no patch merging, 196 dense tokens,
     # and a 768-dim output to match the frozen MAE ViT-B/16 teacher.
-    student = InceptionMambaEncoder(
-        patch_size=16, embed_dim=448, depth=6, out_dim=768,
-    ).to(args.device)
+    student = InceptionMambaEncoder().to(args.device)
 
     projector = ProjectionHead(
         in_dim=768, hidden_dim=2048, out_dim=768,
