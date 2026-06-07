@@ -1338,8 +1338,8 @@ def main() -> None:
                     groups[layer_id] = []
                 groups[layer_id].append(param)
             
-            # Base encoder LR (for top layer) is args.lr / 50.0 (prevents feature destruction) 
-            base_enc_lr = args.lr / 100.0  # Conservative: prevent pre-trained feature destruction
+            # Uniform LR: fine-tune the encoder at the same rate as the classifier
+            base_enc_lr = args.lr
             
             for layer_id in sorted(groups.keys()):
                 # layer depth+1 gets scale=1.0
@@ -1453,17 +1453,13 @@ def main() -> None:
         print(f"  [SCAFFOLD] Initialized control variates for {args.n_clients} clients")
         print(f"  [SCAFFOLD] Corrections activate at round {SCAFFOLD_WARMUP} (after LR warmup)")
 
-    # Encoder LR: use lr/100 as base — much more conservative than lr/50
-    # to prevent destroying pre-trained features that already give 81%.
-    ENC_LR_RATIO = 100.0
-
     for comm_round in range(start_round, args.max_rounds):
         round_start = time.time()
 
         # ---- Compute current LR ----
         current_lr = compute_round_lr(comm_round, args.max_rounds, args.lr, args.mu)
         cls_lr = current_lr
-        enc_lr = current_lr / ENC_LR_RATIO
+        enc_lr = current_lr
 
         # ---- Snapshot global params (needed for FedProx and SCAFFOLD) ----
         global_params = None
