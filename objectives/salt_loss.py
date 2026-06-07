@@ -274,6 +274,12 @@ def salt_loss(
     # --- Detach the teacher ---
     teacher_emb = teacher_emb.detach()
 
+    # --- Pool for Global Semantic Distillation (BEFORE NORMALIZATION) ---
+    if student_proj.dim() == 3:
+        student_proj = student_proj.mean(dim=1)
+    if teacher_emb.dim() == 3:
+        teacher_emb = teacher_emb.mean(dim=1)
+
     s_centered, t_target, t_std = _salt_normalize(
         student_proj=student_proj,
         teacher_emb=teacher_emb,
@@ -282,13 +288,6 @@ def salt_loss(
         eps=eps,
     )
 
-    # --- Pool for Global Semantic Distillation ---
-    # Apply Global Average Pooling over the token/patch dimension (dim=1)
-    # This aligns the hierarchical student (49 patches) with the isotropic teacher (196 patches)
-    if s_centered.dim() == 3:
-        s_centered = s_centered.mean(dim=1)  # Pools (B, N, D) -> (B, D)
-    if t_target.dim() == 3:
-        t_target = t_target.mean(dim=1)      # Pools (B, N, D) -> (B, D)
 
     # Force float32 for loss computation to prevent FP16 overflow
     s_centered_f32 = s_centered.float()
