@@ -208,14 +208,15 @@ def parse_args() -> argparse.Namespace:
                    choices=["scaffold", "fedavgm", "fedprox", "fedavg"],
                    help="Federated algorithm: scaffold (default), fedavgm, fedprox, fedavg")
     p.add_argument(
-        "--aggregation_mode", type=str, default="mono_exclusion",
-        choices=["mono_exclusion", "full_encoder", "class_head_only"],
+        "--aggregation_mode", type=str, default="fedavg",
+        choices=["mono_exclusion", "full_encoder", "class_head_only", "fedavg"],
         help=(
             "Aggregation evidence mode. mono_exclusion preserves the current "
             "behavior; full_encoder aggregates the encoder with all client "
             "weights while classifier shared layers use sanitized weights; "
             "class_head_only aggregates shared classifier layers with all "
-            "clients and the final head class-wise."
+            "clients and the final head class-wise. fedavg uses standard "
+            "FedAvg for the entire model."
         ),
     )
 
@@ -1224,6 +1225,9 @@ def main() -> None:
         encoder_agg_weights = client_weights
         classifier_shared_weights = cls_weights
     elif args.aggregation_mode == "class_head_only":
+        encoder_agg_weights = client_weights
+        classifier_shared_weights = client_weights
+    elif args.aggregation_mode == "fedavg":
         encoder_agg_weights = client_weights
         classifier_shared_weights = client_weights
     else:
