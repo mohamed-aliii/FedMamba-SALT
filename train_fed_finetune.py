@@ -1076,6 +1076,7 @@ def main() -> None:
         algo_name = f"{algo_name}+FEDPROX"
     mode_label = (
         "Federated Full Fine-tune" if args.mode == "federated_finetune"
+        else "Federated Branch Protect" if args.mode == "federated_branch_protect"
         else "Federated Linear Probe"
     )
     freeze_encoder = (args.mode == "federated_linear_probe")
@@ -1322,8 +1323,9 @@ def main() -> None:
                     groups[layer_id] = []
                 groups[layer_id].append(param)
             
-            # Uniform LR: fine-tune the encoder at the same rate as the classifier
-            base_enc_lr = args.lr
+            # FIX: The encoder MUST be fine-tuned at a much lower learning rate
+            # than the randomly initialized classifier to prevent catastrophic forgetting.
+            base_enc_lr = args.lr / 100.0
             
             for layer_id in sorted(groups.keys()):
                 # layer depth+1 gets scale=1.0
@@ -1443,7 +1445,7 @@ def main() -> None:
         # ---- Compute current LR ----
         current_lr = compute_round_lr(comm_round, args.max_rounds, args.lr, args.mu)
         cls_lr = current_lr
-        enc_lr = current_lr
+        enc_lr = current_lr / 100.0
 
         # ---- Snapshot global params (needed for FedProx and SCAFFOLD) ----
         global_params = None
