@@ -476,6 +476,35 @@ def fedprox_penalty(encoder, classifier, global_params: dict, mu: float) -> torc
 # ======================================================================
 # Loss function factory
 # ======================================================================
+class MaskedBCELoss(nn.Module):
+    """
+    Independent Sigmoids with Loss Masking to prevent Softmax Gradient Starvation.
+    If a client does not possess a class, the BCE loss for that class is forced to 0.0,
+    preventing the model from pushing its weights towards negative infinity.
+    """
+    def __init__(self, weight=None):
+        super().__init__()
+        self.weight = weight
+        self.present_classes = None
+        
+    def forward(self, logits, targets):
+        if targets.dim() == 1:
+            targets_one_hot = torch.nn.functional.one_hot(targets, num_classes=logits.size(1)).float()
+        else:
+            targets_one_hot = targets.float()
+            
+        loss_per_class = torch.nn.functional.binary_cross_entropy_with_logits(
+            logits, targets_one_hot, weight=self.weight, reduction='none'
+        )
+        
+        if self.present_classes is not None:
+            mask = self.present_classes.unsqueeze(0).to(logits.device).float()
+            loss_per_class = loss_per_class * mask
+            valid_classes = mask.sum().clamp(min=1)
+            return loss_per_class.sum() / (logits.size(0) * valid_classes)
+        else:
+            return loss_per_class.mean()
+
 def build_criterion(args, device: str) -> nn.Module:
     """
     Build the training loss.
@@ -523,30 +552,8 @@ def build_criterion(args, device: str) -> nn.Module:
 
     class_weights = torch.tensor(cw, dtype=torch.float32, device=device)
 
-    if args.use_focal_loss:
-        focal_weight = class_weights if args.focal_use_class_weights else None
-        if focal_weight is None:
-            print("  [criterion] FocalLoss active with uniform alpha (no class weights).")
-        else:
-            print("  [criterion] FocalLoss active with explicit class weights.")
-        if args.focal_label_smoothing > 0:
-            print(
-                f"  [criterion] FocalLoss label_smoothing="
-                f"{args.focal_label_smoothing:.3f} explicitly enabled."
-            )
-        return FocalLoss(
-            weight=focal_weight,
-            gamma=args.focal_gamma,
-            label_smoothing=args.focal_label_smoothing,
-        )
-
-    # FIX-3 + FIX-9: ce_smoothing is now actually passed to CrossEntropyLoss.
-    ce_smoothing = getattr(args, 'label_smoothing', 0.1)
-    if args.use_mixup:
-        ce_smoothing = 0.0  # Mixup already produces soft targets
-        print("  [criterion] Mixup active — disabling label smoothing.")
-    print(f"  [criterion] Label smoothing: {ce_smoothing}")
-    return nn.CrossEntropyLoss(weight=class_weights, label_smoothing=ce_smoothing)
+    print(f"  [criterion] Using MaskedBCELoss to prevent Softmax collapse.")
+    return MaskedBCELoss(weight=class_weights)
 
 # Local fine-tuning for one client, one round
 # ======================================================================
@@ -797,12 +804,14 @@ def evaluate_global(
         if not torch.isfinite(logits).all():
             raise FloatingPointError("evaluate_global produced non-finite logits.")
 
-        weighted_loss = F.cross_entropy(
-            logits, labels, weight=eval_weights, reduction="sum",
+        # Use BCE to match the MaskedBCELoss training objective
+        labels_one_hot = F.one_hot(labels, num_classes=logits.size(1)).float()
+        weighted_loss = F.binary_cross_entropy_with_logits(
+            logits, labels_one_hot, weight=eval_weights, reduction="sum",
         )
-        unweighted_loss = F.cross_entropy(logits, labels, reduction="sum")
+        unweighted_loss = F.binary_cross_entropy_with_logits(logits, labels_one_hot, reduction="sum")
         if not torch.isfinite(weighted_loss) or not torch.isfinite(unweighted_loss):
-            raise FloatingPointError("evaluate_global produced non-finite CE loss.")
+            raise FloatingPointError("evaluate_global produced non-finite BCE loss.")
 
         weighted_loss_sum += weighted_loss.item()
         weighted_loss_den += eval_weights[labels].sum().item()
@@ -824,8 +833,9 @@ def evaluate_global(
         all_preds.append(preds.cpu())
 
     val_acc  = 100.0 * correct / max(total, 1)
-    val_loss = weighted_loss_sum / max(weighted_loss_den, 1e-12)
-    unweighted_loss = unweighted_loss_sum / max(total, 1)
+    # Mean BCE loss across all batch elements and classes
+    val_loss = weighted_loss_sum / max(total * num_classes, 1)
+    unweighted_loss = unweighted_loss_sum / max(total * num_classes, 1)
 
     all_probs_np  = torch.cat(all_probs).numpy()
     all_labels_np = torch.cat(all_labels).numpy()
@@ -1477,6 +1487,15 @@ def main() -> None:
             scaffold_active = use_scaffold and comm_round >= SCAFFOLD_WARMUP
             if scaffold_active:
                 scaffold_state = (c_global, c_clients[cid])
+
+            # Apply loss masking for missing classes
+            if isinstance(criterion, MaskedBCELoss):
+                counts = client_class_counts[cid]
+                present_mask = torch.zeros(args.num_classes, dtype=torch.bool)
+                for c_idx, c_qty in counts.items():
+                    if c_qty > 0:
+                        present_mask[c_idx] = True
+                criterion.present_classes = present_mask
 
             loss, tacc, accumulated_grads = local_train_one_round(
                 enc, cls, client_loaders[cid], opt,
