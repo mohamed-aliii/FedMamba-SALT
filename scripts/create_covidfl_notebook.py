@@ -410,8 +410,9 @@ cmd = (
     f" --E_epoch {FED_FT_E_EPOCH}"
     f" --lr 3.75e-4"
     f" --batch_size {FED_FT_BATCH_SIZE}"
-    f" --mode {FED_FT_MODE}"
+    f" --mode federated_branch_protect"
     f" --algo {FED_FT_ALGO}"
+    f" --client_weighting equal"
     f" --mu {FED_FT_MU}"
     f" {mixup_flag} {focal_flag}"
 )
@@ -431,6 +432,7 @@ import shutil
 TTA_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "eval_tta")
 os.makedirs(TTA_OUTPUT_DIR, exist_ok=True)
 
+FED_FT_MODE = "federated_branch_protect"
 fed_ft_mode = globals().get("FED_FT_MODE", "federated_finetune")
 fed_ft_local_dir = globals().get("EVAL_FED_FT_DIR", os.path.join(OUTPUT_DIR, f"eval_{fed_ft_mode}"))
 fed_ft_drive_dir = os.path.join(DRIVE_OUTPUT, f"eval_{fed_ft_mode}")

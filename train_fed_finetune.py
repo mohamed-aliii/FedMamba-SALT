@@ -237,9 +237,10 @@ def parse_args() -> argparse.Namespace:
     # Evaluation
     p.add_argument(
         "--mode", type=str, default="federated_finetune",
-        choices=["federated_finetune", "federated_linear_probe"],
+        choices=["federated_finetune", "federated_linear_probe", "federated_branch_protect"],
         help="federated_finetune: encoder + classifier both train; "
-             "federated_linear_probe: encoder frozen, only classifier trains",
+             "federated_linear_probe: encoder frozen, only classifier trains; "
+             "federated_branch_protect: entire SSM branch frozen, Inception branch trains",
     )
     p.add_argument(
         "--label_fraction", type=float, default=1.0,
@@ -413,6 +414,14 @@ def build_models(args):
 
     # Use standard GAP + Linear for both fine-tuning and linear probe
     encoder = base_encoder  # already on device
+
+    if args.mode == "federated_branch_protect":
+        for name, param in encoder.named_parameters():
+            # Freeze the entire sequence branch to prevent covariate shift
+            # into the delicate ODE selective mechanisms.
+            if "ssm_branch" in name:
+                param.requires_grad = False
+
     classifier = nn.Sequential(
         nn.BatchNorm1d(feat_dim),
         nn.Dropout(0.2),
@@ -524,12 +533,14 @@ def build_criterion(args, device: str) -> nn.Module:
 
     class_weights = torch.tensor(cw, dtype=torch.float32, device=device)
 
-    if args.use_focal_loss:
-        print(f"  [criterion] FocalLoss (gamma=2)")
-        return FocalLoss(weight=class_weights, gamma=2.0)
+    ls = args.label_smoothing if not getattr(args, 'use_mixup', False) else 0.0
+
+    if getattr(args, 'use_focal_loss', False):
+        print(f"  [criterion] FocalLoss (gamma=2, label_smoothing={ls})")
+        return FocalLoss(weight=class_weights, gamma=2.0, label_smoothing=ls)
     
-    print(f"  [criterion] CrossEntropyLoss")
-    return nn.CrossEntropyLoss(weight=class_weights)
+    print(f"  [criterion] CrossEntropyLoss (label_smoothing={ls})")
+    return nn.CrossEntropyLoss(weight=class_weights, label_smoothing=ls)
 
 # Local fine-tuning for one client, one round
 # ======================================================================
