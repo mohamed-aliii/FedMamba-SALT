@@ -118,8 +118,12 @@ from models.inception_mamba import InceptionMambaEncoder
 from train_centralized import load_yaml_config, get_gpu_memory_mb
 from utils.ckpt_compat import safe_torch_load
 from utils.fedavg import (
-    average_models, broadcast_global_to_clients, compute_client_weights,
-    classifier_head_diagnostics, model_update_norm,
+    average_models,
+    average_classifier_class_wise,
+    classifier_head_diagnostics,
+    compute_client_weights,
+    model_update_norm,
+    broadcast_global_to_clients
 )
 from utils.scaffold import (
     init_control_variates, apply_scaffold_correction,
@@ -423,7 +427,7 @@ def build_models(args):
                 param.requires_grad = False
 
     classifier = nn.Sequential(
-        nn.BatchNorm1d(feat_dim),
+        nn.LayerNorm(feat_dim),
         nn.Dropout(0.2),
         nn.Linear(feat_dim, args.num_classes),
     ).to(args.device)
@@ -1513,8 +1517,17 @@ def main() -> None:
         # ---- Model aggregation ----
         average_models(global_encoder,    client_encoders,    encoder_agg_weights,
                        server_momentum=server_momentum_enc)
+        
+        # Standard average for classifier first (handles LayerNorm/BatchNorm buffers/weights safely)
         average_models(global_classifier, client_classifiers, classifier_shared_weights,
                        server_momentum=server_momentum_cls)
+        
+        # Overwrite final nn.Linear layer row-by-row using true class presence
+        if args.aggregation_mode == "class_head_only":
+            average_classifier_class_wise(
+                global_classifier, client_classifiers,
+                client_class_counts, args.num_classes
+            )
 
         # ---- Broadcast back ----
         broadcast_global_to_clients(global_encoder,    client_encoders)

@@ -1,3 +1,4 @@
+
 """
 utils/fedavg.py -- FedAvg / FedProx utilities for FedMamba-SALT.
 
@@ -193,3 +194,67 @@ def compute_client_weights(client_dataset_sizes: List[int], strategy: str = "siz
     return [s / total for s in client_dataset_sizes]
 
 
+def average_classifier_class_wise(
+    global_model: nn.Module,
+    client_models: List[nn.Module],
+    client_class_counts: List[Dict[int, int]],
+    num_classes: int
+) -> None:
+    """
+    Performs true row-wise aggregation for the final linear layer.
+    Each row `c` is aggregated only using clients that have samples for class `c`.
+    The weight for client `k` on row `c` is proportional to its sample count: N_{k,c} / N_{global,c}.
+    """
+    global_state = global_model.state_dict()
+    n_clients = len(client_models)
+    
+    # 1. Identify final linear layer keys
+    final_weight_key, final_bias_key = find_final_linear_keys(global_state)
+    
+    # 2. Compute global totals for each class
+    global_class_totals = {c: 0 for c in range(num_classes)}
+    for counts in client_class_counts:
+        for c, count in counts.items():
+            global_class_totals[c] += count
+            
+    # 3. Aggregate final_weight_key
+    global_weight = torch.zeros_like(global_state[final_weight_key], dtype=torch.float32)
+    for c in range(num_classes):
+        total_c = global_class_totals.get(c, 0)
+        if total_c == 0:
+            # Fallback if no client has this class (shouldn't happen in practice)
+            # Just take uniform average
+            for k in range(n_clients):
+                client_weight = client_models[k].state_dict()[final_weight_key]
+                global_weight[c] += client_weight[c].float() / n_clients
+        else:
+            for k in range(n_clients):
+                count_kc = client_class_counts[k].get(c, 0)
+                if count_kc > 0:
+                    weight_fraction = count_kc / total_c
+                    client_weight = client_models[k].state_dict()[final_weight_key]
+                    global_weight[c] += weight_fraction * client_weight[c].float()
+    
+    global_state[final_weight_key] = global_weight
+    
+    # 4. Aggregate final_bias_key if it exists
+    if final_bias_key is not None:
+        global_bias = torch.zeros_like(global_state[final_bias_key], dtype=torch.float32)
+        for c in range(num_classes):
+            total_c = global_class_totals.get(c, 0)
+            if total_c == 0:
+                for k in range(n_clients):
+                    client_bias = client_models[k].state_dict()[final_bias_key]
+                    global_bias[c] += client_bias[c].float() / n_clients
+            else:
+                for k in range(n_clients):
+                    count_kc = client_class_counts[k].get(c, 0)
+                    if count_kc > 0:
+                        weight_fraction = count_kc / total_c
+                        client_bias = client_models[k].state_dict()[final_bias_key]
+                        global_bias[c] += weight_fraction * client_bias[c].float()
+        
+        global_state[final_bias_key] = global_bias
+        
+    # 5. Load updated state back into global model
+    global_model.load_state_dict(global_state)
