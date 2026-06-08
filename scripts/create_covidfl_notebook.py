@@ -408,7 +408,7 @@ cmd = (
     f" --split_type {SPLIT_TYPE}"
     f" --max_rounds {FED_FT_MAX_ROUNDS}"
     f" --E_epoch {FED_FT_E_EPOCH}"
-    f" --lr {FED_FT_LR}"
+    f" --lr 3.75e-4"
     f" --batch_size {FED_FT_BATCH_SIZE}"
     f" --mode {FED_FT_MODE}"
     f" --algo {FED_FT_ALGO}"

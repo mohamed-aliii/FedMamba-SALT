@@ -476,34 +476,6 @@ def fedprox_penalty(encoder, classifier, global_params: dict, mu: float) -> torc
 # ======================================================================
 # Loss function factory
 # ======================================================================
-class MaskedBCELoss(nn.Module):
-    """
-    Independent Sigmoids with Loss Masking to prevent Softmax Gradient Starvation.
-    If a client does not possess a class, the BCE loss for that class is forced to 0.0,
-    preventing the model from pushing its weights towards negative infinity.
-    """
-    def __init__(self, weight=None):
-        super().__init__()
-        self.weight = weight
-        self.present_classes = None
-        
-    def forward(self, logits, targets):
-        if targets.dim() == 1:
-            targets_one_hot = torch.nn.functional.one_hot(targets, num_classes=logits.size(1)).float()
-        else:
-            targets_one_hot = targets.float()
-            
-        loss_per_class = torch.nn.functional.binary_cross_entropy_with_logits(
-            logits, targets_one_hot, weight=self.weight, reduction='none'
-        )
-        
-        if self.present_classes is not None:
-            mask = self.present_classes.unsqueeze(0).to(logits.device).float()
-            loss_per_class = loss_per_class * mask
-            valid_classes = mask.sum().clamp(min=1)
-            return loss_per_class.sum() / (logits.size(0) * valid_classes)
-        else:
-            return loss_per_class.mean()
 
 def build_criterion(args, device: str) -> nn.Module:
     """
@@ -552,8 +524,12 @@ def build_criterion(args, device: str) -> nn.Module:
 
     class_weights = torch.tensor(cw, dtype=torch.float32, device=device)
 
-    print(f"  [criterion] Using MaskedBCELoss to prevent Softmax collapse.")
-    return MaskedBCELoss(weight=class_weights)
+    if args.use_focal_loss:
+        print(f"  [criterion] FocalLoss (gamma=2, alpha={cw.mean():.2f})")
+        return FocalLoss(alpha=class_weights, gamma=2.0)
+    
+    print(f"  [criterion] CrossEntropyLoss")
+    return nn.CrossEntropyLoss(weight=class_weights)
 
 # Local fine-tuning for one client, one round
 # ======================================================================
@@ -1487,15 +1463,6 @@ def main() -> None:
             scaffold_active = use_scaffold and comm_round >= SCAFFOLD_WARMUP
             if scaffold_active:
                 scaffold_state = (c_global, c_clients[cid])
-
-            # Apply loss masking for missing classes
-            if isinstance(criterion, MaskedBCELoss):
-                counts = client_class_counts[cid]
-                present_mask = torch.zeros(args.num_classes, dtype=torch.bool)
-                for c_idx, c_qty in counts.items():
-                    if c_qty > 0:
-                        present_mask[c_idx] = True
-                criterion.present_classes = present_mask
 
             loss, tacc, accumulated_grads = local_train_one_round(
                 enc, cls, client_loaders[cid], opt,

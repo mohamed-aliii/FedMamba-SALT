@@ -70,7 +70,7 @@ from utils.teacher_stats import compute_teacher_embedding_stats, teacher_stats_s
 # Constants
 # ======================================================================
 METRICS_FILENAME = "federated_metrics.csv"
-LOSS_PATIENCE = 200     # increased heavily: curriculum masking forces loss spikes every 50 rounds
+LOSS_PATIENCE = 50     # increased heavily: curriculum masking forces loss spikes every 50 rounds
 LOSS_MIN_DELTA = 1e-4    # raised: 1e-5 was too tight, noise triggered false plateaus
 
 
