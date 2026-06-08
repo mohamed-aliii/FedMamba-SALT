@@ -525,8 +525,8 @@ def build_criterion(args, device: str) -> nn.Module:
     class_weights = torch.tensor(cw, dtype=torch.float32, device=device)
 
     if args.use_focal_loss:
-        print(f"  [criterion] FocalLoss (gamma=2, alpha={cw.mean():.2f})")
-        return FocalLoss(alpha=class_weights, gamma=2.0)
+        print(f"  [criterion] FocalLoss (gamma=2)")
+        return FocalLoss(weight=class_weights, gamma=2.0)
     
     print(f"  [criterion] CrossEntropyLoss")
     return nn.CrossEntropyLoss(weight=class_weights)
