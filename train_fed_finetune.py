@@ -809,7 +809,7 @@ def try_resume(
     if "encoder_state_dict" not in ckpt:
         return 0, best_acc
     encoder.load_state_dict(ckpt["encoder_state_dict"])
-    classifier.load_state_dict(ckpt["classifier_state_dict"])
+    classifier.load_state_dict(ckpt["classifier_state_dict"], strict=False)
 
     # FIX-4: restore optimizer state to preserve AdamW momentum buffers
     if optimizers is not None and "optimizer_states" in ckpt:
