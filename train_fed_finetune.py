@@ -435,19 +435,8 @@ def build_models(args):
             
         # 2. Inject LoRA strictly into the Mamba & Inception projections
         inject_lora_into_encoder(encoder, rank=args.lora_rank)
-                
-        # 3. Unfreeze normalizations for standard PEFT stability
-        for name, param in encoder.named_parameters():
-            if "norm" in name or "LayerNorm" in name or "GroupNorm" in name:
-                param.requires_grad = True
 
-    classifier = nn.Sequential(
-        nn.LayerNorm(feat_dim),
-        nn.Dropout(0.2),
-        nn.Linear(feat_dim, args.num_classes),
-    ).to(args.device)
-    nn.init.trunc_normal_(classifier[2].weight, std=0.02)
-    nn.init.zeros_(classifier[2].bias)
+    classifier = nn.Identity().to(args.device)
 
     enc_params = sum(p.numel() for p in encoder.parameters())
     enc_trainable = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
@@ -629,7 +618,7 @@ def local_train_one_round(
             anchors = F.normalize(anchors, p=2, dim=1)
             
             # Compute logits and loss
-            tau = 0.07
+            tau = 0.15
             sim_logits = torch.matmul(features, anchors.T)
             loss = F.cross_entropy(sim_logits / tau, labels)
             
@@ -1442,7 +1431,17 @@ def main() -> None:
                 if c_sum is not None:
                     new_global_centroids[c] = F.normalize(c_sum, p=2, dim=0)
                 
-        global_centroids = new_global_centroids
+        if global_centroids is None or len(global_centroids) == 0:
+            global_centroids = new_global_centroids
+        else:
+            alpha = 0.9
+            for c in range(args.num_classes):
+                if c in new_global_centroids:
+                    if c in global_centroids:
+                        updated_c = alpha * global_centroids[c].to(args.device) + (1 - alpha) * new_global_centroids[c]
+                    else:
+                        updated_c = new_global_centroids[c]
+                    global_centroids[c] = F.normalize(updated_c, p=2, dim=0)
 
         # ---- Broadcast back ----
         broadcast_global_to_clients(global_encoder,    client_encoders)
