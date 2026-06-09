@@ -1319,7 +1319,8 @@ def main() -> None:
         cls_params = [p for p in cls.parameters() if p.requires_grad]
         param_groups = []
         
-        if args.mode == "peft_fedlc":
+        has_lora = any("lora" in n for n, p in enc.named_parameters() if p.requires_grad)
+        if args.mode == "peft_fedlc" or has_lora:
             # Give LoRA and LayerNorms the FULL learning rate, no decay
             enc_params = [p for p in enc.parameters() if p.requires_grad]
             param_groups.append({
@@ -1485,10 +1486,9 @@ def main() -> None:
         # ---- Compute current LR ----
         current_lr = compute_round_lr(comm_round, args.max_rounds, args.lr, args.mu)
         cls_lr = current_lr
-        if args.mode == "peft_fedlc":
-            enc_lr = current_lr          # LoRA requires full gradient speed
-        else:
-            enc_lr = current_lr / 100.0  # Full finetune requires manifold protection
+        # Note: 'lora_encoder' group handles its own full-speed LR inside the client loop.
+        # This enc_lr is specifically for LLRD layers in full finetuning.
+        enc_lr = current_lr / 100.0  # Full finetune requires manifold protection
 
         # ---- Snapshot global params (needed for FedProx and SCAFFOLD) ----
         global_params = None
@@ -1505,9 +1505,10 @@ def main() -> None:
             cls   = client_classifiers[cid]
             opt   = client_optimizers[cid]
 
-            # Update round-level LR in-place via group_name tag.
             for pg in opt.param_groups:
-                if pg.get("is_encoder", False):
+                if pg.get("group_name") == "lora_encoder":
+                    pg["lr"] = current_lr * pg.get("scale", 1.0)
+                elif pg.get("is_encoder", False):
                     pg["lr"] = enc_lr * pg.get("scale", 1.0)
                 else:  # "classifier"
                     pg["lr"] = cls_lr
