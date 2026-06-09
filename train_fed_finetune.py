@@ -585,7 +585,6 @@ def local_train_one_round(
 ):
     import torch.nn.functional as F
     import torch
-    from models.wrappers import PatchEncoderWrapper
     
     encoder.train()
     total_loss = 0.0
@@ -680,7 +679,6 @@ def evaluate_global(
     import torch
     import numpy as np
     from sklearn.metrics import roc_auc_score, balanced_accuracy_score, precision_recall_fscore_support
-    from models.wrappers import PatchEncoderWrapper
 
     encoder.eval()
     all_preds = []
