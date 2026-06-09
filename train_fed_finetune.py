@@ -703,7 +703,7 @@ def evaluate_global(
             anchor = centroid.to(device)
             logits[:, c] = F.cosine_similarity(features, anchor.unsqueeze(0))
             
-        probs = torch.softmax(logits / 0.07, dim=1)
+        probs = torch.softmax(logits / 0.15, dim=1)
         preds = torch.argmax(logits, dim=1)
         
         all_preds.extend(preds.cpu().numpy())
