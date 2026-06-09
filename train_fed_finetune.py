@@ -1362,6 +1362,7 @@ def main() -> None:
         client_losses    = []
         client_train_acc = []
         client_local_centroids = {}
+        all_delta_c = []
 
         # ---- Local training for each client ----
         for cid in range(args.n_clients):
