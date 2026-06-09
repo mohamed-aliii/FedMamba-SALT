@@ -115,6 +115,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from augmentations.retina_dataset import RetinaDataset
 from augmentations.medical_aug import RETINA_MEAN, RETINA_STD
 from models.inception_mamba import InceptionMambaEncoder
+from models.lora import inject_lora_into_encoder
 from train_centralized import load_yaml_config, get_gpu_memory_mb
 from utils.ckpt_compat import safe_torch_load
 from utils.fedavg import (
@@ -150,22 +151,6 @@ from eval.linear_probe import (
     FINETUNE_PATIENCE,
     MIXUP_ALPHA,
 )
-
-class LoRALinear(nn.Module):
-    """Wraps an existing nn.Linear with trainable Low-Rank matrices."""
-    def __init__(self, linear_layer: nn.Linear, rank: int = 8, alpha: float = 16.0):
-        super().__init__()
-        self.base = linear_layer
-        self.rank = rank
-        self.scaling = alpha / rank
-        
-        self.lora_A = nn.Parameter(torch.zeros(linear_layer.in_features, rank))
-        self.lora_B = nn.Parameter(torch.zeros(rank, linear_layer.out_features))
-        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-        nn.init.zeros_(self.lora_B)
-
-    def forward(self, x):
-        return self.base(x) + (x @ self.lora_A @ self.lora_B) * self.scaling
 
 class FedLCLoss(nn.Module):
     """Logit Calibration Loss to neutralize missing-class logit explosions."""
