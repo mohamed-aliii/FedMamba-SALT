@@ -756,15 +756,10 @@ def evaluate_global(
 def save_checkpoint(
     encoder, classifier,
     comm_round, val_acc, output_dir, name,
-    optimizers=None,
 ) -> None:
     """
-    Save model weights plus optional optimizer state.
-
-    FIX-4: optimizers are persisted in the latest checkpoint
-    so that AdamW momentum buffers survive a resume boundary.
-    Periodic and best checkpoints omit optimizer state (too large) and
-    are used only for weight loading after training completes.
+    Save model weights. Periodic and best checkpoints omit optimizer state
+    and are used only for weight loading after training completes.
     """
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, name)
@@ -774,20 +769,14 @@ def save_checkpoint(
         "encoder_state_dict":    encoder.state_dict(),
         "classifier_state_dict": classifier.state_dict(),
     }
-    if optimizers is not None:
-        payload["optimizer_states"] = [opt.state_dict() for opt in optimizers]
     torch.save(payload, path)
 
 
 def try_resume(
     output_dir, encoder, classifier, device,
-    optimizers=None,
 ) -> tuple:
     """
     Resume from ckpt_latest.pth if present. Returns (start_round, best_acc).
-
-    FIX-4: also restores optimizer state when available so
-    that AdamW momentum buffers are not discarded on resume.
     """
     latest = os.path.join(output_dir, "ckpt_latest.pth")
     best_acc = 0.0
@@ -809,19 +798,6 @@ def try_resume(
         return 0, best_acc
     encoder.load_state_dict(ckpt["encoder_state_dict"])
     classifier.load_state_dict(ckpt["classifier_state_dict"], strict=False)
-
-    # FIX-4: restore optimizer state to preserve AdamW momentum buffers
-    if optimizers is not None and "optimizer_states" in ckpt:
-        opt_states = ckpt["optimizer_states"]
-        if len(opt_states) == len(optimizers):
-            try:
-                for opt, state in zip(optimizers, opt_states):
-                    opt.load_state_dict(state)
-                print("[RESUME] Optimizer states restored.")
-            except Exception as e:
-                print(f"[RESUME] WARNING: Could not restore optimizer states due to architecture change: {e}")
-        else:
-            print("[RESUME] WARNING: optimizer count mismatch — skipping optimizer restore.")
 
     start = ckpt["comm_round"] + 1
     print(f"[RESUME] Resuming from round {start}")
@@ -1249,16 +1225,8 @@ def main() -> None:
         })
         return AdamW(param_groups, betas=(0.9, 0.999))
 
-    client_optimizers = [
-        _make_optimizer(client_encoders[i], client_classifiers[i])
-        for i in range(args.n_clients)
-    ]
-
-    # FIX-4: pass optimizers into try_resume so momentum
-    # buffers survive a resume boundary
     start_round, best_acc = try_resume(
         args.output_dir, global_encoder, global_classifier, args.device,
-        optimizers=client_optimizers,
     )
 
     # ==================================================================
@@ -1367,7 +1335,7 @@ def main() -> None:
         for cid in range(args.n_clients):
             enc   = client_encoders[cid]
             cls   = client_classifiers[cid]
-            opt   = client_optimizers[cid]
+            opt   = _make_optimizer(enc, cls)
 
             for pg in opt.param_groups:
                 if pg.get("group_name") == "lora_encoder":
@@ -1471,12 +1439,10 @@ def main() -> None:
         else:
             rounds_no_improve += 1
 
-        # FIX-4: save optimizer state in the latest checkpoint only
         save_checkpoint(
             global_encoder, global_classifier,
             comm_round, val_acc,
             args.output_dir, "ckpt_latest.pth",
-            optimizers=client_optimizers,
         )
         if (comm_round + 1) % args.save_every == 0:
             name = f"ckpt_round_{comm_round + 1:04d}.pth"
