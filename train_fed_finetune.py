@@ -152,20 +152,7 @@ from eval.linear_probe import (
     MIXUP_ALPHA,
 )
 
-class FedLCLoss(nn.Module):
-    """Logit Calibration Loss to neutralize missing-class logit explosions."""
-    def __init__(self, cls_probs: list[float], tau: float = 1.0):
-        super().__init__()
-        # Clamp to prevent log(0) NaN crashes
-        probs_tensor = torch.tensor(cls_probs, dtype=torch.float32).clamp(min=1e-8)
-        self.margin = tau * torch.log(probs_tensor)
-        self.ce = nn.CrossEntropyLoss()
 
-    def forward(self, logits, targets):
-        # Adds tau * log(P) to the logits. 
-        # Missing classes get extremely negative margins, suppressing false gradients.
-        calibrated_logits = logits + self.margin.to(logits.device)
-        return self.ce(calibrated_logits, targets)
 
 
 # ======================================================================
@@ -1533,14 +1520,7 @@ def main() -> None:
             if scaffold_active:
                 scaffold_state = (c_global, c_clients[cid])
 
-            if args.mode == "peft_fedlc":
-                # Convert this client's raw counts into probability distribution
-                counts = client_class_counts[cid]
-                total = max(1, sum(counts.values()))
-                cls_probs = [(counts.get(i, 0) / total) for i in range(args.num_classes)]
-                local_criterion = FedLCLoss(cls_probs, tau=args.fedlc_tau).to(args.device)
-            else:
-                local_criterion = criterion
+            local_criterion = criterion
 
             loss, tacc, accumulated_grads = local_train_one_round(
                 enc, cls, client_loaders[cid], opt,

@@ -249,5 +249,12 @@ def average_classifier_class_wise(
         
         global_state[final_bias_key] = global_bias
         
-    # 5. Load updated state back into global model
+    # 5. Server-Side L2 Calibration
+    # Calculate the L2 norm of each row and normalize them to share the same mean norm
+    row_norms = torch.norm(global_weight, p=2, dim=1)
+    mean_norm = row_norms.mean()
+    global_weight = global_weight * (mean_norm / (row_norms.unsqueeze(1) + 1e-8))
+    global_state[final_weight_key] = global_weight
+
+    # 6. Load updated state back into global model
     global_model.load_state_dict(global_state)
