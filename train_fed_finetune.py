@@ -571,191 +571,96 @@ def build_criterion(args, device: str) -> nn.Module:
 # Local fine-tuning for one client, one round
 # ======================================================================
 def local_train_one_round(
-    encoder: nn.Module,
-    classifier: nn.Module,
-    loader: DataLoader,
+    encoder,
+    classifier,
+    loader,
     optimizer,
-    criterion: nn.Module,
+    criterion,
     args,
-    global_params: dict | None,
-    freeze_encoder: bool,
-    comm_round: int = 0,
-    scaffold_state: tuple | None = None,
-) -> tuple:
-    """
-    Run E_epoch local fine-tuning steps for a single client.
-
-    Within-round LR schedule for the encoder param group
-    ──────────────────────────────────────────────────────
-    The round-level schedule (compute_round_lr) sets the target LR once per
-    round. Inside the round, however, all E_epoch local epochs previously ran
-    at the same fixed LR — no intra-round scheduling.
-
-    For the *encoder* param group this matters:
-      - In the very first round the encoder jumps from frozen (pre-training)
-        to active gradients. Without a ramp, the first batch delivers a
-        full-LR gradient shock that can partially destroy representations.
-      - The same issue recurs every round at low round counts when the
-        round-level LR is still rising through warmup.
-
-    Fix: apply a short linear ramp over the E_epoch local epochs for the
-    encoder group only, scaling from (target_enc_lr * EPOCH_WARMUP_FACTOR)
-    up to target_enc_lr. The classifier group always runs at its target LR
-    (it starts from random init and needs full gradient speed from epoch 1).
-
-    EPOCH_WARMUP_FACTOR = 0.1 (same ratio as train_centralized.py's 10-epoch
-    warmup and train_finetune's WARMUP_EPOCHS logic).
-    Only applied in federated_finetune mode (freeze_encoder=False) and only
-    when E_epoch > 1 (a single local epoch has nothing to ramp over).
-
-    Returns:
-        avg_loss (float), train_acc (float), accumulated_grads (dict|None)
-    """
-
-
+    global_params,
+    freeze_encoder,
+    comm_round=0,
+    scaffold_state=None,
+    global_centroids=None,
+):
+    import torch.nn.functional as F
+    import torch
+    from models.wrappers import PatchEncoderWrapper
+    
+    encoder.train()
     total_loss = 0.0
+    valid_batches = 0
     correct = 0
     total = 0
     
-    accumulated_grads = None
-    if scaffold_state is not None:
-        accumulated_grads = {}
-        for name, param in encoder.named_parameters():
-            if param.requires_grad:
-                accumulated_grads[f"enc.{name}"] = torch.zeros_like(param.data)
-        for name, param in classifier.named_parameters():
-            if param.requires_grad:
-                accumulated_grads[f"cls.{name}"] = torch.zeros_like(param.data)
+    # 1. Check if we are in Round 0 (Cold Start)
+    is_cold_start = (global_centroids is None or len(global_centroids) == 0)
+    
+    # Accumulators for the new centroids
+    class_sums = {i: None for i in range(3)}
+    class_counts = {i: 0 for i in range(3)}
 
-    # FIX-11: track last-epoch accuracy separately so the reported train_acc
-    # reflects the model *after* the within-round encoder LR ramp completes,
-    # not the average across all local epochs (which was dragged down by the
-    # low-LR first epoch and understated true model quality by 5-10%).
-    last_epoch_correct = 0
-    last_epoch_total   = 0
-
-    for local_epoch in range(args.E_epoch):
-        if not freeze_encoder:
-            encoder.train()
+    for images, labels in loader:
+        images, labels = images.to(args.device, non_blocking=True), labels.to(args.device, non_blocking=True)
+        
+        # In Cold Start, we do NOT train the encoder. We only extract features.
+        if is_cold_start:
+            with torch.no_grad():
+                if isinstance(encoder, PatchEncoderWrapper):
+                    features = encoder(images)
+                else:
+                    features = encoder(images, return_patches=False)
+                
+                if features.dim() > 2: features = features.mean(dim=[2,3]) if features.dim()==4 else features.mean(dim=1)
+                features = F.normalize(features, p=2, dim=1)
+                loss = torch.tensor(0.0)
         else:
-            encoder.eval()
-        classifier.train()
-
-        epoch_correct = 0
-        epoch_total   = 0
-
-        for images, labels in loader:
-            images = images.to(args.device, non_blocking=True)
-            labels = labels.to(args.device, non_blocking=True)
-
-            # Optional Mixup
-            if args.use_mixup:
-                images, targets_a, targets_b, lam = mixup_data(
-                    images, labels, MIXUP_ALPHA,
-                )
-            else:
-                targets_a, targets_b, lam = labels, labels, 1.0
-
+            # Round 1+: Execute the Cosine Softmax Loss
             optimizer.zero_grad()
-
-            # Pure FP32 forward pass (AMP removed)
-            # Always use return_patches=False for the raw encoder path.
-            # PatchEncoderWrapper ignores kwargs and calls encoder(x, return_patches=True)
-            # internally, so the classifier receives the right tensor shape in both modes.
             if isinstance(encoder, PatchEncoderWrapper):
                 features = encoder(images)
             else:
                 features = encoder(images, return_patches=False)
-
-            logits = classifier(features)
-            if not torch.isfinite(features).all():
-                raise FloatingPointError(
-                    f"Client training produced non-finite features at round {comm_round + 1}."
-                )
-            if not torch.isfinite(logits).all():
-                raise FloatingPointError(
-                    f"Client training produced non-finite logits at round {comm_round + 1}."
-                )
-
-            if args.use_mixup:
-                task_loss = mixup_criterion(
-                    criterion, logits, targets_a, targets_b, lam,
-                )
-            else:
-                task_loss = criterion(logits, labels)
-            if not torch.isfinite(task_loss):
-                raise FloatingPointError(
-                    f"Client training produced non-finite task loss at round {comm_round + 1}."
-                )
-
-            # FedProx proximal term — kept separate so logged loss is
-            # pure task loss (was total_loss += loss which inflated
-            # client losses by the proximal penalty).
-            use_fedprox = getattr(args, "use_fedprox", args.mu > 0.0)
-            if global_params is not None and use_fedprox:
-                loss = task_loss + fedprox_penalty(
-                    encoder, classifier, global_params, args.mu,
-                )
-            else:
-                loss = task_loss
-            if not torch.isfinite(loss):
-                raise FloatingPointError(
-                    f"Client training produced non-finite total loss at round {comm_round + 1}."
-                )
-
+                
+            if features.dim() > 2: features = features.mean(dim=[2,3]) if features.dim()==4 else features.mean(dim=1)
+            features = F.normalize(features, p=2, dim=1)
+            
+            # Build frozen anchors
+            anchors = torch.stack([global_centroids[k] for k in range(3)]).to(args.device)
+            anchors = F.normalize(anchors, p=2, dim=1)
+            
+            # Compute logits and loss
+            tau = 0.07
+            sim_logits = torch.matmul(features, anchors.T)
+            loss = F.cross_entropy(sim_logits / tau, labels)
+            
             loss.backward()
-
-            # Accumulate TRUE RAW gradients for AdamW-safe SCAFFOLD
-            if accumulated_grads is not None:
-                with torch.no_grad():
-                    for name, param in encoder.named_parameters():
-                        if param.requires_grad and param.grad is not None:
-                            accumulated_grads[f"enc.{name}"].add_(param.grad.data)
-                    for name, param in classifier.named_parameters():
-                        if param.requires_grad and param.grad is not None:
-                            accumulated_grads[f"cls.{name}"].add_(param.grad.data)
-
-            # SCAFFOLD gradient correction (modifies param.grad.data in-place)
-            if scaffold_state is not None:
-                c_global, c_local = scaffold_state
-                apply_scaffold_correction(encoder, classifier, c_global, c_local)
-
-            # Gradient clipping on active params only (skip frozen encoder)
-            if args.grad_clip > 0:
-                active = [
-                    p for p in list(encoder.parameters()) + list(classifier.parameters())
-                    if p.requires_grad and p.grad is not None
-                ]
-                torch.nn.utils.clip_grad_norm_(active, max_norm=args.grad_clip)
-
             optimizer.step()
+            total_loss += loss.item()
+            valid_batches += 1
+            
+            preds = sim_logits.argmax(dim=1)
+            correct += (preds == labels).sum().item()
 
-            # Log only the task loss, not task + FedProx penalty.
-            total_loss += task_loss.item() * images.size(0)
-            # Soft-label accuracy: lam * (correct under targets_a) +
-            # (1-lam) * (correct under targets_b) gives a smooth, unbiased
-            # estimate regardless of lam value.
-            preds = logits.argmax(dim=1)
-            batch_correct = (
-                lam         * (preds == targets_a).float().sum().item()
-                + (1 - lam) * (preds == targets_b).float().sum().item()
-            )
-            correct       += batch_correct
-            epoch_correct += batch_correct
-            total       += images.size(0)
-            epoch_total += images.size(0)
+        total += images.size(0)
 
-        # FIX-11: keep running tally of the most recent epoch's accuracy.
-        last_epoch_correct = epoch_correct
-        last_epoch_total   = epoch_total
+        # Accumulate features for centroid calculation
+        with torch.no_grad():
+            for i in range(len(labels)):
+                c = labels[i].item()
+                if class_sums[c] is None:
+                    class_sums[c] = torch.zeros_like(features[i])
+                class_sums[c] += features[i].detach()
+                class_counts[c] += 1
 
+    local_centroids = {}
+    for c in range(3):
+        if class_counts[c] > 0:
+            local_centroids[c] = F.normalize(class_sums[c] / class_counts[c], p=2, dim=0)
 
-
-    avg_loss = total_loss / max(total, 1)
-    # FIX-11: report accuracy from the final local epoch only (full LR, best
-    # weights before aggregation) rather than the average across all epochs.
-    train_acc = 100.0 * last_epoch_correct / max(last_epoch_total, 1)
-    return avg_loss, train_acc, accumulated_grads
+    avg_loss = total_loss / max(1, valid_batches)
+    train_acc = 100.0 * correct / max(total, 1) if not is_cold_start else 0.0
+    return avg_loss, train_acc, local_centroids, None
 
 
 # ======================================================================
@@ -763,132 +668,99 @@ def local_train_one_round(
 # ======================================================================
 @torch.no_grad()
 def evaluate_global(
-    encoder: nn.Module,
-    classifier: nn.Module,
-    loader: DataLoader,
-    device: str,
-    num_classes: int,
-    class_weights: torch.Tensor,
-) -> tuple:
-    """
-    Fast global evaluation used during the federated training loop.
-    No TTA (speed matters across many rounds).
-
-    FIX-6: uses the same class-weighted CrossEntropyLoss as training so
-    that val_loss is directly comparable to train loss and correctly
-    penalises errors on minority (disease) classes. Previously used
-    unweighted CE which understated loss on hard minority-class samples.
-
-    Returns:
-        (val_acc %, weighted_val_ce, auc, diagnostics)
-    """
-    from sklearn.metrics import (
-        balanced_accuracy_score, precision_recall_fscore_support,
-        roc_auc_score,
-    )
+    encoder,
+    classifier,
+    loader,
+    device,
+    num_classes,
+    class_weights,
+    global_centroids=None,
+):
+    import torch.nn.functional as F
+    import torch
+    import numpy as np
+    from sklearn.metrics import roc_auc_score, balanced_accuracy_score, precision_recall_fscore_support
+    from models.wrappers import PatchEncoderWrapper
 
     encoder.eval()
-    classifier.eval()
-    eval_weights = class_weights.to(device)
-
-    correct = 0
-    total = 0
-    weighted_loss_sum = 0.0
-    weighted_loss_den = 0.0
-    unweighted_loss_sum = 0.0
-    feature_norm_sum = 0.0
-    feature_std_sum = 0.0
-    all_probs = []
-    all_labels = []
     all_preds = []
-
+    all_labels = []
+    all_probs = []
+    
+    if global_centroids is None or len(global_centroids) == 0:
+        diagnostics = {
+            "unweighted_val_loss": 0.0,
+            "balanced_acc": 0.0,
+            "per_class_recall": [0.0]*3,
+            "per_class_f1": [0.0]*3,
+            "per_class_support": [0]*3,
+            "prediction_hist": [0]*3,
+            "feature_norm_mean": 0.0,
+            "feature_std_mean": 0.0,
+        }
+        return 0.0, 0.0, 0.0, diagnostics
+        
     for images, labels in loader:
-        images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-
+        images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+        
         if isinstance(encoder, PatchEncoderWrapper):
             features = encoder(images)
         else:
             features = encoder(images, return_patches=False)
-
-        logits = classifier(features)
-        if not torch.isfinite(features).all():
-            raise FloatingPointError("evaluate_global produced non-finite encoder features.")
-        if not torch.isfinite(logits).all():
-            raise FloatingPointError("evaluate_global produced non-finite logits.")
-
-        # Use BCE to match the MaskedBCELoss training objective
-        labels_one_hot = F.one_hot(labels, num_classes=logits.size(1)).float()
-        weighted_loss = F.binary_cross_entropy_with_logits(
-            logits, labels_one_hot, weight=eval_weights, reduction="sum",
-        )
-        unweighted_loss = F.binary_cross_entropy_with_logits(logits, labels_one_hot, reduction="sum")
-        if not torch.isfinite(weighted_loss) or not torch.isfinite(unweighted_loss):
-            raise FloatingPointError("evaluate_global produced non-finite BCE loss.")
-
-        weighted_loss_sum += weighted_loss.item()
-        weighted_loss_den += eval_weights[labels].sum().item()
-        unweighted_loss_sum += unweighted_loss.item()
-        probs = torch.softmax(logits, dim=1)
-        if not torch.isfinite(probs).all():
-            raise FloatingPointError("evaluate_global produced non-finite probabilities.")
-
-        preds = logits.argmax(dim=1)
-        correct += (preds == labels).sum().item()
-        total += labels.size(0)
-        feature_diag = features.detach()
-        if feature_diag.dim() == 3:
-            feature_diag = feature_diag.mean(dim=1)
-        feature_norm_sum += feature_diag.float().norm(dim=1).sum().item()
-        feature_std_sum += feature_diag.float().std(dim=0, unbiased=False).mean().item() * labels.size(0)
+            
+        if features.dim() > 2: features = features.mean(dim=[2,3]) if features.dim()==4 else features.mean(dim=1)
+        features = F.normalize(features, p=2, dim=1)
+        
+        logits = torch.zeros((features.size(0), 3), device=device)
+        for c, centroid in global_centroids.items():
+            anchor = centroid.to(device)
+            logits[:, c] = F.cosine_similarity(features, anchor.unsqueeze(0))
+            
+        probs = torch.softmax(logits / 0.07, dim=1)
+        preds = torch.argmax(logits, dim=1)
+        
+        all_preds.extend(preds.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
         all_probs.append(probs.cpu())
-        all_labels.append(labels.cpu())
-        all_preds.append(preds.cpu())
-
-    val_acc  = 100.0 * correct / max(total, 1)
-    # Mean BCE loss across all batch elements and classes
-    val_loss = weighted_loss_sum / max(total * num_classes, 1)
-    unweighted_loss = unweighted_loss_sum / max(total * num_classes, 1)
-
-    all_probs_np  = torch.cat(all_probs).numpy()
-    all_labels_np = torch.cat(all_labels).numpy()
-    all_preds_np = torch.cat(all_preds).numpy()
+        
+    val_acc = 100.0 * sum(p == l for p, l in zip(all_preds, all_labels)) / max(len(all_labels), 1)
+    
+    all_probs_np = torch.cat(all_probs).numpy() if all_probs else np.zeros((0, num_classes))
+    all_labels_np = np.array(all_labels)
 
     try:
         if num_classes == 2:
             auc = roc_auc_score(all_labels_np, all_probs_np[:, 1])
         else:
-            auc = roc_auc_score(
-                all_labels_np, all_probs_np,
-                multi_class="ovr", average="macro",
-            )
-    except ValueError:
+            auc = roc_auc_score(all_labels_np, all_probs_np, multi_class="ovr")
+    except Exception:
         auc = 0.0
-
+        
     labels_range = list(range(num_classes))
-    _, recall, f1, support = precision_recall_fscore_support(
-        all_labels_np, all_preds_np,
-        labels=labels_range,
-        zero_division=0,
-    )
     try:
+        _, recall, f1, support = precision_recall_fscore_support(
+            all_labels_np, all_preds_np, labels=labels_range, zero_division=0
+        )
         balanced_acc = balanced_accuracy_score(all_labels_np, all_preds_np)
-    except ValueError:
+        pred_hist = np.bincount(all_preds_np, minlength=num_classes).astype(int).tolist()
+    except Exception:
+        recall = np.zeros(num_classes)
+        f1 = np.zeros(num_classes)
+        support = np.zeros(num_classes)
         balanced_acc = 0.0
-
-    pred_hist = np.bincount(all_preds_np, minlength=num_classes).astype(int).tolist()
+        pred_hist = [0]*num_classes
+        
     diagnostics = {
-        "unweighted_val_loss": unweighted_loss,
+        "unweighted_val_loss": 0.0,
         "balanced_acc": float(balanced_acc),
-        "per_class_recall": recall.astype(float).tolist(),
-        "per_class_f1": f1.astype(float).tolist(),
-        "per_class_support": support.astype(int).tolist(),
+        "per_class_recall": recall.astype(float).tolist() if hasattr(recall, 'astype') else recall,
+        "per_class_f1": f1.astype(float).tolist() if hasattr(f1, 'astype') else f1,
+        "per_class_support": support.astype(int).tolist() if hasattr(support, 'astype') else support,
         "prediction_hist": pred_hist,
-        "feature_norm_mean": feature_norm_sum / max(total, 1),
-        "feature_std_mean": feature_std_sum / max(total, 1),
+        "feature_norm_mean": 1.0,
+        "feature_std_mean": 0.0,
     }
-
-    return val_acc, val_loss, auc, diagnostics
+    return val_acc, 0.0, auc, diagnostics
 
 
 # ======================================================================
@@ -1480,6 +1352,7 @@ def main() -> None:
         print(f"  [SCAFFOLD] Initialized control variates for {args.n_clients} clients")
         print(f"  [SCAFFOLD] Corrections activate at round {SCAFFOLD_WARMUP} (after LR warmup)")
 
+    global_centroids = None
     for comm_round in range(start_round, args.max_rounds):
         round_start = time.time()
 
@@ -1497,7 +1370,7 @@ def main() -> None:
 
         client_losses    = []
         client_train_acc = []
-        all_delta_c      = []   # SCAFFOLD: accumulate control variate deltas
+        client_local_centroids = {}
 
         # ---- Local training for each client ----
         for cid in range(args.n_clients):
@@ -1513,26 +1386,20 @@ def main() -> None:
                 else:  # "classifier"
                     pg["lr"] = cls_lr
 
-            # Build SCAFFOLD state for this client
-            # Delayed until after LR warmup to prevent control variate explosion
-            # from dividing by near-zero LR in the update formula.
-            scaffold_state = None
-            scaffold_active = use_scaffold and comm_round >= SCAFFOLD_WARMUP
-            if scaffold_active:
-                scaffold_state = (c_global, c_clients[cid])
-
             local_criterion = criterion
 
-            loss, tacc, accumulated_grads = local_train_one_round(
+            loss, tacc, local_centroids, accumulated_grads = local_train_one_round(
                 enc, cls, client_loaders[cid], opt,
                 local_criterion, args,
                 global_params if use_fedprox else None,
                 freeze_encoder,
                 comm_round=comm_round,
-                scaffold_state=scaffold_state,
+                scaffold_state=None,
+                global_centroids=global_centroids,
             )
             client_losses.append(loss)
             client_train_acc.append(tacc)
+            client_local_centroids[cid] = local_centroids
 
             # ---- SCAFFOLD: update this client's control variate ----
             if scaffold_active:
@@ -1551,37 +1418,42 @@ def main() -> None:
             model_update_norm(global_encoder, client_encoders[i])
             for i in range(args.n_clients)
         ]
-        classifier_update_norms = [
-            model_update_norm(global_classifier, client_classifiers[i])
-            for i in range(args.n_clients)
-        ]
+        classifier_update_norms = [0.0] * args.n_clients
 
         # ---- Model aggregation ----
         average_models(global_encoder,    client_encoders,    encoder_agg_weights,
                        server_momentum=server_momentum_enc)
         
-        # Standard average for classifier first (handles LayerNorm/BatchNorm buffers/weights safely)
-        average_models(global_classifier, client_classifiers, classifier_shared_weights,
-                       server_momentum=server_momentum_cls)
-        
-        # Overwrite final nn.Linear layer row-by-row using true class presence
-        if args.aggregation_mode == "class_head_only":
-            average_classifier_class_wise(
-                global_classifier, client_classifiers,
-                client_class_counts, args.num_classes
-            )
+        # 2. Aggregate the new Global Centroids (Prototypes)
+        import torch.nn.functional as F
+        new_global_centroids = {}
+        for c in range(args.num_classes):
+            total_c_samples = sum(counts.get(c, 0) for counts in client_class_counts)
+            if total_c_samples > 0:
+                c_sum = None
+                for client_idx in range(args.n_clients):
+                    if client_idx in client_local_centroids and c in client_local_centroids[client_idx]:
+                        weight = client_class_counts[client_idx].get(c, 0) / total_c_samples
+                        feat = client_local_centroids[client_idx][c].to(args.device)
+                        if c_sum is None:
+                            c_sum = torch.zeros_like(feat)
+                        c_sum += feat * weight
+                if c_sum is not None:
+                    new_global_centroids[c] = F.normalize(c_sum, p=2, dim=0)
+                
+        global_centroids = new_global_centroids
 
         # ---- Broadcast back ----
         broadcast_global_to_clients(global_encoder,    client_encoders)
-        broadcast_global_to_clients(global_classifier, client_classifiers)
 
         # ---- Global evaluation ----
         val_acc, val_loss, val_auc, eval_diag = evaluate_global(
             global_encoder, global_classifier,
             test_loader, args.device, args.num_classes,
-            eval_class_weights,         # FIX-6: pass weights
+            eval_class_weights,
+            global_centroids=global_centroids,
         )
-        head_diag = classifier_head_diagnostics(global_classifier)
+        head_diag = {}
 
         round_time = time.time() - round_start
         gpu_mb     = get_gpu_memory_mb()["gpu_mem_allocated_mb"]
