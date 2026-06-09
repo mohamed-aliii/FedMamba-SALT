@@ -725,6 +725,7 @@ def evaluate_global(
     
     all_probs_np = torch.cat(all_probs).numpy() if all_probs else np.zeros((0, num_classes))
     all_labels_np = np.array(all_labels)
+    all_preds_np = np.array(all_preds)
 
     try:
         if num_classes == 2:
