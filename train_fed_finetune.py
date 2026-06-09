@@ -1400,6 +1400,8 @@ def main() -> None:
             client_train_acc.append(tacc)
             client_local_centroids[cid] = local_centroids
 
+            scaffold_active = use_scaffold and comm_round >= SCAFFOLD_WARMUP
+
             # ---- SCAFFOLD: update this client's control variate ----
             if scaffold_active:
                 K = args.E_epoch * len(client_loaders[cid])
