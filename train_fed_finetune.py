@@ -1437,8 +1437,7 @@ def main() -> None:
     # Phase 2: Loss Function — FedLC (The Logit Explosion Fix)
     # Instantiate client-specific logit calibration losses to dynamically 
     # bound missing classes and prevent -infinity local gradients.
-
-
+    criterion = build_criterion(args, args.device)
     # FIX-6 + FIX-12: use the same balanced weights for evaluate_global
     # (was a separate hardcoded [1.0, 2.0] list — now kept in sync with
     # build_criterion automatically).
