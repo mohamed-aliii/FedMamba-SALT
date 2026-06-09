@@ -1437,16 +1437,7 @@ def main() -> None:
     # Phase 2: Loss Function — FedLC (The Logit Explosion Fix)
     # Instantiate client-specific logit calibration losses to dynamically 
     # bound missing classes and prevent -infinity local gradients.
-    # ==================================================================
-    client_criteria = []
-    for cid in range(args.n_clients):
-        counts = client_class_counts[cid]
-        total = sum(counts.values()) if counts else 0
-        probs = torch.zeros(args.num_classes)
-        if total > 0:
-            for c, cnt in counts.items():
-                probs[c] = cnt / total
-        client_criteria.append(FedLCLoss(client_class_probs=probs, tau=args.fedlc_tau).to(args.device))
+
 
     # FIX-6 + FIX-12: use the same balanced weights for evaluate_global
     # (was a separate hardcoded [1.0, 2.0] list — now kept in sync with
@@ -1563,7 +1554,11 @@ def main() -> None:
                 scaffold_state = (c_global, c_clients[cid])
 
             if args.mode == "peft_fedlc":
-                local_criterion = client_criteria[cid]
+                # Convert this client's raw counts into probability distribution
+                counts = client_class_counts[cid]
+                total = max(1, sum(counts.values()))
+                cls_probs = [(counts.get(i, 0) / total) for i in range(args.num_classes)]
+                local_criterion = FedLCLoss(cls_probs, tau=args.fedlc_tau).to(args.device)
             else:
                 local_criterion = criterion
 
