@@ -1498,7 +1498,10 @@ def main() -> None:
         # ---- Compute current LR ----
         current_lr = compute_round_lr(comm_round, args.max_rounds, args.lr, args.mu)
         cls_lr = current_lr
-        enc_lr = current_lr / 100.0
+        if args.mode == "peft_fedlc":
+            enc_lr = current_lr          # LoRA requires full gradient speed
+        else:
+            enc_lr = current_lr / 100.0  # Full finetune requires manifold protection
 
         # ---- Snapshot global params (needed for FedProx and SCAFFOLD) ----
         global_params = None
