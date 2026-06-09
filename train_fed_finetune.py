@@ -815,9 +815,12 @@ def try_resume(
     if optimizers is not None and "optimizer_states" in ckpt:
         opt_states = ckpt["optimizer_states"]
         if len(opt_states) == len(optimizers):
-            for opt, state in zip(optimizers, opt_states):
-                opt.load_state_dict(state)
-            print("[RESUME] Optimizer states restored.")
+            try:
+                for opt, state in zip(optimizers, opt_states):
+                    opt.load_state_dict(state)
+                print("[RESUME] Optimizer states restored.")
+            except Exception as e:
+                print(f"[RESUME] WARNING: Could not restore optimizer states due to architecture change: {e}")
         else:
             print("[RESUME] WARNING: optimizer count mismatch — skipping optimizer restore.")
 
