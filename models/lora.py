@@ -9,10 +9,11 @@ class LoRALinear(nn.Module):
         self.linear = linear_layer
         self.rank = rank
         self.scaling = alpha / rank
+        device = linear_layer.weight.device
         
         # LoRA A and B matrices
-        self.lora_A = nn.Parameter(torch.zeros(linear_layer.in_features, rank))
-        self.lora_B = nn.Parameter(torch.zeros(rank, linear_layer.out_features))
+        self.lora_A = nn.Parameter(torch.zeros(linear_layer.in_features, rank, device=device))
+        self.lora_B = nn.Parameter(torch.zeros(rank, linear_layer.out_features, device=device))
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B)
 
@@ -31,8 +32,9 @@ class LoRAConv2d(nn.Module):
         # LoRA for 1x1 convolutions
         assert conv_layer.kernel_size == (1, 1) or conv_layer.kernel_size == 1, "LoRAConv2d tailored for 1x1 convs here"
         
-        self.lora_A = nn.Parameter(torch.zeros(rank, conv_layer.in_channels, 1, 1))
-        self.lora_B = nn.Parameter(torch.zeros(conv_layer.out_channels, rank, 1, 1))
+        device = conv_layer.weight.device
+        self.lora_A = nn.Parameter(torch.zeros(rank, conv_layer.in_channels, 1, 1, device=device))
+        self.lora_B = nn.Parameter(torch.zeros(conv_layer.out_channels, rank, 1, 1, device=device))
         
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B)
