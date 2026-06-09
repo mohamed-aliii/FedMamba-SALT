@@ -85,45 +85,37 @@ def average_models(
 ) -> None:
     """
     Weighted average of client model parameters into global_model (in-place).
-    Supports FedAvgM (Server Momentum) if server_momentum dictionary is provided.
-
-    Args:
-        global_model:   Target model whose parameters will be overwritten.
-        client_models:  List of N client models (same architecture as global).
-        client_weights: List of N floats summing to 1.0.
-        server_momentum: Optional dictionary storing server-side momentum buffers.
-        beta:           Momentum coefficient (typically 0.9).
+    Optimized: Only averages parameters that require gradients.
     """
     global_state = global_model.state_dict()
     n_clients = len(client_models)
 
+    # Filter to only aggregate trainable parameters
+    trainable_keys = {name for name, param in global_model.named_parameters() if param.requires_grad}
+
     # Compute averaged weights in a temporary dictionary
     averaged_state = OrderedDict()
-    for key in global_state:
+    for key in trainable_keys:
         averaged_state[key] = torch.zeros_like(global_state[key], dtype=torch.float32)
 
     for client_idx in range(n_clients):
         client_state = client_models[client_idx].state_dict()
         w = client_weights[client_idx]
-        for key in global_state:
+        for key in trainable_keys:
             averaged_state[key] += w * client_state[key].float()
 
     if server_momentum is not None:
         # FedAvgM: Server-side momentum update
-        for key in global_state:
+        for key in trainable_keys:
             if global_state[key].is_floating_point():
-                # Pseudo-gradient: Delta = Averaged_Weights - Global_Weights
                 delta = averaged_state[key] - global_state[key]
-                # Update momentum: m = beta * m + delta
                 server_momentum[key] = beta * server_momentum[key] + delta
-                # Update global weights: w = w + m
                 global_state[key] = global_state[key] + server_momentum[key]
             else:
-                # Non-floating point tensors (e.g., num_batches_tracked) bypass momentum
                 global_state[key] = averaged_state[key]
     else:
         # Standard FedAvg
-        for key in global_state:
+        for key in trainable_keys:
             global_state[key] = averaged_state[key]
 
     # Load updated parameters back into the global model
@@ -136,14 +128,15 @@ def broadcast_global_to_clients(
 ) -> None:
     """
     Copy global model parameters to all client models (in-place).
-
-    Args:
-        global_model:  Source model with averaged parameters.
-        client_models: List of client models to overwrite.
+    Optimized: Only broadcasts parameters that require gradients to save overhead.
     """
     global_state = global_model.state_dict()
+    trainable_keys = {name for name, param in global_model.named_parameters() if param.requires_grad}
+    
     for client_model in client_models:
-        client_model.load_state_dict(global_state)
+        client_state = client_model.state_dict()
+        for key in trainable_keys:
+            client_state[key].copy_(global_state[key])
 
 
 def proximal_loss(

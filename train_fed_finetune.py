@@ -115,6 +115,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from augmentations.retina_dataset import RetinaDataset
 from augmentations.medical_aug import RETINA_MEAN, RETINA_STD
 from models.inception_mamba import InceptionMambaEncoder
+from models.lora import inject_lora_into_encoder
 from train_centralized import load_yaml_config, get_gpu_memory_mb
 from utils.ckpt_compat import safe_torch_load
 from utils.fedavg import (
@@ -241,11 +242,13 @@ def parse_args() -> argparse.Namespace:
     # Evaluation
     p.add_argument(
         "--mode", type=str, default="federated_finetune",
-        choices=["federated_finetune", "federated_linear_probe", "federated_branch_protect"],
+        choices=["federated_finetune", "federated_linear_probe", "peft_fedlc"],
         help="federated_finetune: encoder + classifier both train; "
              "federated_linear_probe: encoder frozen, only classifier trains; "
-             "federated_branch_protect: entire SSM branch frozen, Inception branch trains",
+             "peft_fedlc: Inject LoRA into Mamba projections and apply FedLC.",
     )
+    p.add_argument("--lora_rank", type=int, default=8, help="Intrinsic rank for LoRA injection")
+    p.add_argument("--fedlc_tau", type=float, default=1.0, help="Temperature scalar for FedLC margin")
     p.add_argument(
         "--label_fraction", type=float, default=1.0,
         help="Fraction of each client's labels to use (0.0–1.0). "
@@ -419,12 +422,11 @@ def build_models(args):
     # Use standard GAP + Linear for both fine-tuning and linear probe
     encoder = base_encoder  # already on device
 
-    if args.mode == "federated_branch_protect":
-        for name, param in encoder.named_parameters():
-            # Freeze the entire sequence branch to prevent covariate shift
-            # into the delicate ODE selective mechanisms.
-            if "ssm_branch" in name:
-                param.requires_grad = False
+    if args.mode == "peft_fedlc":
+        # Inject LoRA into Mamba projections and Inception 1x1 convs
+        # This gives the encoder capacity to learn without destroying the Mamba ODEs during FedAvg
+        print(f"  [build_models] Injecting LoRA (rank={args.lora_rank}) into encoder...")
+        inject_lora_into_encoder(encoder, rank=args.lora_rank)
 
     classifier = nn.Sequential(
         nn.LayerNorm(feat_dim),
@@ -489,7 +491,24 @@ def fedprox_penalty(encoder, classifier, global_params: dict, mu: float) -> torc
 # ======================================================================
 # Loss function factory
 # ======================================================================
+# FedLC Loss (Federated Logit Calibration)
+# ======================================================================
+class FedLCLoss(nn.Module):
+    def __init__(self, client_class_probs: torch.Tensor, tau: float = 1.0):
+        super().__init__()
+        # Smooth probabilities to prevent log(0)
+        smoothed_probs = client_class_probs + 1e-8
+        # FedLC margin computation: margin = tau * log(P(y))
+        self.margin = tau * torch.log(smoothed_probs)
+        self.ce = nn.CrossEntropyLoss()
 
+    def forward(self, logits, labels):
+        # Subtract margin from logits. 
+        # Majority classes get a larger penalty, bounding missing classes safely.
+        calibrated_logits = logits - self.margin.to(logits.device)
+        return self.ce(calibrated_logits, labels)
+
+# ======================================================================
 def build_criterion(args, device: str) -> nn.Module:
     """
     Build the training loss.
@@ -1365,7 +1384,20 @@ def main() -> None:
         optimizers=client_optimizers,
     )
 
-    criterion = build_criterion(args, args.device)
+    # ==================================================================
+    # Phase 2: Loss Function — FedLC (The Logit Explosion Fix)
+    # Instantiate client-specific logit calibration losses to dynamically 
+    # bound missing classes and prevent -infinity local gradients.
+    # ==================================================================
+    client_criteria = []
+    for cid in range(args.n_clients):
+        counts = client_class_counts[cid]
+        total = sum(counts.values()) if counts else 0
+        probs = torch.zeros(args.num_classes)
+        if total > 0:
+            for c, cnt in counts.items():
+                probs[c] = cnt / total
+        client_criteria.append(FedLCLoss(client_class_probs=probs, tau=args.fedlc_tau).to(args.device))
 
     # FIX-6 + FIX-12: use the same balanced weights for evaluate_global
     # (was a separate hardcoded [1.0, 2.0] list — now kept in sync with
@@ -1481,9 +1513,14 @@ def main() -> None:
             if scaffold_active:
                 scaffold_state = (c_global, c_clients[cid])
 
+            if args.mode == "peft_fedlc":
+                local_criterion = client_criteria[cid]
+            else:
+                local_criterion = criterion
+
             loss, tacc, accumulated_grads = local_train_one_round(
                 enc, cls, client_loaders[cid], opt,
-                criterion, args,
+                local_criterion, args,
                 global_params if use_fedprox else None,
                 freeze_encoder,
                 comm_round=comm_round,
