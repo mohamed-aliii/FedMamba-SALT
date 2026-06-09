@@ -447,14 +447,7 @@ def build_models(args):
             param.requires_grad = False
             
         # 2. Inject LoRA strictly into the Mamba & Inception projections
-        for name, module in encoder.named_modules():
-            if isinstance(module, nn.Linear) and any(
-                target in name for target in ['proj_main', 'proj_gate', 'proj_out']
-            ):
-                parent_name = name.rsplit('.', 1)[0]
-                child_name = name.rsplit('.', 1)[-1]
-                parent = encoder.get_submodule(parent_name)
-                setattr(parent, child_name, LoRALinear(module, rank=args.lora_rank))
+        inject_lora_into_encoder(encoder, rank=args.lora_rank)
                 
         # 3. Unfreeze normalizations for standard PEFT stability
         for name, param in encoder.named_parameters():
