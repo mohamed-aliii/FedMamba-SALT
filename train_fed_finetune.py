@@ -120,8 +120,7 @@ from train_centralized import load_yaml_config, get_gpu_memory_mb
 from utils.ckpt_compat import safe_torch_load
 from utils.fedavg import (
     average_models,
-    average_classifier_class_wise,
-    classifier_head_diagnostics,
+    aggregate_prototypes_ema,
     compute_client_weights,
     model_update_norm,
     broadcast_global_to_clients
@@ -1419,33 +1418,21 @@ def main() -> None:
                        server_momentum=server_momentum_enc)
         
         # 2. Aggregate the new Global Centroids (Prototypes)
-        import torch.nn.functional as F
-        new_global_centroids = {}
-        for c in range(args.num_classes):
-            total_c_samples = sum(counts.get(c, 0) for counts in client_class_counts)
-            if total_c_samples > 0:
-                c_sum = None
-                for client_idx in range(args.n_clients):
-                    if client_idx in client_local_centroids and c in client_local_centroids[client_idx]:
-                        weight = client_class_counts[client_idx].get(c, 0) / total_c_samples
-                        feat = client_local_centroids[client_idx][c].to(args.device)
-                        if c_sum is None:
-                            c_sum = torch.zeros_like(feat)
-                        c_sum += feat * weight
-                if c_sum is not None:
-                    new_global_centroids[c] = F.normalize(c_sum, p=2, dim=0)
+        feat_dim = 768
+        for cid, cents in client_local_centroids.items():
+            if len(cents) > 0:
+                feat_dim = list(cents.values())[0].shape[0]
+                break
                 
-        if global_centroids is None or len(global_centroids) == 0:
-            global_centroids = new_global_centroids
-        else:
-            alpha = 0.9
-            for c in range(args.num_classes):
-                if c in new_global_centroids:
-                    if c in global_centroids:
-                        updated_c = alpha * global_centroids[c].to(args.device) + (1 - alpha) * new_global_centroids[c]
-                    else:
-                        updated_c = new_global_centroids[c]
-                    global_centroids[c] = F.normalize(updated_c, p=2, dim=0)
+        global_centroids = aggregate_prototypes_ema(
+            global_centroids=global_centroids,
+            client_local_centroids=client_local_centroids,
+            client_class_counts=client_class_counts,
+            num_classes=args.num_classes,
+            device=args.device,
+            feat_dim=feat_dim,
+            momentum=0.9
+        )
 
         # ---- Broadcast back ----
         broadcast_global_to_clients(global_encoder,    client_encoders)

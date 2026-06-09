@@ -26,41 +26,68 @@ import torch
 import torch.nn as nn
 
 
-def find_final_linear_keys(state_dict: Dict[str, torch.Tensor]) -> Tuple[str, Optional[str]]:
-    """Return the final linear weight/bias keys from a classifier state_dict."""
-    final_weight_key = None
-    final_bias_key = None
-    for key in reversed(list(state_dict.keys())):
-        if key.endswith(".weight") and state_dict[key].dim() == 2:
-            final_weight_key = key
-            bias_key = key.replace(".weight", ".bias")
-            if bias_key in state_dict:
-                final_bias_key = bias_key
-            break
-    if final_weight_key is None:
-        raise ValueError("Could not identify final linear layer weight in classifier state_dict.")
-    return final_weight_key, final_bias_key
+import torch.nn.functional as F
 
-
-def classifier_head_diagnostics(classifier: nn.Module) -> Dict[str, List[float]]:
-    """Return row-wise weight norms and bias values for the final classifier head."""
-    state = classifier.state_dict()
-    final_weight_key, final_bias_key = find_final_linear_keys(state)
-    weight = state[final_weight_key].detach().float()
-    diag = {
-        "final_weight_key": [final_weight_key],
-        "row_weight_norms": weight.norm(dim=1).cpu().tolist(),
-    }
-    if final_bias_key is not None:
-        bias = state[final_bias_key].detach().float()
-        diag["final_bias_key"] = [final_bias_key]
-        diag["row_biases"] = bias.cpu().tolist()
-        diag["bias_abs_mean"] = [bias.abs().mean().item()]
-    else:
-        diag["final_bias_key"] = []
-        diag["row_biases"] = []
-        diag["bias_abs_mean"] = [0.0]
-    return diag
+def aggregate_prototypes_ema(
+    global_centroids: Dict[int, torch.Tensor],
+    client_local_centroids: List[Dict[int, torch.Tensor]],
+    client_class_counts: List[Dict[int, int]],
+    num_classes: int,
+    device: torch.device,
+    feat_dim: int = 768,
+    momentum: float = 0.9
+) -> Dict[int, torch.Tensor]:
+    """
+    Computes the weighted average of newly discovered local prototypes,
+    then applies an Exponential Moving Average (EMA) against the existing 
+    global prototypes to stabilize the representation space.
+    
+    Args:
+        global_centroids: Dict of current global prototypes (can be empty for Round 0).
+        client_local_centroids: List of dicts containing each client's local prototypes.
+        client_class_counts: List of dicts containing sample counts per class.
+        num_classes: Total number of classes.
+        device: Torch device.
+        feat_dim: Dimensionality of the representation space.
+        momentum: EMA factor (alpha). 0.0 means complete overwrite, 1.0 means frozen.
+        
+    Returns:
+        Updated dictionary of global centroids, L2-normalized.
+    """
+    new_global_centroids = {}
+    
+    for c in range(num_classes):
+        # Find how many samples of class 'c' exist across all clients this round
+        total_c_samples = sum(counts.get(c, 0) for counts in client_class_counts)
+        
+        if total_c_samples > 0:
+            c_sum = torch.zeros(feat_dim, device=device)
+            
+            # Step 1: Weighted average of the NEW local prototypes
+            for client_idx in range(len(client_local_centroids)):
+                if c in client_local_centroids[client_idx]:
+                    weight = client_class_counts[client_idx].get(c, 0) / total_c_samples
+                    c_sum += client_local_centroids[client_idx][c].to(device) * weight
+                    
+            # Normalize the newly aggregated prototype
+            new_c_normalized = F.normalize(c_sum, p=2, dim=0)
+            
+            # Step 2: EMA Update against the historical global prototype
+            if global_centroids is not None and c in global_centroids:
+                # Smooth shift
+                updated_c = (momentum * global_centroids[c].to(device)) + ((1.0 - momentum) * new_c_normalized)
+            else:
+                # Cold start: No historical prototype exists yet
+                updated_c = new_c_normalized
+                
+            # Step 3: Re-project to unit sphere to maintain Cosine Similarity validity
+            new_global_centroids[c] = F.normalize(updated_c, p=2, dim=0)
+            
+        elif global_centroids is not None and c in global_centroids:
+            # Edge case: No client had this class this round, keep historical
+            new_global_centroids[c] = global_centroids[c].to(device)
+            
+    return new_global_centroids
 
 
 def model_update_norm(global_model: nn.Module, client_model: nn.Module) -> float:
@@ -187,74 +214,3 @@ def compute_client_weights(client_dataset_sizes: List[int], strategy: str = "siz
     return [s / total for s in client_dataset_sizes]
 
 
-def average_classifier_class_wise(
-    global_model: nn.Module,
-    client_models: List[nn.Module],
-    client_class_counts: List[Dict[int, int]],
-    num_classes: int
-) -> None:
-    """
-    Performs true row-wise aggregation for the final linear layer.
-    Each row `c` is aggregated only using clients that have samples for class `c`.
-    The weight for client `k` on row `c` is proportional to its sample count: N_{k,c} / N_{global,c}.
-    """
-    global_state = global_model.state_dict()
-    n_clients = len(client_models)
-    
-    # 1. Identify final linear layer keys
-    final_weight_key, final_bias_key = find_final_linear_keys(global_state)
-    
-    # 2. Compute global totals for each class
-    global_class_totals = {c: 0 for c in range(num_classes)}
-    for counts in client_class_counts:
-        for c, count in counts.items():
-            global_class_totals[c] += count
-            
-    # 3. Aggregate final_weight_key
-    global_weight = torch.zeros_like(global_state[final_weight_key], dtype=torch.float32)
-    for c in range(num_classes):
-        total_c = global_class_totals.get(c, 0)
-        if total_c == 0:
-            # Fallback if no client has this class (shouldn't happen in practice)
-            # Just take uniform average
-            for k in range(n_clients):
-                client_weight = client_models[k].state_dict()[final_weight_key]
-                global_weight[c] += client_weight[c].float() / n_clients
-        else:
-            for k in range(n_clients):
-                count_kc = client_class_counts[k].get(c, 0)
-                if count_kc > 0:
-                    weight_fraction = count_kc / total_c
-                    client_weight = client_models[k].state_dict()[final_weight_key]
-                    global_weight[c] += weight_fraction * client_weight[c].float()
-    
-    global_state[final_weight_key] = global_weight
-    
-    # 4. Aggregate final_bias_key if it exists
-    if final_bias_key is not None:
-        global_bias = torch.zeros_like(global_state[final_bias_key], dtype=torch.float32)
-        for c in range(num_classes):
-            total_c = global_class_totals.get(c, 0)
-            if total_c == 0:
-                for k in range(n_clients):
-                    client_bias = client_models[k].state_dict()[final_bias_key]
-                    global_bias[c] += client_bias[c].float() / n_clients
-            else:
-                for k in range(n_clients):
-                    count_kc = client_class_counts[k].get(c, 0)
-                    if count_kc > 0:
-                        weight_fraction = count_kc / total_c
-                        client_bias = client_models[k].state_dict()[final_bias_key]
-                        global_bias[c] += weight_fraction * client_bias[c].float()
-        
-        global_state[final_bias_key] = global_bias
-        
-    # 5. Server-Side L2 Calibration
-    # Calculate the L2 norm of each row and normalize them to share the same mean norm
-    row_norms = torch.norm(global_weight, p=2, dim=1)
-    mean_norm = row_norms.mean()
-    global_weight = global_weight * (mean_norm / (row_norms.unsqueeze(1) + 1e-8))
-    global_state[final_weight_key] = global_weight
-
-    # 6. Load updated state back into global model
-    global_model.load_state_dict(global_state)
