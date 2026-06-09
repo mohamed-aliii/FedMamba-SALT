@@ -1320,8 +1320,19 @@ def main() -> None:
         cls_params = [p for p in cls.parameters() if p.requires_grad]
         param_groups = []
         
-        # Layer-Wise Learning Rate Decay (LLRD) for encoder
-        if any(p.requires_grad for p in enc.parameters()):
+        if args.mode == "peft_fedlc":
+            # Give LoRA and LayerNorms the FULL learning rate, no decay
+            enc_params = [p for p in enc.parameters() if p.requires_grad]
+            param_groups.append({
+                "params": enc_params,
+                "lr": args.lr, 
+                "weight_decay": 0.01,
+                "group_name": "lora_encoder",
+                "is_encoder": True,
+                "scale": 1.0, 
+            })
+        # Layer-Wise Learning Rate Decay (LLRD) for full encoder fine-tuning
+        elif any(p.requires_grad for p in enc.parameters()):
             # Count number of blocks to set decay factor
             # Use split('blocks.')[1] to handle prefixes like 'encoder.blocks.0.weight'
             depth = max([int(n.split('blocks.')[1].split('.')[0]) for n, p in enc.named_parameters() if 'blocks.' in n and p.requires_grad] + [0]) + 1
