@@ -596,8 +596,8 @@ def local_train_one_round(
     is_cold_start = (global_centroids is None or len(global_centroids) == 0)
     
     # Accumulators for the new centroids
-    class_sums = {i: None for i in range(3)}
-    class_counts = {i: 0 for i in range(3)}
+    class_sums = {i: None for i in range(args.num_classes)}
+    class_counts = {i: 0 for i in range(args.num_classes)}
 
     for images, labels in loader:
         images, labels = images.to(args.device, non_blocking=True), labels.to(args.device, non_blocking=True)
@@ -625,7 +625,7 @@ def local_train_one_round(
             features = F.normalize(features, p=2, dim=1)
             
             # Build frozen anchors
-            anchors = torch.stack([global_centroids[k] for k in range(3)]).to(args.device)
+            anchors = torch.stack([global_centroids[k] for k in range(args.num_classes)]).to(args.device)
             anchors = F.normalize(anchors, p=2, dim=1)
             
             # Compute logits and loss
@@ -653,7 +653,7 @@ def local_train_one_round(
                 class_counts[c] += 1
 
     local_centroids = {}
-    for c in range(3):
+    for c in range(args.num_classes):
         if class_counts[c] > 0:
             local_centroids[c] = F.normalize(class_sums[c] / class_counts[c], p=2, dim=0)
 
@@ -689,10 +689,10 @@ def evaluate_global(
         diagnostics = {
             "unweighted_val_loss": 0.0,
             "balanced_acc": 0.0,
-            "per_class_recall": [0.0]*3,
-            "per_class_f1": [0.0]*3,
-            "per_class_support": [0]*3,
-            "prediction_hist": [0]*3,
+            "per_class_recall": [0.0]*num_classes,
+            "per_class_f1": [0.0]*num_classes,
+            "per_class_support": [0]*num_classes,
+            "prediction_hist": [0]*num_classes,
             "feature_norm_mean": 0.0,
             "feature_std_mean": 0.0,
         }
@@ -709,7 +709,7 @@ def evaluate_global(
         if features.dim() > 2: features = features.mean(dim=[2,3]) if features.dim()==4 else features.mean(dim=1)
         features = F.normalize(features, p=2, dim=1)
         
-        logits = torch.zeros((features.size(0), 3), device=device)
+        logits = torch.zeros((features.size(0), num_classes), device=device)
         for c, centroid in global_centroids.items():
             anchor = centroid.to(device)
             logits[:, c] = F.cosine_similarity(features, anchor.unsqueeze(0))
