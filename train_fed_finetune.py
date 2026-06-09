@@ -115,7 +115,6 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from augmentations.retina_dataset import RetinaDataset
 from augmentations.medical_aug import RETINA_MEAN, RETINA_STD
 from models.inception_mamba import InceptionMambaEncoder
-from models.lora import inject_lora_into_encoder
 from train_centralized import load_yaml_config, get_gpu_memory_mb
 from utils.ckpt_compat import safe_torch_load
 from utils.fedavg import (
@@ -151,6 +150,37 @@ from eval.linear_probe import (
     FINETUNE_PATIENCE,
     MIXUP_ALPHA,
 )
+
+class LoRALinear(nn.Module):
+    """Wraps an existing nn.Linear with trainable Low-Rank matrices."""
+    def __init__(self, linear_layer: nn.Linear, rank: int = 8, alpha: float = 16.0):
+        super().__init__()
+        self.base = linear_layer
+        self.rank = rank
+        self.scaling = alpha / rank
+        
+        self.lora_A = nn.Parameter(torch.zeros(linear_layer.in_features, rank))
+        self.lora_B = nn.Parameter(torch.zeros(rank, linear_layer.out_features))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
+
+    def forward(self, x):
+        return self.base(x) + (x @ self.lora_A @ self.lora_B) * self.scaling
+
+class FedLCLoss(nn.Module):
+    """Logit Calibration Loss to neutralize missing-class logit explosions."""
+    def __init__(self, cls_probs: list[float], tau: float = 1.0):
+        super().__init__()
+        # Clamp to prevent log(0) NaN crashes
+        probs_tensor = torch.tensor(cls_probs, dtype=torch.float32).clamp(min=1e-8)
+        self.margin = tau * torch.log(probs_tensor)
+        self.ce = nn.CrossEntropyLoss()
+
+    def forward(self, logits, targets):
+        # Adds tau * log(P) to the logits. 
+        # Missing classes get extremely negative margins, suppressing false gradients.
+        calibrated_logits = logits + self.margin.to(logits.device)
+        return self.ce(calibrated_logits, targets)
 
 
 # ======================================================================
@@ -427,10 +457,24 @@ def build_models(args):
                 param.requires_grad = False
 
     if args.mode == "peft_fedlc":
-        # Inject LoRA into Mamba projections and Inception 1x1 convs
-        # This gives the encoder capacity to learn without destroying the Mamba ODEs during FedAvg
-        print(f"  [build_models] Injecting LoRA (rank={args.lora_rank}) into encoder...")
-        inject_lora_into_encoder(encoder, rank=args.lora_rank)
+        # 1. Freeze the entire backbone to protect the ODEs
+        for param in encoder.parameters():
+            param.requires_grad = False
+            
+        # 2. Inject LoRA strictly into the Mamba & Inception projections
+        for name, module in encoder.named_modules():
+            if isinstance(module, nn.Linear) and any(
+                target in name for target in ['proj_main', 'proj_gate', 'proj_out']
+            ):
+                parent_name = name.rsplit('.', 1)[0]
+                child_name = name.rsplit('.', 1)[-1]
+                parent = encoder.get_submodule(parent_name)
+                setattr(parent, child_name, LoRALinear(module, rank=args.lora_rank))
+                
+        # 3. Unfreeze normalizations for standard PEFT stability
+        for name, param in encoder.named_parameters():
+            if "norm" in name or "LayerNorm" in name or "GroupNorm" in name:
+                param.requires_grad = True
 
     classifier = nn.Sequential(
         nn.LayerNorm(feat_dim),
@@ -440,10 +484,13 @@ def build_models(args):
     nn.init.trunc_normal_(classifier[2].weight, std=0.02)
     nn.init.zeros_(classifier[2].bias)
 
-    enc_params = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
-    cls_params = sum(p.numel() for p in classifier.parameters() if p.requires_grad)
-    print(f"\n  Encoder trainable:    {enc_params / 1e6:.2f}M params")
-    print(f"  Classifier trainable: {cls_params / 1e6:.2f}M params\n")
+    enc_params = sum(p.numel() for p in encoder.parameters())
+    enc_trainable = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
+    cls_trainable = sum(p.numel() for p in classifier.parameters() if p.requires_grad)
+    
+    print(f"\n  [PEFT Diagnostics] Encoder Total:     {enc_params / 1e6:.2f}M")
+    print(f"  [PEFT Diagnostics] Encoder Trainable: {enc_trainable / 1e6:.4f}M ({(enc_trainable/enc_params)*100:.2f}%)")
+    print(f"  [PEFT Diagnostics] Head Trainable:    {cls_trainable / 1e6:.4f}M\n")
 
     return encoder, classifier
 
@@ -497,20 +544,7 @@ def fedprox_penalty(encoder, classifier, global_params: dict, mu: float) -> torc
 # ======================================================================
 # FedLC Loss (Federated Logit Calibration)
 # ======================================================================
-class FedLCLoss(nn.Module):
-    def __init__(self, client_class_probs: torch.Tensor, tau: float = 1.0):
-        super().__init__()
-        # Smooth probabilities to prevent log(0)
-        smoothed_probs = client_class_probs + 1e-8
-        # FedLC margin computation: margin = tau * log(P(y))
-        self.margin = tau * torch.log(smoothed_probs)
-        self.ce = nn.CrossEntropyLoss()
 
-    def forward(self, logits, labels):
-        # Subtract margin from logits. 
-        # Majority classes get a larger penalty, bounding missing classes safely.
-        calibrated_logits = logits - self.margin.to(logits.device)
-        return self.ce(calibrated_logits, labels)
 
 # ======================================================================
 def build_criterion(args, device: str) -> nn.Module:
