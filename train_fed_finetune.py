@@ -242,10 +242,8 @@ def parse_args() -> argparse.Namespace:
     # Evaluation
     p.add_argument(
         "--mode", type=str, default="federated_finetune",
-        choices=["federated_finetune", "federated_linear_probe", "peft_fedlc"],
-        help="federated_finetune: encoder + classifier both train; "
-             "federated_linear_probe: encoder frozen, only classifier trains; "
-             "peft_fedlc: Inject LoRA into Mamba projections and apply FedLC.",
+        choices=["federated_finetune", "federated_linear_probe", "federated_branch_protect", "peft_fedlc"],
+        help="Select the fine-tuning paradigm."
     )
     p.add_argument("--lora_rank", type=int, default=8, help="Intrinsic rank for LoRA injection")
     p.add_argument("--fedlc_tau", type=float, default=1.0, help="Temperature scalar for FedLC margin")
@@ -421,6 +419,12 @@ def build_models(args):
 
     # Use standard GAP + Linear for both fine-tuning and linear probe
     encoder = base_encoder  # already on device
+
+    if args.mode == "federated_branch_protect":
+        for name, param in encoder.named_parameters():
+            # Freeze the entire sequence branch to prevent covariate shift
+            if "ssm_branch" in name:
+                param.requires_grad = False
 
     if args.mode == "peft_fedlc":
         # Inject LoRA into Mamba projections and Inception 1x1 convs
