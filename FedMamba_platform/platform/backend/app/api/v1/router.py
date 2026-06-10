@@ -1,0 +1,12 @@
+from fastapi import APIRouter
+
+from app.api.v1.auth import router as auth_router
+from app.api.v1.users import router as users_router
+from app.api.v1.experiments import router as experiments_router
+from app.api.v1.sse import router as sse_router
+
+api_v1_router = APIRouter()
+api_v1_router.include_router(auth_router)
+api_v1_router.include_router(users_router)
+api_v1_router.include_router(experiments_router)
+api_v1_router.include_router(sse_router)

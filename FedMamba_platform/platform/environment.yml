@@ -1,0 +1,32 @@
+name: fedmamba-salt
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - postgresql=16
+  - nodejs=20
+  - pip:
+      - fastapi>=0.111.0
+      - "uvicorn[standard]>=0.30.0"
+      - sqlalchemy>=2.0.30
+      - pydantic-settings>=2.3.0
+      - "celery[redis]>=5.4.0"
+      - httpx>=0.27.0
+      - python-dotenv>=1.0.0
+      - sse-starlette>=2.1.0
+      - alembic>=1.13.0
+      - psycopg2-binary>=2.9.9
+      - aiosqlite>=0.20.0
+      - pytest>=8.2.0
+      - pytest-asyncio>=0.23.0
+      - timm==0.3.2
+      - einops
+      - PyYAML
+      - matplotlib
+      - tqdm
+      - pandas
+      - seaborn
+      - scikit-image
+      - scikit-learn
