@@ -81,6 +81,62 @@ def reconstruct_centroids(encoder, client_loaders, num_classes, device):
     print("=> Centroid reconstruction complete!")
     return global_centroids
 
+def train_and_evaluate_linear_probe(encoder, client_loaders, test_loader, num_classes, device):
+    print("\n" + "="*55)
+    print("=> Training Central Linear Probe over Frozen Features (5 Epochs)...")
+    encoder.eval()
+    
+    # 1. Get feature dimension from a dummy pass
+    with torch.no_grad():
+        for images, _ in test_loader:
+            dummy_out = encoder(images.to(device)[:2])
+            if dummy_out.dim() > 2: dummy_out = dummy_out.mean(dim=[2,3]) if dummy_out.dim()==4 else dummy_out.mean(dim=1)
+            feat_dim = dummy_out.shape[-1]
+            break
+            
+    head = torch.nn.Linear(feat_dim, num_classes).to(device)
+    optimizer = torch.optim.AdamW(head.parameters(), lr=1e-3, weight_decay=0.01)
+    criterion = torch.nn.CrossEntropyLoss()
+    
+    for epoch in range(5):
+        head.train()
+        total_loss = 0
+        samples = 0
+        for cid, loader in enumerate(client_loaders):
+            for images, labels in loader:
+                images, labels = images.to(device), labels.to(device)
+                with torch.no_grad():
+                    features = encoder(images)
+                    if features.dim() > 2: features = features.mean(dim=[2,3]) if features.dim()==4 else features.mean(dim=1)
+                
+                optimizer.zero_grad()
+                logits = head(features)
+                loss = criterion(logits, labels)
+                loss.backward()
+                optimizer.step()
+                
+                total_loss += loss.item() * labels.size(0)
+                samples += labels.size(0)
+        print(f"   Epoch {epoch+1}/5 - Probe Loss: {total_loss / samples:.4f}")
+        
+    print("\n=> Evaluating Central Linear Probe on Test Set...")
+    head.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for images, labels in test_loader:
+            images, labels = images.to(device), labels.to(device)
+            features = encoder(images)
+            if features.dim() > 2: features = features.mean(dim=[2,3]) if features.dim()==4 else features.mean(dim=1)
+            logits = head(features)
+            preds = torch.argmax(logits, dim=1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+            
+    print(f"--- LINEAR PROBE RESULTS ---")
+    print(f"Trained Linear Probe Accuracy: {100. * correct / total:.2f}%")
+    print("="*55)
+
 if __name__ == "__main__":
     # Extract --ckpt_path manually so parse_args doesn't crash on it
     ckpt_path = None
@@ -136,4 +192,6 @@ if __name__ == "__main__":
     # Run the zero-cost evaluation
     print("\n" + "="*55)
     evaluate_calibration(encoder, test_loader, global_centroids, device, class_weights)
-    print("="*55)
+    
+    # Run the Central Linear Probe Training (zero-cost federated, minimal central compute)
+    train_and_evaluate_linear_probe(encoder, client_loaders, test_loader, args.num_classes, device)
