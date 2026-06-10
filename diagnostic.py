@@ -83,41 +83,55 @@ def reconstruct_centroids(encoder, client_loaders, num_classes, device):
 
 def train_and_evaluate_linear_probe(encoder, client_loaders, test_loader, num_classes, device):
     print("\n" + "="*55)
-    print("=> Training Central Linear Probe over Frozen Features (5 Epochs)...")
+    print("=> Extracting all Federated Features to Memory...")
     encoder.eval()
     
-    # 1. Get feature dimension from a dummy pass
+    all_features = []
+    all_labels = []
+    
     with torch.no_grad():
-        for images, _ in test_loader:
-            dummy_out = encoder(images.to(device)[:2])
-            if dummy_out.dim() > 2: dummy_out = dummy_out.mean(dim=[2,3]) if dummy_out.dim()==4 else dummy_out.mean(dim=1)
-            feat_dim = dummy_out.shape[-1]
-            break
-            
-    head = torch.nn.Linear(feat_dim, num_classes).to(device)
+        for cid, loader in enumerate(client_loaders):
+            for images, labels in loader:
+                images = images.to(device)
+                features = encoder(images)
+                if features.dim() > 2: features = features.mean(dim=[2,3]) if features.dim()==4 else features.mean(dim=1)
+                
+                # We do NOT L2 normalize here because nn.Linear can learn the optimal scale.
+                # If we normalize, it restricts the magnitude which can hamper the linear probe.
+                all_features.append(features.cpu())
+                all_labels.append(labels.cpu())
+                
+    all_features = torch.cat(all_features, dim=0)
+    all_labels = torch.cat(all_labels, dim=0)
+    
+    print(f"=> Extracted {all_features.size(0)} features of dimension {all_features.size(1)}.")
+    
+    # Create a unified, shuffled dataloader
+    dataset = torch.utils.data.TensorDataset(all_features, all_labels)
+    train_loader = torch.utils.data.DataLoader(dataset, batch_size=256, shuffle=True)
+    
+    print("=> Training Central Linear Probe over Unified Shuffled Features (10 Epochs)...")
+    head = torch.nn.Linear(all_features.size(1), num_classes).to(device)
     optimizer = torch.optim.AdamW(head.parameters(), lr=1e-3, weight_decay=0.01)
     criterion = torch.nn.CrossEntropyLoss()
     
-    for epoch in range(5):
+    for epoch in range(10):
         head.train()
         total_loss = 0
         samples = 0
-        for cid, loader in enumerate(client_loaders):
-            for images, labels in loader:
-                images, labels = images.to(device), labels.to(device)
-                with torch.no_grad():
-                    features = encoder(images)
-                    if features.dim() > 2: features = features.mean(dim=[2,3]) if features.dim()==4 else features.mean(dim=1)
-                
-                optimizer.zero_grad()
-                logits = head(features)
-                loss = criterion(logits, labels)
-                loss.backward()
-                optimizer.step()
-                
-                total_loss += loss.item() * labels.size(0)
-                samples += labels.size(0)
-        print(f"   Epoch {epoch+1}/5 - Probe Loss: {total_loss / samples:.4f}")
+        for features, labels in train_loader:
+            features, labels = features.to(device), labels.to(device)
+            
+            optimizer.zero_grad()
+            logits = head(features)
+            loss = criterion(logits, labels)
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item() * labels.size(0)
+            samples += labels.size(0)
+        if (epoch+1) % 2 == 0 or epoch == 0:
+            print(f"   Epoch {epoch+1}/10 - Probe Loss: {total_loss / samples:.4f}")
         
     print("\n=> Evaluating Central Linear Probe on Test Set...")
     head.eval()
