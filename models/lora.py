@@ -4,7 +4,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class LoRALinear(nn.Module):
-    def __init__(self, linear_layer: nn.Linear, rank: int = 8, alpha: float = 16.0):
+    def __init__(self, linear_layer: nn.Linear, rank: int = 8, alpha: float = None):
+        if alpha is None:
+            alpha = float(rank)
         super().__init__()
         self.linear = linear_layer
         self.rank = rank
@@ -23,7 +25,9 @@ class LoRALinear(nn.Module):
         return base_out + lora_out
 
 class LoRAConv2d(nn.Module):
-    def __init__(self, conv_layer: nn.Conv2d, rank: int = 8, alpha: float = 16.0):
+    def __init__(self, conv_layer: nn.Conv2d, rank: int = 8, alpha: float = None):
+        if alpha is None:
+            alpha = float(rank)
         super().__init__()
         self.conv = conv_layer
         self.rank = rank
@@ -45,7 +49,9 @@ class LoRAConv2d(nn.Module):
         lora_out = F.conv2d(lora_out, self.lora_B)
         return base_out + lora_out * self.scaling
 
-def inject_lora_into_encoder(encoder: nn.Module, rank: int = 8, alpha: float = 16.0):
+def inject_lora_into_encoder(encoder: nn.Module, rank: int = 8, alpha: float = None):
+    if alpha is None:
+        alpha = float(rank)
     """Recursively replaces target Linear/Conv1x1 layers with LoRA wrappers."""
     # 1. Freeze entire backbone
     for param in encoder.parameters():
@@ -55,7 +61,7 @@ def inject_lora_into_encoder(encoder: nn.Module, rank: int = 8, alpha: float = 1
     targets = []
     for name, module in encoder.named_modules():
         if isinstance(module, nn.Linear) and any(
-            target in name for target in ['proj_main', 'proj_gate', 'proj_out']
+            target in name for target in ['proj_main', 'proj_gate', 'proj_out', 'in_proj', 'x_proj', 'dt_proj', 'out_proj']
         ):
             targets.append((name, module, 'linear'))
         elif isinstance(module, nn.Conv2d) and module.kernel_size == (1, 1) and 'inception' in name:

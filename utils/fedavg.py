@@ -35,7 +35,8 @@ def aggregate_prototypes_ema(
     num_classes: int,
     device: torch.device,
     feat_dim: int = 768,
-    momentum: float = 0.9
+    momentum: float = 0.9,
+    comm_round: int = 0
 ) -> Dict[int, torch.Tensor]:
     """
     Computes the weighted average of newly discovered local prototypes,
@@ -73,9 +74,10 @@ def aggregate_prototypes_ema(
             new_c_normalized = F.normalize(c_sum, p=2, dim=0)
             
             # Step 2: EMA Update against the historical global prototype
+            adaptive_momentum = momentum if comm_round >= 20 else max(0.0, momentum - 0.2)
             if global_centroids is not None and c in global_centroids:
                 # Smooth shift
-                updated_c = (momentum * global_centroids[c].to(device)) + ((1.0 - momentum) * new_c_normalized)
+                updated_c = (adaptive_momentum * global_centroids[c].to(device)) + ((1.0 - adaptive_momentum) * new_c_normalized)
             else:
                 # Cold start: No historical prototype exists yet
                 updated_c = new_c_normalized
@@ -190,7 +192,13 @@ def proximal_loss(
     penalty = torch.tensor(0.0, device=next(local_model.parameters()).device)
     for name, param in local_model.named_parameters():
         if param.requires_grad and name in global_params:
-            penalty += (param - global_params[name].detach()).pow(2).sum()
+            diff = param - global_params[name].detach()
+            # Orthogonal State Transition Regularization:
+            # Apply a 10x stronger penalty to A_log to preserve the pre-trained ODE dynamics
+            if 'A_log' in name:
+                penalty += 10.0 * diff.pow(2).sum()
+            else:
+                penalty += diff.pow(2).sum()
 
     return (mu / 2.0) * penalty
 

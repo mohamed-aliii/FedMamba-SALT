@@ -756,6 +756,7 @@ def evaluate_global(
 def save_checkpoint(
     encoder, classifier,
     comm_round, val_acc, output_dir, name,
+    global_centroids=None,
 ) -> None:
     """
     Save model weights. Periodic and best checkpoints omit optimizer state
@@ -769,6 +770,8 @@ def save_checkpoint(
         "encoder_state_dict":    encoder.state_dict(),
         "classifier_state_dict": classifier.state_dict(),
     }
+    if global_centroids is not None:
+        payload["global_centroids"] = global_centroids
     torch.save(payload, path)
 
 
@@ -776,10 +779,11 @@ def try_resume(
     output_dir, encoder, classifier, device,
 ) -> tuple:
     """
-    Resume from ckpt_latest.pth if present. Returns (start_round, best_acc).
+    Resume from ckpt_latest.pth if present. Returns (start_round, best_acc, global_centroids).
     """
     latest = os.path.join(output_dir, "ckpt_latest.pth")
     best_acc = 0.0
+    global_centroids = None
     best_path = os.path.join(output_dir, "ckpt_best_finetune.pth")
     
     if os.path.isfile(best_path):
@@ -791,17 +795,18 @@ def try_resume(
             print(f"[RESUME] Could not load best_acc from {best_path}: {e}")
 
     if not os.path.isfile(latest):
-        return 0, best_acc
+        return 0, best_acc, global_centroids
     print(f"[RESUME] Loading {latest}")
     ckpt = safe_torch_load(latest, map_location=device)
     if "encoder_state_dict" not in ckpt:
-        return 0, best_acc
+        return 0, best_acc, global_centroids
     encoder.load_state_dict(ckpt["encoder_state_dict"])
     classifier.load_state_dict(ckpt["classifier_state_dict"], strict=False)
 
     start = ckpt["comm_round"] + 1
+    global_centroids = ckpt.get("global_centroids", None)
     print(f"[RESUME] Resuming from round {start}")
-    return start, best_acc
+    return start, best_acc, global_centroids
 
 
 # ======================================================================
@@ -1090,7 +1095,8 @@ def main() -> None:
         encoder_agg_weights = client_weights
         classifier_shared_weights = client_weights
     elif args.aggregation_mode == "fedavg":
-        encoder_agg_weights = client_weights
+        equal_weights = compute_client_weights(dataset_sizes, strategy="equal")
+        encoder_agg_weights = equal_weights if freeze_encoder else client_weights
         classifier_shared_weights = client_weights
     else:
         raise ValueError(f"Unknown aggregation_mode={args.aggregation_mode}")
@@ -1171,9 +1177,6 @@ def main() -> None:
             })
         # Layer-Wise Learning Rate Decay (LLRD) for full encoder fine-tuning
         elif any(p.requires_grad for p in enc.parameters()):
-            # Count number of blocks to set decay factor
-            # Use split('blocks.')[1] to handle prefixes like 'encoder.blocks.0.weight'
-            depth = max([int(n.split('blocks.')[1].split('.')[0]) for n, p in enc.named_parameters() if 'blocks.' in n and p.requires_grad] + [0]) + 1
             llrd_decay = args.layer_decay
             
             groups = {}
@@ -1181,24 +1184,31 @@ def main() -> None:
                 if not param.requires_grad:
                     continue
                 
-                # Strip wrapper prefixes
-                norm_name = name
-                if norm_name.startswith('encoder.'):
-                    norm_name = norm_name[len('encoder.'):]
-                elif norm_name.startswith('base_encoder.'):
-                    norm_name = norm_name[len('base_encoder.'):]
+                # Assign layer ID based on stage index.
+                # Patch embedding gets 0. Stages get 1 to 4. Final norm/proj gets 5.
+                layer_id = 0
+                if 'stages.' in name:
+                    try:
+                        stage_idx = int(name.split('stages.')[1].split('.')[0])
+                        layer_id = stage_idx + 1
+                    except ValueError:
+                        layer_id = 1
+                elif 'downsamples.' in name:
+                    try:
+                        stage_idx = int(name.split('downsamples.')[1].split('.')[0])
+                        layer_id = stage_idx + 1
+                    except ValueError:
+                        layer_id = 1
+                elif 'norm' in name and 'patch_embed' not in name and 'stages' not in name:
+                    layer_id = 5
+                elif 'proj' in name and 'patch_embed' not in name and 'stages' not in name:
+                    layer_id = 5
 
-                if norm_name.startswith('patch_embed'):
-                    layer_id = 0
-                elif norm_name.startswith('blocks.'):
-                    layer_id = int(norm_name.split('.')[1]) + 1
-                else:
-                    layer_id = depth + 1
-                
                 if layer_id not in groups:
                     groups[layer_id] = []
                 groups[layer_id].append(param)
             
+            depth = 5
             # FIX: The encoder MUST be fine-tuned at a much lower learning rate
             # than the randomly initialized classifier to prevent catastrophic forgetting.
             base_enc_lr = args.lr / 100.0
@@ -1225,7 +1235,13 @@ def main() -> None:
         })
         return AdamW(param_groups, betas=(0.9, 0.999))
 
-    start_round, best_acc = try_resume(
+    # Instantiate persistent client optimizers BEFORE the round loop starts
+    client_optimizers = [
+        _make_optimizer(client_encoders[i], client_classifiers[i])
+        for i in range(args.n_clients)
+    ]
+
+    start_round, best_acc, global_centroids = try_resume(
         args.output_dir, global_encoder, global_classifier, args.device,
     )
 
@@ -1310,7 +1326,7 @@ def main() -> None:
         print(f"  [SCAFFOLD] Initialized control variates for {args.n_clients} clients")
         print(f"  [SCAFFOLD] Corrections activate at round {SCAFFOLD_WARMUP} (after LR warmup)")
 
-    global_centroids = None
+    # global_centroids initialized from resume if available
     for comm_round in range(start_round, args.max_rounds):
         round_start = time.time()
 
@@ -1335,7 +1351,7 @@ def main() -> None:
         for cid in range(args.n_clients):
             enc   = client_encoders[cid]
             cls   = client_classifiers[cid]
-            opt   = _make_optimizer(enc, cls)
+            opt   = client_optimizers[cid]  # Use the persistent optimizer
 
             for pg in opt.param_groups:
                 if pg.get("group_name") == "lora_encoder":
@@ -1427,29 +1443,31 @@ def main() -> None:
         # ---- Checkpoint on improvement ----
         is_best = val_acc > best_acc + ACC_MIN_DELTA
         if is_best:
-            best_acc   = val_acc
-            best_round = comm_round + 1   # FIX-8: only set when improvement occurs
+            best_acc = val_acc
+            best_round = comm_round + 1
             rounds_no_improve = 0
             save_checkpoint(
                 global_encoder, global_classifier,
                 comm_round, val_acc,
                 args.output_dir, "ckpt_best_finetune.pth",
-                # best checkpoint: no optimizer state (file size)
+                global_centroids=global_centroids,
             )
         else:
             rounds_no_improve += 1
 
+        # Periodic checkpoint
         save_checkpoint(
             global_encoder, global_classifier,
             comm_round, val_acc,
             args.output_dir, "ckpt_latest.pth",
+            global_centroids=global_centroids,
         )
         if (comm_round + 1) % args.save_every == 0:
             name = f"ckpt_round_{comm_round + 1:04d}.pth"
             save_checkpoint(
                 global_encoder, global_classifier,
                 comm_round, val_acc, args.output_dir, name,
-                # periodic checkpoints: no optimizer state (file size)
+                global_centroids=global_centroids,
             )
 
         # ---- History & logging ----
@@ -1503,6 +1521,7 @@ def main() -> None:
         ckpt = safe_torch_load(best_path, map_location=args.device)
         global_encoder.load_state_dict(ckpt["encoder_state_dict"])
         global_classifier.load_state_dict(ckpt["classifier_state_dict"])
+        global_centroids = ckpt.get("global_centroids", global_centroids)
         best_str = str(best_round) if best_round is not None else "N/A"
         print(f"  Loaded best checkpoint (round {best_str}, "
               f"val_acc={best_acc:.2f}%)")
@@ -1510,35 +1529,24 @@ def main() -> None:
         # FIX-8: graceful fallback if no best checkpoint was ever saved
         print("  WARNING: no best checkpoint found; using current model weights.")
 
-    top1, per_class, cm, all_probs, all_labels = evaluate_finetune(
+    print("  Using evaluate_global for final accuracy (centroid-aware if applicable).")
+    top1, _, auc, eval_diag = evaluate_global(
         global_encoder, global_classifier,
-        test_loader, args.num_classes, args.device, class_names,
-        dataset=args.dataset,
+        test_loader, args.device, args.num_classes, eval_class_weights,
+        global_centroids=global_centroids
     )
+    
+    # We don't have per-class/all_probs/all_labels from evaluate_global directly here easily 
+    # without rewriting it, so we'll just log what we got.
+    cm = None
+    all_probs = None
+    all_labels = None
 
-    # AUC on TTA predictions
-    from sklearn.metrics import roc_auc_score
-    try:
-        if args.num_classes == 2:
-            final_auc = roc_auc_score(all_labels, all_probs[:, 1])
-        else:
-            final_auc = roc_auc_score(
-                all_labels, all_probs, multi_class="ovr", average="macro",
-            )
-    except ValueError:
-        final_auc = 0.0
-
-    # ------------------------------------------------------------------
-    # Save plots and reports
-    # ------------------------------------------------------------------
-    mode_tag = f"{args.mode}_{args.split_type}"
-
-    cm_path = os.path.join(args.output_dir, f"confusion_matrix_{mode_tag}.png")
-    save_confusion_matrix(cm, class_names, cm_path,
-                          title=f"{mode_label} Confusion Matrix")
-
-    save_roc_curve(all_probs, all_labels, class_names, args.output_dir, mode_tag)
-    print_classification_report(cm, class_names, args.output_dir, mode_tag)
+    # We bypass ROC curve and CM saving since evaluate_global doesn't return the raw predictions,
+    # but the per-round metrics CSV already contains the true balanced_acc and validation loss.
+    print(f"\nFinal Test Accuracy: {top1:.2f}%")
+    print(f"Final Test AUC:      {auc:.4f}")
+    print(f"Final Balanced Acc:  {eval_diag.get('balanced_acc', 0.0):.3f}")
 
     # Training curve (val_acc / val_loss / AUC across rounds)
     _save_round_curves(history, args.output_dir, mode_tag)

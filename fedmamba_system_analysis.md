@@ -56,5 +56,3 @@ Because the Mamba blocks are frozen (Federated Branch Protect), the encoder lack
 All classifier aggregation hacks, logit masking, and Softmax manipulations are ultimately futile walkarounds because they treat the symptom of an entangled feature space.
 
 **We must find a way to impart learning capacity to the Mamba blocks in a federated setting WITHOUT subjecting their core continuous-time ODE parameters to destructive linear averaging.** 
-
-*(e.g., Parameter-Efficient Fine-Tuning / LoRA injected strictly into the Mamba block's linear projections, allowing the block to adapt non-linearly while leaving the fragile ODE state-transition matrices perfectly frozen.)*

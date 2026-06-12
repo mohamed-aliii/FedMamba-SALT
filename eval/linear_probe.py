@@ -156,11 +156,12 @@ def get_train_transform(dataset: str = "retina") -> transforms.Compose:
     if dataset == "covidfl":
         # Chest X-Rays: No vertical flips, minimal rotation, safe cropping
         return transforms.Compose([
-            transforms.RandomResizedCrop(224, scale=(0.9, 1.0)),
+            transforms.RandomResizedCrop(224, scale=(0.7, 1.0)),
             transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomRotation(degrees=10),
-            transforms.ColorJitter(brightness=0.1, contrast=0.1),
+            transforms.RandomRotation(degrees=5),
+            transforms.ColorJitter(brightness=0.2, contrast=0.3),
             transforms.ToTensor(),
+            transforms.RandomErasing(p=0.2, scale=(0.02, 0.1)),
             transforms.Normalize(mean=mean, std=std),
         ])
     else:
