@@ -845,8 +845,8 @@ def main():
         epoch_time = time.time() - epoch_start
         pcr_str = ', '.join(f"{per_class[c]['recall']:.2f}" for c in range(args.nb_classes))
         print(f"Round {epoch:3d}/{args.max_communication_rounds} | "
-              f"loss={avg_train_loss:.4f} | acc={test_stats['acc1']:.1f}% | "
-              f"best={max_accuracy:.1f}% | "
+              f"train_loss={avg_train_loss:.4f} | test_loss={test_stats['loss']:.4f} | "
+              f"acc={test_stats['acc1']:.1f}% | best={max_accuracy:.1f}% | "
               f"per_class=[{pcr_str}] | "
               f"lr={cur_lr:.2e} | {epoch_time:.0f}s")
 
