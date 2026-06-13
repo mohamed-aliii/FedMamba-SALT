@@ -138,20 +138,22 @@ LORA_TARGETS = "qkv_proj"  # "qkv", "qkv_proj", or "all"
 
 # Advanced Baseline Improvements
 # Heavy penalty for missing COVID-19 (Class 2) vs Normal (Class 0) and Pneumonia (Class 1)
-# Example: "1.0 1.0 10.0" heavily weights Class 2
-CLASS_WEIGHTS = None  # Change to "1.0 1.0 10.0" to enable weighted loss
+# Example: "1.0 1.0 20.0" heavily weights Class 2
+CLASS_WEIGHTS = "1.0 1.0 20.0"  # Increased to mathematically counteract 5% scarcity
 
 # --- FedNMC Hyperparameters (only used if PEFT_MODE == "lora_fednmc") ---
 PROTO_TAU      = 0.1     # Minimum (final) temperature for cosine classifier
 PROTO_MOMENTUM = 0.9     # EMA momentum for prototype updates
+PROTO_WARMUP_ROUNDS = 1  # Number of initial rounds to use low momentum for cold-start
+PROTO_WARMUP_MOMENTUM = 0.3 # Lower EMA momentum used during warmup rounds
 
 # --- Dynamic Temperature Annealing (lora_fednmc only) ---
 TAU_INIT        = 1.0    # Starting temperature (1.0 = soft, set == PROTO_TAU to disable)
-TAU_DECAY_ROUNDS = 50    # Rounds over which tau anneals to PROTO_TAU
-TAU_STAB_THRESH  = 0.95  # Prototype stability threshold to advance annealing
+TAU_DECAY_ROUNDS = 60    # Rounds over which tau anneals to PROTO_TAU
+TAU_STAB_THRESH  = 0.85  # Prototype stability threshold to advance annealing
 
 # --- MAB Client Selection (lora_fednmc only) ---
-USE_MAB      = True   # Enable UCB Multi-Armed Bandit client selection
+USE_MAB      = True   # Enabled to actively hunt for COVID clients
 MAB_C        = 1.0    # Exploration constant (higher = more exploration)
 MAB_EMA      = 0.1    # EMA smoothing for reward estimates
 
@@ -159,6 +161,7 @@ MAB_EMA      = 0.1    # EMA smoothing for reward estimates
 FT_ROUNDS    = CFG["ft_rounds"]  # Communication rounds
 FT_BLR       = CFG["ft_blr"]    # Base learning rate
 FT_BATCH_SIZE = 16               # Batch size per client (16 for A100/L4)
+NUM_LOCAL_CLIENTS = 5            # Reduced from -1 to 5 to allow MAB to filter out Normal clients
 E_EPOCH       = 1                # Local epochs per round
 WARMUP_EPOCHS = 5                # LR warmup epochs
 MIN_LR        = 5e-5             # Minimum learning rate for cosine decay
@@ -229,7 +232,7 @@ else:
     print(f"  ⚠ Split dir not found: {split_dir}")
 
 # Create output directory
-RUN_NAME = f"{DATASET}_{PEFT_MODE}_r{LORA_RANK}_{LORA_TARGETS}_tau{PROTO_TAU}"
+RUN_NAME = f"{DATASET}_{PEFT_MODE}_r{LORA_RANK}_class_cond_proto_tau_anneal"
 if PEFT_MODE == "full_ft":
     RUN_NAME = f"{DATASET}_{PEFT_MODE}"
 OUTPUT_DIR = os.path.join(DRIVE_RESULTS, RUN_NAME)
@@ -363,13 +366,12 @@ cmd = [
     "--warmup_epochs", str(WARMUP_EPOCHS),
     "--weight_decay", str(WEIGHT_DECAY),
     "--drop_path", str(DROP_PATH),
-    "--layer_decay", str(LAYER_DECAY),
     "--save_ckpt_freq", str(SAVE_FREQ),
     "--num_workers", str(NUM_WORKERS),
     "--seed", str(SEED),
     "--smoothing", str(SMOOTHING),
     "--reprob", str(REPROB),
-    "--num_local_clients", "-1",
+    "--num_local_clients", str(NUM_LOCAL_CLIENTS),
 ]
 
 # Add mode-specific args
@@ -400,6 +402,8 @@ if PEFT_MODE == "lora_fednmc":
     cmd += [
         "--proto_tau", str(PROTO_TAU),
         "--proto_momentum", str(PROTO_MOMENTUM),
+        "--proto_warmup_rounds", str(PROTO_WARMUP_ROUNDS),
+        "--proto_warmup_momentum", str(PROTO_WARMUP_MOMENTUM),
         "--tau_init", str(TAU_INIT),
         "--tau_decay_rounds", str(TAU_DECAY_ROUNDS),
         "--tau_stability_thresh", str(TAU_STAB_THRESH),

@@ -445,6 +445,13 @@ def train_one_round_client(model, data_loader, optimizer, device, epoch,
                 if classifier is not None:
                     features = model.forward_features(samples)
                     output = classifier(features)
+                    
+                    # Restricted Softmax (FedRS): mask missing classes
+                    if args.peft_mode == 'lora_fednmc':
+                        client_counts = args.client_class_counts.get(args.single_client, {})
+                        for c in range(args.nb_classes):
+                            if client_counts.get(c, 0) == 0:
+                                output[:, c] = -1e4
                 else:
                     output = model(samples)
 
@@ -474,8 +481,9 @@ def train_one_round_client(model, data_loader, optimizer, device, epoch,
                     feats = model.forward_features(samples)
                     # Need integer targets for EMA update
                     if targets.dim() == 1:
+                        cur_momentum = args.proto_warmup_momentum if epoch < args.proto_warmup_rounds else args.proto_momentum
                         classifier.update_prototypes_ema(
-                            feats, targets, momentum=args.proto_momentum)
+                            feats, targets, momentum=cur_momentum)
 
             total_loss += loss_value
             n_batches += 1
@@ -508,6 +516,10 @@ def get_args():
                         help='Minimum (final) temperature for cosine classifier')
     parser.add_argument('--proto_momentum', default=0.9, type=float,
                         help='EMA momentum for prototype updates')
+    parser.add_argument('--proto_warmup_rounds', default=1, type=int,
+                        help='Number of initial rounds to use low momentum for cold-start')
+    parser.add_argument('--proto_warmup_momentum', default=0.3, type=float,
+                        help='Lower EMA momentum used during warmup rounds')
 
     # Dynamic Temperature Annealing (lora_fednmc only)
     parser.add_argument('--tau_init', type=float, default=1.0,
@@ -753,7 +765,7 @@ def main():
         args.proxy_clients = args.dis_cvs_files
         args.num_local_clients = len(args.dis_cvs_files)
     else:
-        args.proxy_clients = ['train_' + str(i) for i in range(args.num_local_clients)]
+        args.proxy_clients = args.dis_cvs_files[:args.num_local_clients]
 
     args.clients_weightes = {}
     args.global_step_per_client = {name: 0 for name in args.proxy_clients}
@@ -909,7 +921,7 @@ def main():
             cur_protos = classifier_all[args.proxy_clients[0]].prototypes.data.cpu()
             if prev_prototypes is not None:
                 sim = F.cosine_similarity(cur_protos, prev_prototypes, dim=-1).mean().item()
-                if sim >= args.tau_stability_thresh:
+                if epoch >= args.proto_warmup_rounds and sim >= args.tau_stability_thresh:
                     tau_decay_step += 1
             prev_prototypes = cur_protos.clone()
 
