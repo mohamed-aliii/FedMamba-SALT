@@ -149,6 +149,15 @@ def create_dataset_and_evalmetrix(args, mode='pretrain'):
     args.clients_with_len = {}
     args.client_class_counts = {}  # {client: {class_id: count}}
 
+    # Load global labels dictionary
+    labels_dict = {}
+    labels_path = os.path.join(args.data_path, 'labels.csv')
+    if os.path.isfile(labels_path):
+        for line in open(labels_path):
+            parts = line.strip().split(',')
+            if len(parts) >= 2:
+                labels_dict[parts[0]] = int(float(parts[1]))
+
     for single_client in args.dis_cvs_files:
         if args.split_type == 'central':
             client_path = os.path.join(args.data_path, args.split_type, single_client)
@@ -161,12 +170,11 @@ def create_dataset_and_evalmetrix(args, mode='pretrain'):
         img_paths = [r.split(',')[0] for r in rows]
         args.clients_with_len[single_client] = len(img_paths)
 
-        # Count samples per class from the label column
+        # Count samples per class using the global labels dictionary
         class_counts = {}
-        for r in rows:
-            parts = r.split(',')
-            if len(parts) >= 2:
-                label = int(float(parts[1]))
+        for img_path in img_paths:
+            if img_path in labels_dict:
+                label = labels_dict[img_path]
                 class_counts[label] = class_counts.get(label, 0) + 1
         args.client_class_counts[single_client] = class_counts
     
