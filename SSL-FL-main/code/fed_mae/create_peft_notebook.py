@@ -142,8 +142,18 @@ LORA_TARGETS = "qkv_proj"  # "qkv", "qkv_proj", or "all"
 CLASS_WEIGHTS = None  # Change to "1.0 1.0 10.0" to enable weighted loss
 
 # --- FedNMC Hyperparameters (only used if PEFT_MODE == "lora_fednmc") ---
-PROTO_TAU      = 0.1     # Temperature for cosine classifier
+PROTO_TAU      = 0.1     # Minimum (final) temperature for cosine classifier
 PROTO_MOMENTUM = 0.9     # EMA momentum for prototype updates
+
+# --- Dynamic Temperature Annealing (lora_fednmc only) ---
+TAU_INIT        = 1.0    # Starting temperature (1.0 = soft, set == PROTO_TAU to disable)
+TAU_DECAY_ROUNDS = 50    # Rounds over which tau anneals to PROTO_TAU
+TAU_STAB_THRESH  = 0.95  # Prototype stability threshold to advance annealing
+
+# --- MAB Client Selection (lora_fednmc only) ---
+USE_MAB      = True   # Enable UCB Multi-Armed Bandit client selection
+MAB_C        = 1.0    # Exploration constant (higher = more exploration)
+MAB_EMA      = 0.1    # EMA smoothing for reward estimates
 
 # --- Training ---
 FT_ROUNDS    = CFG["ft_rounds"]  # Communication rounds
@@ -151,6 +161,7 @@ FT_BLR       = CFG["ft_blr"]    # Base learning rate
 FT_BATCH_SIZE = 16               # Batch size per client (16 for A100/L4)
 E_EPOCH       = 1                # Local epochs per round
 WARMUP_EPOCHS = 5                # LR warmup epochs
+MIN_LR        = 5e-5             # Minimum learning rate for cosine decay
 LAYER_DECAY   = 0.75             # Layer-wise LR decay (full_ft only)
 WEIGHT_DECAY  = 0.05
 DROP_PATH     = 0.1
@@ -174,6 +185,8 @@ if PEFT_MODE != "full_ft":
     print(f"LoRA:      rank={LORA_RANK}, alpha={LORA_ALPHA}, targets={LORA_TARGETS}")
 if PEFT_MODE == "lora_fednmc":
     print(f"FedNMC:    tau={PROTO_TAU}, momentum={PROTO_MOMENTUM}")
+    print(f"Tau anneal: {TAU_INIT} -> {PROTO_TAU} over {TAU_DECAY_ROUNDS} stable rounds")
+    print(f"MAB:       {'enabled' if USE_MAB else 'disabled'} (c={MAB_C}, ema={MAB_EMA})")
 """))
 
 # ==============================================================
@@ -344,6 +357,7 @@ cmd = [
     "--model", "vit_base_patch16",
     "--batch_size", str(FT_BATCH_SIZE),
     "--blr", str(FT_BLR),
+    "--min_lr", str(MIN_LR),
     "--max_communication_rounds", str(FT_ROUNDS),
     "--E_epoch", str(E_EPOCH),
     "--warmup_epochs", str(WARMUP_EPOCHS),
@@ -386,7 +400,16 @@ if PEFT_MODE == "lora_fednmc":
     cmd += [
         "--proto_tau", str(PROTO_TAU),
         "--proto_momentum", str(PROTO_MOMENTUM),
+        "--tau_init", str(TAU_INIT),
+        "--tau_decay_rounds", str(TAU_DECAY_ROUNDS),
+        "--tau_stability_thresh", str(TAU_STAB_THRESH),
     ]
+    if USE_MAB:
+        cmd += [
+            "--use_mab",
+            "--mab_c", str(MAB_C),
+            "--mab_ema_alpha", str(MAB_EMA),
+        ]
 
 print("=" * 60)
 print("Running command:")

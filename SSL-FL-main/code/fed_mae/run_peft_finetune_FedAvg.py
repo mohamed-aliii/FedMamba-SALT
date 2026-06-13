@@ -453,9 +453,26 @@ def get_args():
 
     # FedNMC config
     parser.add_argument('--proto_tau', default=0.1, type=float,
-                        help='Temperature for cosine classifier')
+                        help='Minimum (final) temperature for cosine classifier')
     parser.add_argument('--proto_momentum', default=0.9, type=float,
                         help='EMA momentum for prototype updates')
+
+    # Dynamic Temperature Annealing (lora_fednmc only)
+    parser.add_argument('--tau_init', type=float, default=1.0,
+                        help='Initial temperature for annealing (default 1.0). '
+                             'Set equal to --proto_tau to disable annealing.')
+    parser.add_argument('--tau_decay_rounds', type=int, default=50,
+                        help='Rounds over which tau decays from tau_init to proto_tau')
+    parser.add_argument('--tau_stability_thresh', type=float, default=0.95,
+                        help='Prototype cosine-similarity threshold to advance tau decay')
+
+    # MAB Client Selection (lora_fednmc only)
+    parser.add_argument('--use_mab', action='store_true', default=False,
+                        help='Use UCB Multi-Armed Bandit client selection (lora_fednmc only)')
+    parser.add_argument('--mab_c', type=float, default=1.0,
+                        help='UCB exploration constant')
+    parser.add_argument('--mab_ema_alpha', type=float, default=0.1,
+                        help='EMA smoothing factor for MAB reward estimates')
 
     # Standard fine-tuning args (matching SSL-FL interface)
     parser.add_argument('--batch_size', default=64, type=int)
@@ -744,7 +761,11 @@ def main():
                 criterion_all[proxy_client] = nn.CrossEntropyLoss()
         else:
             mixup_fn_all[proxy_client] = None
-            criterion_all[proxy_client] = nn.CrossEntropyLoss()
+            if args.class_weights is not None:
+                weights = torch.tensor(args.class_weights, dtype=torch.float32).to(device)
+                criterion_all[proxy_client] = nn.CrossEntropyLoss(weight=weights)
+            else:
+                criterion_all[proxy_client] = nn.CrossEntropyLoss()
 
         loss_scaler_all[proxy_client] = misc.NativeScalerWithGradNormCount()
 
@@ -760,6 +781,23 @@ def main():
     print(f"  Trainable params: {n_trainable:,}")
     print(f"{'='*60}\n")
 
+    # --- MAB initialisation (lora_fednmc only) ---
+    mab = None
+    if args.peft_mode == 'lora_fednmc' and args.use_mab and args.num_local_clients < len(args.dis_cvs_files):
+        from util.mab_selector import UCBClientSelector
+        mab = UCBClientSelector(args.dis_cvs_files, c=args.mab_c, ema_alpha=args.mab_ema_alpha)
+        print(f"  MAB: UCB client selection enabled (c={args.mab_c}, ema_alpha={args.mab_ema_alpha})")
+
+    # --- Dynamic tau annealing initialisation (lora_fednmc only) ---
+    tau_annealing = (args.peft_mode == 'lora_fednmc' and args.tau_init > args.proto_tau)
+    if tau_annealing:
+        tau_current = args.tau_init
+        tau_decay_step = 0          # counts rounds where stability was met
+        prev_prototypes = None
+        print(f"  Tau: annealing {args.tau_init:.2f} → {args.proto_tau:.2f} over ~{args.tau_decay_rounds} stable rounds")
+    else:
+        tau_current = args.proto_tau
+
     max_accuracy = 0.0
     start_time = time.time()
     tot_clients = args.dis_cvs_files
@@ -770,6 +808,8 @@ def main():
         # Select clients
         if args.num_local_clients == len(tot_clients):
             cur_selected_clients = args.proxy_clients
+        elif mab is not None:
+            cur_selected_clients = mab.select(args.num_local_clients, epoch)
         else:
             cur_selected_clients = np.random.choice(
                 tot_clients, args.num_local_clients, replace=False).tolist()
@@ -808,6 +848,24 @@ def main():
         else:
             fedavg_aggregate(model_avg, model_all, args)
 
+        # ---- Dynamic tau annealing ----
+        if tau_annealing:
+            cur_protos = classifier_all[args.proxy_clients[0]].prototypes.data.cpu()
+            if prev_prototypes is not None:
+                sim = F.cosine_similarity(cur_protos, prev_prototypes, dim=-1).mean().item()
+                if sim >= args.tau_stability_thresh:
+                    tau_decay_step += 1
+            prev_prototypes = cur_protos.clone()
+
+            tau_current = args.proto_tau + (args.tau_init - args.proto_tau) * np.exp(
+                -3.0 * tau_decay_step / max(args.tau_decay_rounds, 1))
+            tau_current = max(args.proto_tau, tau_current)
+
+            log_tau_val = float(np.log(tau_current))
+            for pc in args.proxy_clients:
+                with torch.no_grad():
+                    classifier_all[pc].log_tau.fill_(log_tau_val)
+
         # ---- Evaluation ----
         model_avg.to(device)
         eval_classifier = None
@@ -837,6 +895,13 @@ def main():
         # Get current LR
         cur_lr = optimizer_all[args.proxy_clients[0]].param_groups[0]['lr']
 
+        # ---- MAB reward update ----
+        if mab is not None:
+            macro_recall = np.mean([per_class[c]['recall'] for c in range(args.nb_classes)])
+            reward_delta = macro_recall - mab.last_macro_recall
+            rewards = {k: reward_delta for k in cur_selected_clients}
+            mab.update(cur_selected_clients, rewards, macro_recall)
+
         # Log metrics
         metrics.log(epoch, avg_train_loss, test_stats, max_accuracy, cur_lr,
                     n_trainable, per_class)
@@ -844,11 +909,12 @@ def main():
         # Print
         epoch_time = time.time() - epoch_start
         pcr_str = ', '.join(f"{per_class[c]['recall']:.2f}" for c in range(args.nb_classes))
+        tau_str = f" | tau={tau_current:.3f}" if tau_annealing else ""
         print(f"Round {epoch:3d}/{args.max_communication_rounds} | "
               f"train_loss={avg_train_loss:.4f} | test_loss={test_stats['loss']:.4f} | "
               f"acc={test_stats['acc1']:.1f}% | best={max_accuracy:.1f}% | "
               f"per_class=[{pcr_str}] | "
-              f"lr={cur_lr:.2e} | {epoch_time:.0f}s")
+              f"lr={cur_lr:.2e}{tau_str} | {epoch_time:.0f}s")
 
         # Save periodic checkpoint
         if args.output_dir and (epoch + 1) % args.save_ckpt_freq == 0:
@@ -870,6 +936,8 @@ def main():
             'max_acc': max_accuracy, 'lr': cur_lr,
             'per_class_recall': {c: per_class[c]['recall'] for c in range(args.nb_classes)},
             'confusion_matrix': confusion.tolist(),
+            'tau': tau_current,
+            'mab_counts': mab.get_counts() if mab is not None else None,
         }
         with open(os.path.join(args.output_dir, "log.txt"), "a") as f:
             f.write(json.dumps(log_stats) + "\n")
