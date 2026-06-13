@@ -287,8 +287,10 @@ def fednmc_aggregate(model_avg, model_all, classifier_all,
                      args, proto_momentum=0.7):
     """
     Aggregate client models:
-    - LoRA + head params: weighted FedAvg
-    - Prototypes: weighted average across clients (one-shot, not EMA here)
+    - LoRA + head params: weighted FedAvg (by total samples)
+    - Prototypes: per-class weighted average (by class-specific sample counts)
+      Clients with zero samples for class C contribute zero weight to prototype C,
+      eliminating garbage-dominance of zero-shot clients.
     """
     device = 'cpu'
     model_avg.to(device)
@@ -317,8 +319,60 @@ def fednmc_aggregate(model_avg, model_all, classifier_all,
         for key in trainable_keys:
             client_sd[key].copy_(avg_sd[key].to(client_sd[key].device))
 
-    # --- Aggregate prototypes via weighted average ---
-    if classifier_all is not None:
+    # --- Class-conditioned prototype aggregation ---
+    # The training loop maps: cur_client (data) -> proxy_client (model slot)
+    # args.clients_weightes is keyed by proxy_client, but class counts are
+    # keyed by the actual data client (cur_client = args.single_client for that slot).
+    # We recover the data client from args.client_class_counts by checking which
+    # data client was assigned to each proxy slot this round via clients_weightes.
+    # Simplest safe approach: use args.dis_cvs_files order in proxy_clients.
+    # The mapping is stable: proxy_clients[i] trained on cur_selected_clients[i].
+    # We stored cur_client names as the keys in client_class_counts, so we look
+    # them up through the proxy->data mapping reconstructed from clients_weightes.
+    #
+    # Since we cannot recover cur_selected_clients here, we use args.single_client
+    # which is the LAST client processed — instead, we store the mapping on args.
+    # The training loop sets args.clients_weightes[proxy] = len(cur_client)/total.
+    # We add args.proxy_to_data_client mapping in the training loop (see below).
+
+    if classifier_all is not None and hasattr(args, 'proxy_to_data_client'):
+        num_classes = classifier_all[args.proxy_clients[0]].num_classes
+
+        # For each class C, compute total class-C samples across active proxies
+        class_totals = {}
+        for proxy_client in args.proxy_clients:
+            data_client = args.proxy_to_data_client.get(proxy_client)
+            if data_client is None:
+                continue
+            counts = args.client_class_counts.get(data_client, {})
+            for c, n in counts.items():
+                class_totals[c] = class_totals.get(c, 0) + n
+
+        # Weighted sum per class
+        embed_dim = classifier_all[args.proxy_clients[0]].prototypes.shape[1]
+        avg_proto = torch.zeros(num_classes, embed_dim, dtype=torch.float32)
+
+        for proxy_client in args.proxy_clients:
+            data_client = args.proxy_to_data_client.get(proxy_client)
+            if data_client is None:
+                continue
+            counts = args.client_class_counts.get(data_client, {})
+            client_proto = classifier_all[proxy_client].prototypes.data.cpu().float()
+
+            for c in range(num_classes):
+                n_c = counts.get(c, 0)
+                total_c = class_totals.get(c, 0)
+                if total_c > 0 and n_c > 0:
+                    w_c = n_c / total_c
+                    avg_proto[c] += client_proto[c] * w_c
+                # If n_c == 0, this client has nothing to contribute to class C
+
+        # Distribute aggregated prototypes back to all clients
+        for client in args.proxy_clients:
+            classifier_all[client].prototypes.data.copy_(
+                avg_proto.to(classifier_all[client].prototypes.device))
+    elif classifier_all is not None:
+        # Fallback: flat weighted average (original behaviour, should not be reached)
         avg_proto = None
         for client in args.proxy_clients:
             w = args.clients_weightes[client]
@@ -327,8 +381,6 @@ def fednmc_aggregate(model_avg, model_all, classifier_all,
                 avg_proto = client_proto * w
             else:
                 avg_proto += client_proto * w
-
-        # Distribute aggregated prototypes back
         for client in args.proxy_clients:
             classifier_all[client].prototypes.data.copy_(
                 avg_proto.to(classifier_all[client].prototypes.device))
@@ -843,6 +895,10 @@ def main():
             avg_train_loss += client_loss * args.clients_weightes[proxy_client]
 
         # ---- Aggregation ----
+        # Build proxy->data mapping for class-conditioned prototype aggregation
+        args.proxy_to_data_client = {
+            proxy: cur for proxy, cur in zip(args.proxy_clients, cur_selected_clients)
+        }
         if args.peft_mode == 'lora_fednmc':
             fednmc_aggregate(model_avg, model_all, classifier_all, args)
         else:

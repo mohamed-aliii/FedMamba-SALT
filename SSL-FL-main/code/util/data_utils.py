@@ -147,16 +147,28 @@ def create_dataset_and_evalmetrix(args, mode='pretrain'):
         args.dis_cvs_files = os.listdir(os.path.join(args.data_path, f'{args.n_clients}_clients', args.split_type))
     
     args.clients_with_len = {}
-    
+    args.client_class_counts = {}  # {client: {class_id: count}}
+
     for single_client in args.dis_cvs_files:
         if args.split_type == 'central':
-            img_paths = list({line.strip().split(',')[0] for line in
-                            open(os.path.join(args.data_path, args.split_type, single_client))})
+            client_path = os.path.join(args.data_path, args.split_type, single_client)
         else:
-            img_paths = list({line.strip().split(',')[0] for line in
-                                open(os.path.join(args.data_path, f'{args.n_clients}_clients',
-                                                args.split_type, single_client))})
+            client_path = os.path.join(args.data_path, f'{args.n_clients}_clients',
+                                       args.split_type, single_client)
+
+        # Use a set for deduplication (matches existing img_paths logic)
+        rows = list({line.strip() for line in open(client_path)})
+        img_paths = [r.split(',')[0] for r in rows]
         args.clients_with_len[single_client] = len(img_paths)
+
+        # Count samples per class from the label column
+        class_counts = {}
+        for r in rows:
+            parts = r.split(',')
+            if len(parts) >= 2:
+                label = int(float(parts[1]))
+                class_counts[label] = class_counts.get(label, 0) + 1
+        args.client_class_counts[single_client] = class_counts
     
     
     ## step 2: get the evaluation matrix
